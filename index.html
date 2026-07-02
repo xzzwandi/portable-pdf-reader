@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#f7f3eb" />
+    <title>随身 PDF</title>
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="./icons/icon.svg" />
+    <link rel="stylesheet" href="./styles.css?v=15" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">PDF</span>
+          <div>
+            <div class="brand-title">
+              <h1>随身 PDF</h1>
+              <span id="appVersion" class="version-badge">v15</span>
+            </div>
+            <p id="docName">未打开文件</p>
+          </div>
+        </div>
+
+        <div class="actions">
+          <input id="fileInput" type="file" accept="application/pdf,.pdf" hidden />
+          <button id="lockButton" type="button">锁</button>
+          <button id="libraryButton" type="button">书架</button>
+          <button id="openButton" class="primary" type="button">打开 PDF</button>
+        </div>
+      </header>
+
+      <main class="reader">
+        <section id="emptyState" class="empty-state">
+          <div class="empty-mark" aria-hidden="true">PDF</div>
+          <h2>选择一个 PDF 开始</h2>
+          <p>文件保存在这台设备的浏览器里。</p>
+          <button id="emptyOpenButton" class="primary large" type="button">打开 PDF</button>
+        </section>
+
+        <section id="viewerPane" class="viewer-pane" hidden>
+          <div class="canvas-wrap" id="canvasWrap">
+            <canvas id="pdfCanvas"></canvas>
+            <div id="continuousPages" class="continuous-pages" hidden></div>
+          </div>
+        </section>
+      </main>
+
+      <footer id="controls" class="controls" hidden>
+        <button id="prevButton" type="button" aria-label="上一页">上一页</button>
+        <label class="page-jump" for="pageInput">
+          <input id="pageInput" type="number" min="1" value="1" inputmode="numeric" />
+          <span id="pageTotal">/ 0</span>
+        </label>
+        <button id="nextButton" type="button" aria-label="下一页">下一页</button>
+
+        <div class="spacer"></div>
+
+        <div class="mode-switch" role="group" aria-label="阅读模式">
+          <button id="pagedModeButton" type="button" aria-pressed="true">分页</button>
+          <button id="scrollModeButton" type="button" aria-pressed="false">连续</button>
+        </div>
+
+        <div id="edgeJumpGroup" class="edge-jumps" role="group" aria-label="连续模式跳转" hidden>
+          <button id="jumpTopButton" type="button" aria-label="跳到顶部">↑</button>
+          <button id="jumpBottomButton" type="button" aria-label="跳到底部">↓</button>
+        </div>
+
+        <button id="zoomOutButton" type="button" aria-label="缩小">-</button>
+        <button id="fitButton" type="button">适宽</button>
+        <button id="zoomInButton" type="button" aria-label="放大">+</button>
+      </footer>
+
+      <button id="floatingLockButton" class="floating-lock" type="button" aria-label="锁定阅读器">
+        锁
+      </button>
+
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+
+      <div id="libraryOverlay" class="library-overlay" hidden>
+        <section class="library-panel" role="dialog" aria-modal="true" aria-labelledby="libraryTitle">
+          <header class="library-header">
+            <h2 id="libraryTitle">书架</h2>
+            <button id="libraryCloseButton" type="button" aria-label="关闭书架">关闭</button>
+          </header>
+
+          <div id="libraryList" class="library-list"></div>
+          <p id="libraryEmptyState" class="library-empty">还没有保存过 PDF。</p>
+        </section>
+      </div>
+
+      <div id="lockOverlay" class="lock-overlay" hidden>
+        <section class="lock-panel" role="dialog" aria-modal="true" aria-labelledby="lockTitle">
+          <div class="lock-mark" aria-hidden="true">PDF</div>
+          <h2 id="lockTitle">密码锁</h2>
+          <p id="lockDescription">输入密码后继续阅读。</p>
+
+          <form id="lockForm" class="lock-form">
+            <input
+              id="lockPasswordInput"
+              type="password"
+              autocomplete="current-password"
+              inputmode="text"
+              minlength="4"
+              placeholder="输入密码"
+            />
+            <input
+              id="lockConfirmInput"
+              type="password"
+              autocomplete="new-password"
+              inputmode="text"
+              minlength="4"
+              placeholder="再次输入密码"
+              hidden
+            />
+            <button id="lockSubmitButton" class="primary" type="submit">解锁</button>
+          </form>
+
+          <button id="lockCancelButton" type="button" hidden>取消</button>
+        </section>
+      </div>
+    </div>
+
+    <script type="module" src="./app.js?v=15"></script>
+  </body>
+</html>

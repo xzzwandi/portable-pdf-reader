@@ -1,0 +1,15 @@
+{
+  "name": "portable-pdf-reader",
+  "version": "1.0.0",
+  "description": "A local-first web PDF reader for mobile Safari.",
+  "private": true,
+  "scripts": {
+    "start": "py -3 -m http.server 5173 --bind 0.0.0.0",
+    "build": "node scripts/build.mjs",
+    "serve:dist": "py -3 -m http.server 5174 --bind 0.0.0.0 --directory dist"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "pdfjs-dist": "^4.10.38"
+  }
+}
