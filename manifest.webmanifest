@@ -1,7 +1,7 @@
 {
-  "name": "随身 PDF",
-  "short_name": "PDF",
-  "description": "一个本地优先的手机 PDF 阅读器。",
+  "name": "随身阅读",
+  "short_name": "阅读",
+  "description": "一个本地优先的手机 PDF/EPUB 阅读器。",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

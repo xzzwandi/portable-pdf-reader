@@ -11,7 +11,11 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v15";
+const APP_VERSION = "v16";
+const DOCUMENT_FORMATS = {
+  PDF: "pdf",
+  EPUB: "epub",
+};
 const READ_MODES = {
   PAGED: "paged",
   SCROLL: "scroll",
@@ -27,6 +31,8 @@ const els = {
   edgeJumpGroup: document.querySelector("#edgeJumpGroup"),
   emptyOpenButton: document.querySelector("#emptyOpenButton"),
   emptyState: document.querySelector("#emptyState"),
+  epubPane: document.querySelector("#epubPane"),
+  epubViewer: document.querySelector("#epubViewer"),
   fileInput: document.querySelector("#fileInput"),
   fitButton: document.querySelector("#fitButton"),
   floatingLockButton: document.querySelector("#floatingLockButton"),
@@ -60,6 +66,8 @@ const els = {
 };
 
 let pdfDoc = null;
+let epubBook = null;
+let epubRendition = null;
 let renderTask = null;
 let pageObserver = null;
 let lastViewportChangeAt = 0;
@@ -77,7 +85,10 @@ const pageRenderTasks = new Map();
 
 const state = {
   documentId: "",
+  format: DOCUMENT_FORMATS.PDF,
   fileName: "",
+  epubCfi: "",
+  epubProgress: 0,
   page: 1,
   scrollOffsetRatio: 0,
   scrollPage: 1,
@@ -91,7 +102,15 @@ function clamp(value, min, max) {
 }
 
 function isScrollMode() {
-  return state.mode === READ_MODES.SCROLL;
+  return state.format === DOCUMENT_FORMATS.PDF && state.mode === READ_MODES.SCROLL;
+}
+
+function isPdfDocument() {
+  return state.format === DOCUMENT_FORMATS.PDF;
+}
+
+function isEpubDocument() {
+  return state.format === DOCUMENT_FORMATS.EPUB;
 }
 
 function isScrollTrackingSuppressed() {
@@ -269,7 +288,11 @@ function readSavedState() {
   try {
     const saved = JSON.parse(window.localStorage.getItem(STATE_KEY) || "{}");
     state.documentId = typeof saved.documentId === "string" ? saved.documentId : "";
+    state.format =
+      saved.format === DOCUMENT_FORMATS.EPUB ? DOCUMENT_FORMATS.EPUB : DOCUMENT_FORMATS.PDF;
     state.fileName = typeof saved.fileName === "string" ? saved.fileName : "";
+    state.epubCfi = typeof saved.epubCfi === "string" ? saved.epubCfi : "";
+    state.epubProgress = Number.isFinite(saved.epubProgress) ? saved.epubProgress : 0;
     state.page = Number.isFinite(saved.page) ? saved.page : 1;
     state.scrollPage = Number.isFinite(saved.scrollPage) ? saved.scrollPage : state.page;
     state.scrollOffsetRatio = Number.isFinite(saved.scrollOffsetRatio)
@@ -280,7 +303,10 @@ function readSavedState() {
     state.mode = saved.mode === READ_MODES.SCROLL ? READ_MODES.SCROLL : READ_MODES.PAGED;
   } catch {
     state.documentId = "";
+    state.format = DOCUMENT_FORMATS.PDF;
     state.fileName = "";
+    state.epubCfi = "";
+    state.epubProgress = 0;
     state.page = 1;
     state.scrollPage = 1;
     state.scrollOffsetRatio = 0;
@@ -300,7 +326,10 @@ function saveReaderState() {
       STATE_KEY,
       JSON.stringify({
         documentId: state.documentId,
+        epubCfi: state.epubCfi,
+        epubProgress: state.epubProgress,
         fileName: state.fileName,
+        format: state.format,
         mode: state.mode,
         page: state.page,
         scrollOffsetRatio: state.scrollOffsetRatio,
@@ -380,6 +409,34 @@ function isLibraryDocument(record) {
   return Boolean(record?.blob && typeof record.id === "string" && record.id.startsWith(DOCUMENT_ID_PREFIX));
 }
 
+function getDocumentFormatFromName(name = "") {
+  return name.toLowerCase().endsWith(".epub") ? DOCUMENT_FORMATS.EPUB : DOCUMENT_FORMATS.PDF;
+}
+
+function getDocumentFormatFromFile(file) {
+  if (file?.type === "application/epub+zip" || file?.name?.toLowerCase().endsWith(".epub")) {
+    return DOCUMENT_FORMATS.EPUB;
+  }
+
+  if (file?.type === "application/pdf" || file?.name?.toLowerCase().endsWith(".pdf")) {
+    return DOCUMENT_FORMATS.PDF;
+  }
+
+  return "";
+}
+
+function getDocumentFormat(record = {}) {
+  if (record.format === DOCUMENT_FORMATS.EPUB || record.type === "application/epub+zip") {
+    return DOCUMENT_FORMATS.EPUB;
+  }
+
+  if (record.format === DOCUMENT_FORMATS.PDF || record.type === "application/pdf") {
+    return DOCUMENT_FORMATS.PDF;
+  }
+
+  return getDocumentFormatFromName(record.name || "");
+}
+
 function getProgressMap() {
   try {
     return JSON.parse(window.localStorage.getItem(PROGRESS_KEY) || "{}");
@@ -401,7 +458,10 @@ function saveDocumentProgress() {
   try {
     const progressMap = getProgressMap();
     progressMap[state.documentId] = {
+      epubCfi: state.epubCfi,
+      epubProgress: state.epubProgress,
       fileName: state.fileName,
+      format: state.format,
       mode: state.mode,
       page: state.page,
       scrollOffsetRatio: state.scrollOffsetRatio,
@@ -429,6 +489,10 @@ function deleteDocumentProgress(documentId) {
 function applyDocumentProgress(documentId, fallbackPage = 1) {
   const progress = readDocumentProgress(documentId);
 
+  state.format =
+    progress?.format === DOCUMENT_FORMATS.EPUB ? DOCUMENT_FORMATS.EPUB : state.format;
+  state.epubCfi = typeof progress?.epubCfi === "string" ? progress.epubCfi : "";
+  state.epubProgress = Number.isFinite(progress?.epubProgress) ? progress.epubProgress : 0;
   state.page = clamp(progress?.page || fallbackPage, 1, Number.MAX_SAFE_INTEGER);
   state.scrollPage = clamp(progress?.scrollPage || state.page, 1, Number.MAX_SAFE_INTEGER);
   state.scrollOffsetRatio = Number.isFinite(progress?.scrollOffsetRatio)
@@ -510,15 +574,19 @@ async function readLibraryDocuments() {
 }
 
 async function saveDocumentFile(file) {
-  const id = createDocumentId(file.name || "未命名.pdf", file.size, file.lastModified || 0);
+  const format = getDocumentFormatFromFile(file);
+  const fallbackName = format === DOCUMENT_FORMATS.EPUB ? "未命名.epub" : "未命名.pdf";
+  const type = format === DOCUMENT_FORMATS.EPUB ? "application/epub+zip" : "application/pdf";
+  const id = createDocumentId(file.name || fallbackName, file.size, file.lastModified || 0);
   const existing = await getStoredDocument(id).catch(() => null);
-  const blob = file.slice(0, file.size, file.type || "application/pdf");
+  const blob = file.slice(0, file.size, file.type || type);
   const now = Date.now();
   const record = {
     id,
-    name: file.name || "未命名.pdf",
+    format,
+    name: file.name || fallbackName,
     size: file.size,
-    type: file.type || "application/pdf",
+    type: file.type || type,
     updatedAt: now,
     lastOpenedAt: now,
     blob,
@@ -546,12 +614,8 @@ async function touchStoredDocument(documentId) {
   });
 }
 
-function isPdfFile(file) {
-  if (!file) {
-    return false;
-  }
-
-  return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+function isSupportedDocumentFile(file) {
+  return Boolean(getDocumentFormatFromFile(file));
 }
 
 function setReaderVisible(visible) {
@@ -565,37 +629,49 @@ function setReaderVisible(visible) {
 }
 
 function updateViewerMode() {
+  const epubMode = isEpubDocument();
   const scrollMode = isScrollMode();
-  els.canvas.hidden = scrollMode;
+  els.canvasWrap.hidden = epubMode;
+  els.epubPane.hidden = !epubMode;
+  els.canvas.hidden = scrollMode || epubMode;
   els.continuousPages.hidden = !scrollMode;
   els.canvasWrap.classList.toggle("is-continuous", scrollMode);
 }
 
 function updateControls() {
-  const hasDocument = Boolean(pdfDoc);
+  const hasDocument = Boolean(pdfDoc || epubBook);
+  const epubMode = hasDocument && isEpubDocument();
   const total = pdfDoc?.numPages || 0;
-  const pagedMode = state.mode === READ_MODES.PAGED;
-  const scrollMode = !pagedMode;
+  const pagedMode = !epubMode && state.mode === READ_MODES.PAGED;
+  const scrollMode = !epubMode && state.mode !== READ_MODES.PAGED;
 
   els.docName.textContent = state.fileName || "未打开文件";
-  els.pageInput.value = String(hasDocument ? state.page : 1);
+  els.prevButton.textContent = epubMode ? "上一章" : "上一页";
+  els.nextButton.textContent = epubMode ? "下一章" : "下一页";
+  els.prevButton.setAttribute("aria-label", epubMode ? "上一章" : "上一页");
+  els.nextButton.setAttribute("aria-label", epubMode ? "下一章" : "下一页");
+  els.pageInput.value = epubMode
+    ? String(Math.round(clamp(state.epubProgress || 0, 0, 1) * 100))
+    : String(hasDocument ? state.page : 1);
   els.pageInput.max = String(Math.max(total, 1));
-  els.pageTotal.textContent = `/ ${total}`;
+  els.pageTotal.textContent = epubMode ? "%" : `/ ${total}`;
 
-  els.prevButton.disabled = !hasDocument || state.page <= 1;
-  els.nextButton.disabled = !hasDocument || state.page >= total;
-  els.pageInput.disabled = !hasDocument;
-  els.zoomOutButton.disabled = !hasDocument || state.zoom <= 0.6;
-  els.zoomInButton.disabled = !hasDocument || state.zoom >= 2.6;
-  els.fitButton.disabled = !hasDocument;
-  els.edgeJumpGroup.hidden = !hasDocument || !scrollMode;
-  els.jumpTopButton.disabled = !hasDocument || !scrollMode;
-  els.jumpBottomButton.disabled = !hasDocument || !scrollMode;
+  els.prevButton.disabled = !hasDocument || (!epubMode && state.page <= 1);
+  els.nextButton.disabled = !hasDocument || (!epubMode && state.page >= total);
+  els.pageInput.disabled = !hasDocument || epubMode;
+  els.zoomOutButton.disabled = !hasDocument || epubMode || state.zoom <= 0.6;
+  els.zoomInButton.disabled = !hasDocument || epubMode || state.zoom >= 2.6;
+  els.fitButton.disabled = !hasDocument || epubMode;
+  els.edgeJumpGroup.hidden = !hasDocument || epubMode || !scrollMode;
+  els.jumpTopButton.disabled = !hasDocument || epubMode || !scrollMode;
+  els.jumpBottomButton.disabled = !hasDocument || epubMode || !scrollMode;
+  els.pagedModeButton.disabled = epubMode;
+  els.scrollModeButton.disabled = epubMode;
 
   els.pagedModeButton.classList.toggle("active", pagedMode);
-  els.scrollModeButton.classList.toggle("active", scrollMode);
+  els.scrollModeButton.classList.toggle("active", scrollMode || epubMode);
   els.pagedModeButton.setAttribute("aria-pressed", String(pagedMode));
-  els.scrollModeButton.setAttribute("aria-pressed", String(scrollMode));
+  els.scrollModeButton.setAttribute("aria-pressed", String(scrollMode || epubMode));
 }
 
 async function cancelCurrentRender() {
@@ -631,11 +707,24 @@ async function closeCurrentDocument() {
   els.canvas.removeAttribute("width");
   els.canvas.removeAttribute("height");
   els.canvas.removeAttribute("style");
+  els.epubViewer.replaceChildren();
 
   if (pdfDoc) {
     const oldDoc = pdfDoc;
     pdfDoc = null;
     await oldDoc.destroy().catch(() => {});
+  }
+
+  if (epubRendition) {
+    const oldRendition = epubRendition;
+    epubRendition = null;
+    oldRendition.destroy?.();
+  }
+
+  if (epubBook) {
+    const oldBook = epubBook;
+    epubBook = null;
+    oldBook.destroy?.();
   }
 }
 
@@ -1163,6 +1252,10 @@ async function renderCurrentView(pageNumber = state.page, options = {}) {
 }
 
 async function goToPage(pageNumber) {
+  if (isEpubDocument()) {
+    return;
+  }
+
   if (!pdfDoc) {
     return;
   }
@@ -1189,6 +1282,10 @@ async function goToPage(pageNumber) {
 }
 
 async function setReadMode(mode) {
+  if (isEpubDocument()) {
+    return;
+  }
+
   if (mode !== READ_MODES.PAGED && mode !== READ_MODES.SCROLL) {
     return;
   }
@@ -1267,9 +1364,126 @@ function updateCurrentPageFromScroll() {
   }
 }
 
+function estimateEpubProgress(location) {
+  const percentage = location?.start?.percentage;
+
+  if (Number.isFinite(percentage)) {
+    return clamp(percentage, 0, 1);
+  }
+
+  const index = Number.isFinite(location?.start?.index) ? location.start.index : state.page - 1;
+  const total = Math.max(epubBook?.spine?.length || 1, 1);
+
+  return clamp(index / total, 0, 1);
+}
+
+function updateEpubLocation(location) {
+  if (!location?.start) {
+    return;
+  }
+
+  state.epubCfi = location.start.cfi || state.epubCfi;
+  state.epubProgress = estimateEpubProgress(location);
+  state.page = Number.isFinite(location.start.index) ? location.start.index + 1 : state.page;
+  updateControls();
+
+  window.clearTimeout(scrollStateTimer);
+  scrollStateTimer = window.setTimeout(saveReaderState, 300);
+}
+
+async function loadEpubFromBlob(blob, meta = {}) {
+  await closeCurrentDocument();
+  state.format = DOCUMENT_FORMATS.EPUB;
+  setReaderVisible(true);
+  updateViewerMode();
+  showStatus("正在打开 EPUB...", true);
+
+  try {
+    if (typeof window.ePub !== "function") {
+      throw new Error("EPUB 引擎没有加载。");
+    }
+
+    const buffer = await blob.arrayBuffer();
+    const book = window.ePub();
+    await book.open(buffer, "binary");
+
+    epubBook = book;
+    epubRendition = book.renderTo(els.epubViewer, {
+      allowScriptedContent: false,
+      flow: "scrolled-doc",
+      height: "100%",
+      spread: "none",
+      width: "100%",
+    });
+
+    epubRendition.themes.default({
+      body: {
+        "font-family":
+          'ui-serif, "Iowan Old Style", "Songti SC", "Noto Serif CJK SC", serif',
+        "line-height": "1.72",
+        "padding": "0 6%",
+      },
+      p: {
+        "line-height": "1.72",
+      },
+    });
+
+    epubRendition.on("relocated", updateEpubLocation);
+
+    state.documentId = meta.id || state.documentId;
+    state.fileName = meta.name || state.fileName || "未命名.epub";
+    state.epubProgress = clamp(state.epubProgress || 0, 0, 1);
+    state.page = clamp(state.page || 1, 1, epubBook.spine?.length || Number.MAX_SAFE_INTEGER);
+
+    updateControls();
+    await epubRendition.display(state.epubCfi || undefined);
+    const location = epubRendition.currentLocation?.();
+
+    if (location) {
+      updateEpubLocation(location);
+    }
+
+    saveReaderState();
+    hideStatus();
+  } catch (error) {
+    console.error(error);
+    await closeCurrentDocument();
+    state.format = DOCUMENT_FORMATS.PDF;
+    setReaderVisible(false);
+    updateViewerMode();
+    showStatus("这个 EPUB 暂时打不开。", true);
+  }
+}
+
+async function navigateEpub(direction) {
+  if (!epubRendition) {
+    return;
+  }
+
+  try {
+    if (direction === "prev") {
+      await epubRendition.prev();
+    } else {
+      await epubRendition.next();
+    }
+
+    const location = epubRendition.currentLocation?.();
+    if (location) {
+      updateEpubLocation(location);
+    }
+  } catch (error) {
+    console.error(error);
+    showStatus("EPUB 跳转失败。", true);
+  }
+}
+
 async function loadPdfFromBlob(blob, meta = {}, requestedPage = 1) {
   await closeCurrentDocument();
+  state.format = DOCUMENT_FORMATS.PDF;
+  state.epubCfi = "";
+  state.epubProgress = 0;
   setReaderVisible(true);
+  updateViewerMode();
   showStatus("正在打开 PDF...", true);
 
   try {
@@ -1302,28 +1516,37 @@ async function loadPdfFromBlob(blob, meta = {}, requestedPage = 1) {
 
 async function openDocumentRecord(record, options = {}) {
   if (!record?.blob) {
-    showStatus("这个 PDF 记录不可用。");
+    showStatus("这个文件记录不可用。");
     return;
   }
 
-  if (pdfDoc) {
+  if (pdfDoc || epubBook) {
     persistReaderPositionNow();
   }
 
+  const format = getDocumentFormat(record);
   state.documentId = record.id;
-  state.fileName = record.name || "未命名.pdf";
+  state.format = format;
+  state.fileName = record.name || (format === DOCUMENT_FORMATS.EPUB ? "未命名.epub" : "未命名.pdf");
 
   if (options.resetProgress) {
     state.page = 1;
     state.scrollPage = 1;
     state.scrollOffsetRatio = 0;
     state.scrollTop = 0;
+    state.epubCfi = "";
+    state.epubProgress = 0;
     state.zoom = 1;
   } else {
     applyDocumentProgress(record.id, options.fallbackPage || 1);
   }
 
-  await loadPdfFromBlob(record.blob, { id: record.id, name: record.name }, state.page);
+  if (format === DOCUMENT_FORMATS.EPUB) {
+    await loadEpubFromBlob(record.blob, { id: record.id, name: state.fileName });
+  } else {
+    await loadPdfFromBlob(record.blob, { id: record.id, name: state.fileName }, state.page);
+  }
+
   await touchStoredDocument(record.id).catch(() => {});
   saveReaderState();
   renderLibraryList();
@@ -1333,7 +1556,7 @@ async function openDocumentFromLibrary(documentId) {
   const record = await getStoredDocument(documentId).catch(() => null);
 
   if (!record?.blob) {
-    showStatus("这个 PDF 已经不在本机存储里。");
+    showStatus("这个文件已经不在本机存储里。");
     renderLibraryList();
     return;
   }
@@ -1343,8 +1566,8 @@ async function openDocumentFromLibrary(documentId) {
 }
 
 async function handleFileSelection(file) {
-  if (!isPdfFile(file)) {
-    showStatus("请选择 PDF 文件。");
+  if (!isSupportedDocumentFile(file)) {
+    showStatus("请选择 PDF 或 EPUB 文件。");
     return;
   }
 
@@ -1355,8 +1578,14 @@ async function handleFileSelection(file) {
     showStatus("已加入书架。");
   } catch (error) {
     console.error(error);
-    showStatus("PDF 已选择，但保存到书架失败。", true);
-    await loadPdfFromBlob(file, { name: file.name || "未命名.pdf" }, 1);
+    const format = getDocumentFormatFromFile(file);
+    showStatus("文件已选择，但保存到书架失败。", true);
+
+    if (format === DOCUMENT_FORMATS.EPUB) {
+      await loadEpubFromBlob(file, { name: file.name || "未命名.epub" });
+    } else {
+      await loadPdfFromBlob(file, { name: file.name || "未命名.pdf" }, 1);
+    }
   }
 }
 
@@ -1379,10 +1608,16 @@ async function restoreLastDocument() {
     }
 
     state.documentId = record.id;
-    state.fileName = record.name || "未命名.pdf";
+    state.format = getDocumentFormat(record);
+    state.fileName =
+      record.name || (state.format === DOCUMENT_FORMATS.EPUB ? "未命名.epub" : "未命名.pdf");
     applyDocumentProgress(record.id, state.page || 1);
     showStatus("正在恢复上次阅读...", true);
-    await loadPdfFromBlob(record.blob, { id: record.id, name: state.fileName }, state.page);
+    if (state.format === DOCUMENT_FORMATS.EPUB) {
+      await loadEpubFromBlob(record.blob, { id: record.id, name: state.fileName });
+    } else {
+      await loadPdfFromBlob(record.blob, { id: record.id, name: state.fileName }, state.page);
+    }
     renderLibraryList();
   } catch (error) {
     console.warn(error);
@@ -1404,7 +1639,10 @@ async function deleteDocumentFromLibrary(documentId) {
   if (isActiveDocument) {
     await closeCurrentDocument();
     state.documentId = "";
+    state.format = DOCUMENT_FORMATS.PDF;
     state.fileName = "";
+    state.epubCfi = "";
+    state.epubProgress = 0;
     state.page = 1;
     state.scrollPage = 1;
     state.scrollOffsetRatio = 0;
@@ -1435,7 +1673,12 @@ async function renderLibraryList() {
       const name = document.createElement("span");
       const meta = document.createElement("span");
       const deleteButton = document.createElement("button");
+      const format = getDocumentFormat(record);
       const page = progress?.page || 1;
+      const progressLabel =
+        format === DOCUMENT_FORMATS.EPUB
+          ? `${Math.round(clamp(progress?.epubProgress || 0, 0, 1) * 100)}%`
+          : `第 ${page} 页`;
       const isActive = record.id === state.documentId;
 
       item.className = "library-item";
@@ -1445,10 +1688,11 @@ async function renderLibraryList() {
       openButton.type = "button";
 
       name.className = "library-name";
-      name.textContent = record.name || "未命名.pdf";
+      name.textContent =
+        record.name || (format === DOCUMENT_FORMATS.EPUB ? "未命名.epub" : "未命名.pdf");
 
       meta.className = "library-meta";
-      meta.textContent = `${isActive ? "正在阅读 · " : ""}第 ${page} 页 · ${formatFileSize(record.size || record.blob?.size || 0)}`;
+      meta.textContent = `${isActive ? "正在阅读 · " : ""}${format.toUpperCase()} · ${progressLabel} · ${formatFileSize(record.size || record.blob?.size || 0)}`;
 
       deleteButton.className = "library-delete";
       deleteButton.type = "button";
@@ -1472,7 +1716,7 @@ async function renderLibraryList() {
 }
 
 function persistReaderPositionNow() {
-  if (!pdfDoc) {
+  if (!pdfDoc && !epubBook) {
     return;
   }
 
@@ -1547,14 +1791,33 @@ function wireEvents() {
     }
   });
 
-  els.prevButton.addEventListener("click", () => goToPage(state.page - 1));
-  els.nextButton.addEventListener("click", () => goToPage(state.page + 1));
+  els.prevButton.addEventListener("click", () => {
+    if (isEpubDocument()) {
+      navigateEpub("prev");
+      return;
+    }
+
+    goToPage(state.page - 1);
+  });
+  els.nextButton.addEventListener("click", () => {
+    if (isEpubDocument()) {
+      navigateEpub("next");
+      return;
+    }
+
+    goToPage(state.page + 1);
+  });
   els.jumpTopButton.addEventListener("click", () => handleContinuousEdgeJump("top"));
   els.jumpBottomButton.addEventListener("click", () => handleContinuousEdgeJump("bottom"));
   els.pagedModeButton.addEventListener("click", () => setReadMode(READ_MODES.PAGED));
   els.scrollModeButton.addEventListener("click", () => setReadMode(READ_MODES.SCROLL));
 
   els.pageInput.addEventListener("change", () => {
+    if (isEpubDocument()) {
+      updateControls();
+      return;
+    }
+
     const page = Number.parseInt(els.pageInput.value, 10);
     if (Number.isFinite(page)) {
       goToPage(page);
@@ -1623,6 +1886,11 @@ function wireEvents() {
     lastViewportChangeAt = Date.now();
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
+      if (epubRendition) {
+        epubRendition.resize("100%", "100%", state.epubCfi || undefined);
+        return;
+      }
+
       if (!pdfDoc) {
         return;
       }
@@ -1655,16 +1923,24 @@ function wireEvents() {
       return;
     }
 
-    if (!pdfDoc || event.target === els.pageInput) {
+    if ((!pdfDoc && !epubBook) || event.target === els.pageInput) {
       return;
     }
 
     if (event.key === "ArrowLeft") {
-      goToPage(state.page - 1);
+      if (isEpubDocument()) {
+        navigateEpub("prev");
+      } else {
+        goToPage(state.page - 1);
+      }
     }
 
     if (event.key === "ArrowRight") {
-      goToPage(state.page + 1);
+      if (isEpubDocument()) {
+        navigateEpub("next");
+      } else {
+        goToPage(state.page + 1);
+      }
     }
   });
 

@@ -255,6 +255,32 @@ h1 {
   scroll-behavior: smooth;
 }
 
+.epub-pane {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  background:
+    linear-gradient(90deg, rgba(36, 33, 29, 0.04) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(36, 33, 29, 0.04) 1px, transparent 1px),
+    #ede7dc;
+  background-size: 20px 20px;
+  padding: 16px;
+}
+
+.epub-viewer {
+  width: min(860px, 100%);
+  height: 100%;
+  margin: 0 auto;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--surface);
+  box-shadow: 0 12px 35px rgba(43, 36, 28, 0.22);
+}
+
+.epub-viewer iframe {
+  background: var(--surface);
+}
+
 canvas {
   display: block;
   max-width: none;
@@ -684,6 +710,10 @@ canvas {
   .canvas-wrap {
     padding: 10px;
   }
+
+  .epub-pane {
+    padding: 10px;
+  }
 }
 
 @media (prefers-color-scheme: dark) {
@@ -709,6 +739,14 @@ canvas {
   }
 
   .canvas-wrap {
+    background:
+      linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+      #161410;
+    background-size: 20px 20px;
+  }
+
+  .epub-pane {
     background:
       linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
       linear-gradient(180deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
