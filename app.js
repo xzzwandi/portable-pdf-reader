@@ -11,7 +11,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v16";
+const APP_VERSION = "v17";
 const DOCUMENT_FORMATS = {
   PDF: "pdf",
   EPUB: "epub",
@@ -68,6 +68,10 @@ const els = {
 let pdfDoc = null;
 let epubBook = null;
 let epubRendition = null;
+let epubAtEnd = false;
+let epubAtStart = false;
+let epubNavigationInProgress = false;
+let epubLoadingTimer = null;
 let renderTask = null;
 let pageObserver = null;
 let lastViewportChangeAt = 0;
@@ -111,6 +115,14 @@ function isPdfDocument() {
 
 function isEpubDocument() {
   return state.format === DOCUMENT_FORMATS.EPUB;
+}
+
+function getEpubChapterTotal() {
+  return Math.max(epubBook?.spine?.length || state.page || 1, 1);
+}
+
+function getEpubProgressPercent() {
+  return Math.round(clamp(state.epubProgress || 0, 0, 1) * 100);
 }
 
 function isScrollTrackingSuppressed() {
@@ -642,6 +654,8 @@ function updateControls() {
   const hasDocument = Boolean(pdfDoc || epubBook);
   const epubMode = hasDocument && isEpubDocument();
   const total = pdfDoc?.numPages || 0;
+  const epubTotal = getEpubChapterTotal();
+  const epubPercent = getEpubProgressPercent();
   const pagedMode = !epubMode && state.mode === READ_MODES.PAGED;
   const scrollMode = !epubMode && state.mode !== READ_MODES.PAGED;
 
@@ -651,13 +665,15 @@ function updateControls() {
   els.prevButton.setAttribute("aria-label", epubMode ? "上一章" : "上一页");
   els.nextButton.setAttribute("aria-label", epubMode ? "下一章" : "下一页");
   els.pageInput.value = epubMode
-    ? String(Math.round(clamp(state.epubProgress || 0, 0, 1) * 100))
+    ? String(clamp(state.page || 1, 1, epubTotal))
     : String(hasDocument ? state.page : 1);
-  els.pageInput.max = String(Math.max(total, 1));
-  els.pageTotal.textContent = epubMode ? "%" : `/ ${total}`;
+  els.pageInput.max = String(epubMode ? epubTotal : Math.max(total, 1));
+  els.pageTotal.textContent = epubMode ? `章 / ${epubTotal} · ${epubPercent}%` : `/ ${total}`;
 
-  els.prevButton.disabled = !hasDocument || (!epubMode && state.page <= 1);
-  els.nextButton.disabled = !hasDocument || (!epubMode && state.page >= total);
+  els.prevButton.disabled =
+    !hasDocument || (epubMode ? epubNavigationInProgress || epubAtStart : state.page <= 1);
+  els.nextButton.disabled =
+    !hasDocument || (epubMode ? epubNavigationInProgress || epubAtEnd : state.page >= total);
   els.pageInput.disabled = !hasDocument || epubMode;
   els.zoomOutButton.disabled = !hasDocument || epubMode || state.zoom <= 0.6;
   els.zoomInButton.disabled = !hasDocument || epubMode || state.zoom >= 2.6;
@@ -701,6 +717,7 @@ function clearContinuousPages() {
 
 async function closeCurrentDocument() {
   renderToken += 1;
+  setEpubLoading(false);
   await cancelCurrentRender();
   clearContinuousPages();
 
@@ -708,6 +725,8 @@ async function closeCurrentDocument() {
   els.canvas.removeAttribute("height");
   els.canvas.removeAttribute("style");
   els.epubViewer.replaceChildren();
+  epubAtEnd = false;
+  epubAtStart = false;
 
   if (pdfDoc) {
     const oldDoc = pdfDoc;
@@ -959,6 +978,24 @@ function getContinuousPageTop(shell) {
 
 function getContinuousMaxScrollTop() {
   return Math.max(0, els.canvasWrap.scrollHeight - els.canvasWrap.clientHeight);
+}
+
+function setEpubLoading(loading, message = "正在排版...") {
+  window.clearTimeout(epubLoadingTimer);
+  epubNavigationInProgress = loading;
+
+  if (loading) {
+    els.epubPane.dataset.loadingText = message;
+    els.epubPane.classList.add("is-loading");
+    updateControls();
+    return;
+  }
+
+  epubLoadingTimer = window.setTimeout(() => {
+    els.epubPane.classList.remove("is-loading");
+    delete els.epubPane.dataset.loadingText;
+    updateControls();
+  }, 120);
 }
 
 function getDocumentMaxScrollTop() {
@@ -1382,9 +1419,14 @@ function updateEpubLocation(location) {
     return;
   }
 
+  const total = getEpubChapterTotal();
+  epubAtStart = Boolean(location.atStart);
+  epubAtEnd = Boolean(location.atEnd);
   state.epubCfi = location.start.cfi || state.epubCfi;
-  state.epubProgress = estimateEpubProgress(location);
-  state.page = Number.isFinite(location.start.index) ? location.start.index + 1 : state.page;
+  state.epubProgress = epubAtEnd ? 1 : estimateEpubProgress(location);
+  state.page = Number.isFinite(location.start.index)
+    ? clamp(location.start.index + 1, 1, total)
+    : clamp(state.page || 1, 1, total);
   updateControls();
 
   window.clearTimeout(scrollStateTimer);
@@ -1394,8 +1436,11 @@ function updateEpubLocation(location) {
 async function loadEpubFromBlob(blob, meta = {}) {
   await closeCurrentDocument();
   state.format = DOCUMENT_FORMATS.EPUB;
+  epubAtEnd = false;
+  epubAtStart = false;
   setReaderVisible(true);
   updateViewerMode();
+  setEpubLoading(true, "正在排版 EPUB...");
   showStatus("正在打开 EPUB...", true);
 
   try {
@@ -1437,6 +1482,8 @@ async function loadEpubFromBlob(blob, meta = {}) {
 
     updateControls();
     await epubRendition.display(state.epubCfi || undefined);
+    await waitForNextFrame();
+    await waitForNextFrame();
     const location = epubRendition.currentLocation?.();
 
     if (location) {
@@ -1445,8 +1492,10 @@ async function loadEpubFromBlob(blob, meta = {}) {
 
     saveReaderState();
     hideStatus();
+    setEpubLoading(false);
   } catch (error) {
     console.error(error);
+    setEpubLoading(false);
     await closeCurrentDocument();
     state.format = DOCUMENT_FORMATS.PDF;
     setReaderVisible(false);
@@ -1456,9 +1505,11 @@ async function loadEpubFromBlob(blob, meta = {}) {
 }
 
 async function navigateEpub(direction) {
-  if (!epubRendition) {
+  if (!epubRendition || epubNavigationInProgress) {
     return;
   }
+
+  setEpubLoading(true, direction === "prev" ? "正在打开上一章..." : "正在打开下一章...");
 
   try {
     if (direction === "prev") {
@@ -1467,6 +1518,8 @@ async function navigateEpub(direction) {
       await epubRendition.next();
     }
 
+    await waitForNextFrame();
+    await waitForNextFrame();
     const location = epubRendition.currentLocation?.();
     if (location) {
       updateEpubLocation(location);
@@ -1474,6 +1527,8 @@ async function navigateEpub(direction) {
   } catch (error) {
     console.error(error);
     showStatus("EPUB 跳转失败。", true);
+  } finally {
+    setEpubLoading(false);
   }
 }
 
