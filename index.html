@@ -4,46 +4,49 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#f7f3eb" />
-    <title>随身 PDF</title>
+    <title>随身阅读</title>
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./icons/icon.svg" />
-    <link rel="stylesheet" href="./styles.css?v=15" />
+    <link rel="stylesheet" href="./styles.css?v=16" />
   </head>
   <body>
     <div class="app-shell">
       <header class="topbar">
         <div class="brand">
-          <span class="brand-mark" aria-hidden="true">PDF</span>
+          <span class="brand-mark" aria-hidden="true">读</span>
           <div>
             <div class="brand-title">
-              <h1>随身 PDF</h1>
-              <span id="appVersion" class="version-badge">v15</span>
+              <h1>随身阅读</h1>
+              <span id="appVersion" class="version-badge">v16</span>
             </div>
             <p id="docName">未打开文件</p>
           </div>
         </div>
 
         <div class="actions">
-          <input id="fileInput" type="file" accept="application/pdf,.pdf" hidden />
+          <input id="fileInput" type="file" accept="application/pdf,.pdf,application/epub+zip,.epub" hidden />
           <button id="lockButton" type="button">锁</button>
           <button id="libraryButton" type="button">书架</button>
-          <button id="openButton" class="primary" type="button">打开 PDF</button>
+          <button id="openButton" class="primary" type="button">打开文件</button>
         </div>
       </header>
 
       <main class="reader">
         <section id="emptyState" class="empty-state">
-          <div class="empty-mark" aria-hidden="true">PDF</div>
-          <h2>选择一个 PDF 开始</h2>
-          <p>文件保存在这台设备的浏览器里。</p>
-          <button id="emptyOpenButton" class="primary large" type="button">打开 PDF</button>
+          <div class="empty-mark" aria-hidden="true">书</div>
+          <h2>选择一个文件开始</h2>
+          <p>PDF 和 EPUB 都会保存在这台设备的浏览器里。</p>
+          <button id="emptyOpenButton" class="primary large" type="button">打开文件</button>
         </section>
 
         <section id="viewerPane" class="viewer-pane" hidden>
           <div class="canvas-wrap" id="canvasWrap">
             <canvas id="pdfCanvas"></canvas>
             <div id="continuousPages" class="continuous-pages" hidden></div>
+          </div>
+          <div id="epubPane" class="epub-pane" hidden>
+            <div id="epubViewer" class="epub-viewer"></div>
           </div>
         </section>
       </main>
@@ -123,6 +126,8 @@
       </div>
     </div>
 
-    <script type="module" src="./app.js?v=15"></script>
+    <script src="./vendor/jszip/jszip.min.js?v=16"></script>
+    <script src="./vendor/epubjs/epub.min.js?v=16"></script>
+    <script type="module" src="./app.js?v=16"></script>
   </body>
 </html>
