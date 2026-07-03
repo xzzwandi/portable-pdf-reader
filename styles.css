@@ -344,10 +344,13 @@ canvas {
   gap: 8px;
 }
 
-.page-shell:not([data-rendered="true"]) canvas {
+.page-placeholder {
+  display: block;
   width: min(100%, 520px);
   height: min(70vh, 680px);
+  border-radius: 3px;
   background: rgba(255, 253, 248, 0.64);
+  box-shadow: 0 12px 35px rgba(43, 36, 28, 0.16);
 }
 
 .page-label {
