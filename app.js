@@ -11,7 +11,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v49";
+const APP_VERSION = "v51";
 const DOCUMENT_FORMATS = {
   PDF: "pdf",
   EPUB: "epub",
@@ -28,6 +28,10 @@ const PDF_RANGE_CHUNK_SIZE = 1_048_576;
 const MAX_PAGED_CANVAS_PIXELS = 18_000_000;
 const MAX_CONTINUOUS_CANVAS_PIXELS = 6_500_000;
 const MAX_CANVAS_DIMENSION = 8192;
+const FULLSCREEN_EPUB_SWIPE_DISTANCE = 72;
+const FULLSCREEN_EPUB_SWIPE_MAX_DRIFT = 52;
+const TOC_RENDER_BATCH_SIZE = 72;
+const TOC_RENDER_SCROLL_THRESHOLD = 320;
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -109,9 +113,15 @@ let statusTimer = null;
 let resizeTimer = null;
 let scrollStateTimer = null;
 let touchStart = null;
+let epubPaneTouchStart = null;
 let overlayTouchY = 0;
 let appFullscreen = false;
 let syncingNativeFullscreen = false;
+let epubTocEntriesCache = null;
+let epubSectionHrefIndex = null;
+let tocEntries = [];
+let tocActiveIndex = null;
+let tocRenderedCount = 0;
 
 const pageRenderTasks = new Map();
 const continuousRenderPromises = new Map();
@@ -823,6 +833,7 @@ function updateControls() {
   const pagedMode = !epubMode && state.mode === READ_MODES.PAGED;
   const scrollMode = !epubMode && state.mode !== READ_MODES.PAGED;
   const showEdgeJumps = hasDocument && (epubMode || scrollMode);
+  const fullscreenEpubMode = epubMode && appFullscreen;
 
   els.docName.textContent = state.fileName || "未打开文件";
   els.prevButton.textContent = epubMode ? "上一章" : "上一页";
@@ -847,8 +858,16 @@ function updateControls() {
   els.tocButton.hidden = !epubMode;
   els.tocButton.disabled = !epubMode || epubNavigationInProgress;
   els.edgeJumpGroup.hidden = !showEdgeJumps;
-  els.jumpTopButton.disabled = !showEdgeJumps || (epubMode && epubNavigationInProgress);
-  els.jumpBottomButton.disabled = !showEdgeJumps || (epubMode && epubNavigationInProgress);
+  els.edgeJumpGroup.setAttribute(
+    "aria-label",
+    fullscreenEpubMode ? "章节切换" : "连续模式跳转",
+  );
+  els.jumpTopButton.setAttribute("aria-label", fullscreenEpubMode ? "上一章" : "跳到顶部");
+  els.jumpBottomButton.setAttribute("aria-label", fullscreenEpubMode ? "下一章" : "跳到底部");
+  els.jumpTopButton.disabled =
+    !showEdgeJumps || (epubMode && (epubNavigationInProgress || (fullscreenEpubMode && epubAtStart)));
+  els.jumpBottomButton.disabled =
+    !showEdgeJumps || (epubMode && (epubNavigationInProgress || (fullscreenEpubMode && epubAtEnd)));
   els.pagedModeButton.disabled = epubMode;
   els.scrollModeButton.disabled = epubMode;
 
@@ -899,6 +918,7 @@ async function closeCurrentDocument() {
   els.canvas.removeAttribute("height");
   els.canvas.removeAttribute("style");
   els.epubViewer.replaceChildren();
+  resetEpubTocCache();
   epubAtEnd = false;
   epubAtStart = false;
   epubLastKnownIndex = 0;
@@ -3466,6 +3486,7 @@ async function fixEpubImages(section, view) {
   ensureEpubImageStyles(documentElement);
   bindEpubDocumentPreviewHandler(documentElement);
   installEpubImageObserver(documentElement);
+  installEpubGestureNavigation(documentElement);
   const generated = await generateEpubLargeImageBlocks(section, documentElement);
   markEpubImagesForExpansion(documentElement);
 
@@ -3520,6 +3541,132 @@ async function waitForEpubImageRepairs(timeout = 1400) {
   }
 }
 
+function isFullscreenEpubGestureEnabled() {
+  return (
+    appFullscreen &&
+    isEpubDocument() &&
+    Boolean(epubBook) &&
+    Boolean(epubRendition) &&
+    !epubNavigationInProgress &&
+    els.lockOverlay.hidden &&
+    els.libraryOverlay.hidden &&
+    els.tocOverlay.hidden &&
+    els.imageOverlay.hidden
+  );
+}
+
+function isInteractiveEpubGestureTarget(target) {
+  return Boolean(
+    target?.closest?.(
+      [
+        "a",
+        "button",
+        "input",
+        "textarea",
+        "select",
+        "img",
+        "svg",
+        "image",
+        "[role='button']",
+        "[contenteditable='true']",
+        "[data-portable-reader-image]",
+        "[data-portable-reader-generated-block]",
+      ].join(","),
+    ),
+  );
+}
+
+function handleFullscreenEpubSwipe(start, end) {
+  if (!isFullscreenEpubGestureEnabled()) {
+    return false;
+  }
+
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+
+  if (
+    Math.abs(dx) < FULLSCREEN_EPUB_SWIPE_DISTANCE ||
+    Math.abs(dy) > FULLSCREEN_EPUB_SWIPE_MAX_DRIFT
+  ) {
+    return false;
+  }
+
+  navigateEpub(dx < 0 ? "next" : "prev").catch((error) => {
+    console.error(error);
+    showStatus("章节切换失败，请再滑一次。", true);
+  });
+  return true;
+}
+
+function installEpubGestureNavigation(documentElement) {
+  const body = documentElement?.body;
+
+  if (!documentElement || !body || body.dataset.portableReaderGestureNavigation === "true") {
+    return;
+  }
+
+  body.dataset.portableReaderGestureNavigation = "true";
+  let start = null;
+
+  documentElement.addEventListener(
+    "touchstart",
+    (event) => {
+      if (
+        event.touches?.length !== 1 ||
+        !isFullscreenEpubGestureEnabled() ||
+        isInteractiveEpubGestureTarget(event.target)
+      ) {
+        start = null;
+        return;
+      }
+
+      const touch = event.changedTouches?.[0];
+      if (!touch) {
+        start = null;
+        return;
+      }
+
+      start = {
+        x: touch.clientX,
+        y: touch.clientY,
+      };
+    },
+    { passive: true },
+  );
+
+  documentElement.addEventListener(
+    "touchend",
+    (event) => {
+      if (!start) {
+        return;
+      }
+
+      const touch = event.changedTouches?.[0];
+      if (!touch) {
+        start = null;
+        return;
+      }
+
+      const currentStart = start;
+      start = null;
+
+      handleFullscreenEpubSwipe(currentStart, {
+        x: touch.clientX,
+        y: touch.clientY,
+      });
+    },
+    { passive: true },
+  );
+
+  documentElement.addEventListener(
+    "touchcancel",
+    () => {
+      start = null;
+    },
+    { passive: true },
+  );
+}
+
 function installEpubContentImageHook() {
   epubRendition?.hooks?.content?.register?.((contents) => {
     const documentElement = contents?.document || contents?.content?.ownerDocument;
@@ -3531,6 +3678,7 @@ function installEpubContentImageHook() {
     ensureEpubImageStyles(documentElement);
     bindEpubDocumentPreviewHandler(documentElement);
     installEpubImageObserver(documentElement);
+    installEpubGestureNavigation(documentElement);
     markEpubImagesForExpansion(documentElement);
   });
 }
@@ -3802,6 +3950,14 @@ async function jumpToEpubEdge(edge) {
 
 function handleEdgeJump(edge) {
   if (isEpubDocument()) {
+    if (appFullscreen) {
+      navigateEpub(edge === "top" ? "prev" : "next").catch((error) => {
+        console.error(error);
+        showStatus("章节切换失败，请再点一次。", true);
+      });
+      return;
+    }
+
     jumpToEpubEdge(edge).catch((error) => {
       console.error(error);
       showStatus("跳转失败，请再点一次。", true);
@@ -3968,6 +4124,9 @@ function closeToc() {
   els.tocOverlay.hidden = true;
   els.tocList.replaceChildren();
   els.tocEmptyState.hidden = true;
+  tocEntries = [];
+  tocActiveIndex = null;
+  tocRenderedCount = 0;
   updatePanelScrollLock();
 }
 
@@ -3978,9 +4137,9 @@ function openToc() {
   }
 
   closeLibrary();
-  renderTocList();
   els.tocOverlay.hidden = false;
   updatePanelScrollLock();
+  renderTocList();
 }
 
 function updatePanelScrollLock() {
@@ -4091,6 +4250,34 @@ function getEpubSectionHrefCandidates(section) {
     .filter(Boolean);
 }
 
+function resetEpubTocCache() {
+  epubTocEntriesCache = null;
+  epubSectionHrefIndex = null;
+  tocEntries = [];
+  tocActiveIndex = null;
+  tocRenderedCount = 0;
+}
+
+function getEpubSectionHrefIndex() {
+  if (epubSectionHrefIndex) {
+    return epubSectionHrefIndex;
+  }
+
+  epubSectionHrefIndex = new Map();
+
+  for (let index = 0; index < getEpubChapterTotal(); index += 1) {
+    const section = getEpubSectionAt(index);
+
+    for (const candidate of getEpubSectionHrefCandidates(section)) {
+      if (!epubSectionHrefIndex.has(candidate)) {
+        epubSectionHrefIndex.set(candidate, section);
+      }
+    }
+  }
+
+  return epubSectionHrefIndex;
+}
+
 function findEpubSectionByHref(href) {
   const target = normalizeEpubTocHref(href);
 
@@ -4098,11 +4285,15 @@ function findEpubSectionByHref(href) {
     return null;
   }
 
-  for (let index = 0; index < getEpubChapterTotal(); index += 1) {
-    const section = getEpubSectionAt(index);
-    const candidates = getEpubSectionHrefCandidates(section);
+  const sectionIndex = getEpubSectionHrefIndex();
+  const exactSection = sectionIndex.get(target);
 
-    if (candidates.some((candidate) => epubTocHrefsMatch(candidate, target))) {
+  if (exactSection) {
+    return exactSection;
+  }
+
+  for (const [candidate, section] of sectionIndex) {
+    if (epubTocHrefsMatch(candidate, target)) {
       return section;
     }
   }
@@ -4132,11 +4323,16 @@ function flattenEpubTocItems(items, depth = 0, entries = []) {
 }
 
 function getEpubTocEntries() {
+  if (epubTocEntriesCache) {
+    return epubTocEntriesCache;
+  }
+
   const navigationItems = epubBook?.navigation?.toc || [];
   const entries = flattenEpubTocItems(navigationItems);
 
   if (entries.length) {
-    return entries;
+    epubTocEntriesCache = entries;
+    return epubTocEntriesCache;
   }
 
   const fallbackEntries = [];
@@ -4152,7 +4348,8 @@ function getEpubTocEntries() {
     });
   }
 
-  return fallbackEntries;
+  epubTocEntriesCache = fallbackEntries;
+  return epubTocEntriesCache;
 }
 
 async function jumpToEpubTocEntry(entry) {
@@ -4216,32 +4413,94 @@ async function jumpToEpubTocEntry(entry) {
   }
 }
 
-function renderTocList() {
-  const entries = getEpubTocEntries();
-  const activeIndex = getEpubNavigationBaseIndex();
+function createTocItem(entry, index) {
+  const item = document.createElement("button");
+  const title = document.createElement("span");
+  const isActive = entry.sectionIndex === tocActiveIndex;
+
+  item.className = "toc-item";
+  item.type = "button";
+  item.dataset.tocIndex = String(index);
+  item.style.paddingLeft = `${10 + Math.min(entry.depth || 0, 4) * 14}px`;
+  item.classList.toggle("active", isActive);
+
+  title.className = "toc-name";
+  title.textContent = entry.label || `第 ${index + 1} 章`;
+
+  item.append(title);
+  return item;
+}
+
+function appendTocBatch() {
+  if (!tocEntries.length || tocRenderedCount >= tocEntries.length) {
+    return;
+  }
+
   const fragment = document.createDocumentFragment();
+  const start = tocRenderedCount;
+  const end = Math.min(start + TOC_RENDER_BATCH_SIZE, tocEntries.length);
 
-  els.tocEmptyState.hidden = entries.length > 0;
+  for (let index = start; index < end; index += 1) {
+    fragment.append(createTocItem(tocEntries[index], index));
+  }
 
-  entries.forEach((entry, index) => {
-    const item = document.createElement("button");
-    const title = document.createElement("span");
-    const isActive = entry.sectionIndex === activeIndex;
+  tocRenderedCount = end;
+  els.tocList.append(fragment);
+}
 
-    item.className = "toc-item";
-    item.type = "button";
-    item.style.paddingLeft = `${10 + Math.min(entry.depth || 0, 4) * 14}px`;
-    item.classList.toggle("active", isActive);
+function fillTocViewport() {
+  let guard = 0;
 
-    title.className = "toc-name";
-    title.textContent = entry.label || `第 ${index + 1} 章`;
+  while (
+    tocRenderedCount < tocEntries.length &&
+    els.tocList.scrollHeight <= els.tocList.clientHeight + TOC_RENDER_SCROLL_THRESHOLD &&
+    guard < 8
+  ) {
+    appendTocBatch();
+    guard += 1;
+  }
+}
 
-    item.append(title);
-    item.addEventListener("click", () => jumpToEpubTocEntry(entry));
-    fragment.append(item);
-  });
+function maybeAppendTocBatch() {
+  if (els.tocOverlay.hidden || tocRenderedCount >= tocEntries.length) {
+    return;
+  }
 
-  els.tocList.replaceChildren(fragment);
+  const distanceToBottom =
+    els.tocList.scrollHeight - els.tocList.scrollTop - els.tocList.clientHeight;
+
+  if (distanceToBottom <= TOC_RENDER_SCROLL_THRESHOLD) {
+    appendTocBatch();
+    fillTocViewport();
+  }
+}
+
+function renderTocList() {
+  tocEntries = getEpubTocEntries();
+  tocActiveIndex = getEpubNavigationBaseIndex();
+  tocRenderedCount = 0;
+
+  els.tocList.replaceChildren();
+  els.tocList.scrollTop = 0;
+  els.tocEmptyState.hidden = tocEntries.length > 0;
+
+  appendTocBatch();
+  window.requestAnimationFrame(fillTocViewport);
+}
+
+function handleTocListClick(event) {
+  const item = event.target?.closest?.(".toc-item");
+
+  if (!item || !els.tocList.contains(item)) {
+    return;
+  }
+
+  const index = Number.parseInt(item.dataset.tocIndex || "", 10);
+  const entry = tocEntries[index] || getEpubTocEntries()[index];
+
+  if (entry) {
+    jumpToEpubTocEntry(entry);
+  }
 }
 
 async function deleteDocumentFromLibrary(documentId) {
@@ -4392,6 +4651,8 @@ function wireEvents() {
   els.libraryCloseButton.addEventListener("click", closeLibrary);
   els.tocButton.addEventListener("click", openToc);
   els.tocCloseButton.addEventListener("click", closeToc);
+  els.tocList.addEventListener("click", handleTocListClick);
+  els.tocList.addEventListener("scroll", maybeAppendTocBatch, { passive: true });
   els.imageCloseButton.addEventListener("click", closeImagePreview);
   els.imageOverlay.addEventListener("click", (event) => {
     if (event.target === els.imageOverlay) {
@@ -4634,6 +4895,64 @@ function wireEvents() {
       if (Math.abs(dx) > 72 && Math.abs(dy) < 48) {
         goToPage(dx < 0 ? state.page + 1 : state.page - 1);
       }
+    },
+    { passive: true },
+  );
+
+  els.epubPane.addEventListener(
+    "touchstart",
+    (event) => {
+      if (
+        event.touches?.length !== 1 ||
+        !isFullscreenEpubGestureEnabled() ||
+        isInteractiveEpubGestureTarget(event.target)
+      ) {
+        epubPaneTouchStart = null;
+        return;
+      }
+
+      const touch = event.changedTouches?.[0];
+      if (!touch) {
+        epubPaneTouchStart = null;
+        return;
+      }
+
+      epubPaneTouchStart = {
+        x: touch.clientX,
+        y: touch.clientY,
+      };
+    },
+    { passive: true },
+  );
+
+  els.epubPane.addEventListener(
+    "touchend",
+    (event) => {
+      if (!epubPaneTouchStart) {
+        return;
+      }
+
+      const touch = event.changedTouches?.[0];
+      if (!touch) {
+        epubPaneTouchStart = null;
+        return;
+      }
+
+      const currentStart = epubPaneTouchStart;
+      epubPaneTouchStart = null;
+
+      handleFullscreenEpubSwipe(currentStart, {
+        x: touch.clientX,
+        y: touch.clientY,
+      });
+    },
+    { passive: true },
+  );
+
+  els.epubPane.addEventListener(
+    "touchcancel",
+    () => {
+      epubPaneTouchStart = null;
     },
     { passive: true },
   );
