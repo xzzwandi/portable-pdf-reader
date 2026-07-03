@@ -1,9 +1,9 @@
-const CACHE_NAME = "portable-pdf-reader-v49";
+const CACHE_NAME = "portable-pdf-reader-v51";
 const APP_SHELL = [
   "./",
   "./index.html",
-  "./styles.css?v=49",
-  "./app.js?v=49",
+  "./styles.css?v=51",
+  "./app.js?v=51",
   "./manifest.webmanifest",
   "./icons/icon.svg",
   "./vendor/jszip/jszip.min.js?v=46",
