@@ -768,6 +768,10 @@ body.is-app-fullscreen .floating-fullscreen:not([hidden]) {
   gap: 6px;
 }
 
+.toc-spacer {
+  pointer-events: none;
+}
+
 .toc-item {
   display: grid;
   align-items: center;

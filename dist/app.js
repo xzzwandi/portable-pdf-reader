@@ -11,7 +11,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v51";
+const APP_VERSION = "v52";
 const DOCUMENT_FORMATS = {
   PDF: "pdf",
   EPUB: "epub",
@@ -32,6 +32,7 @@ const FULLSCREEN_EPUB_SWIPE_DISTANCE = 72;
 const FULLSCREEN_EPUB_SWIPE_MAX_DRIFT = 52;
 const TOC_RENDER_BATCH_SIZE = 72;
 const TOC_RENDER_SCROLL_THRESHOLD = 320;
+const TOC_ITEM_ESTIMATED_HEIGHT = 58;
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -121,7 +122,8 @@ let epubTocEntriesCache = null;
 let epubSectionHrefIndex = null;
 let tocEntries = [];
 let tocActiveIndex = null;
-let tocRenderedCount = 0;
+let tocWindowStart = 0;
+let tocWindowEnd = 0;
 
 const pageRenderTasks = new Map();
 const continuousRenderPromises = new Map();
@@ -4126,7 +4128,8 @@ function closeToc() {
   els.tocEmptyState.hidden = true;
   tocEntries = [];
   tocActiveIndex = null;
-  tocRenderedCount = 0;
+  tocWindowStart = 0;
+  tocWindowEnd = 0;
   updatePanelScrollLock();
 }
 
@@ -4255,7 +4258,8 @@ function resetEpubTocCache() {
   epubSectionHrefIndex = null;
   tocEntries = [];
   tocActiveIndex = null;
-  tocRenderedCount = 0;
+  tocWindowStart = 0;
+  tocWindowEnd = 0;
 }
 
 function getEpubSectionHrefIndex() {
@@ -4431,46 +4435,153 @@ function createTocItem(entry, index) {
   return item;
 }
 
-function appendTocBatch() {
-  if (!tocEntries.length || tocRenderedCount >= tocEntries.length) {
+function createTocSpacer(count) {
+  const spacer = document.createElement("div");
+  spacer.className = "toc-spacer";
+  spacer.style.height = `${Math.max(0, count) * TOC_ITEM_ESTIMATED_HEIGHT}px`;
+  return spacer;
+}
+
+function getActiveTocEntryIndex(entries, activeIndex) {
+  const exactIndex = entries.findIndex((entry) => entry.sectionIndex === activeIndex);
+
+  if (exactIndex >= 0) {
+    return exactIndex;
+  }
+
+  let nearestIndex = -1;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+
+  entries.forEach((entry, index) => {
+    if (!Number.isFinite(entry.sectionIndex)) {
+      return;
+    }
+
+    const distance = Math.abs(entry.sectionIndex - activeIndex);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearestIndex = index;
+    }
+  });
+
+  return nearestIndex >= 0 ? nearestIndex : 0;
+}
+
+function scrollTocEntryIntoView(index) {
+  const item = els.tocList.querySelector(`[data-toc-index="${index}"]`);
+
+  if (!item) {
     return;
   }
 
-  const fragment = document.createDocumentFragment();
-  const start = tocRenderedCount;
-  const end = Math.min(start + TOC_RENDER_BATCH_SIZE, tocEntries.length);
+  item.scrollIntoView({
+    block: "center",
+  });
+}
 
-  for (let index = start; index < end; index += 1) {
+function renderTocWindow(start, end, options = {}) {
+  if (!tocEntries.length) {
+    els.tocList.replaceChildren();
+    tocWindowStart = 0;
+    tocWindowEnd = 0;
+    return;
+  }
+
+  const windowStart = clamp(Math.floor(start), 0, Math.max(tocEntries.length - 1, 0));
+  const windowEnd = clamp(Math.ceil(end), windowStart + 1, tocEntries.length);
+  const previousScrollTop = els.tocList.scrollTop;
+  const fragment = document.createDocumentFragment();
+
+  tocWindowStart = windowStart;
+  tocWindowEnd = windowEnd;
+
+  if (tocWindowStart > 0) {
+    fragment.append(createTocSpacer(tocWindowStart));
+  }
+
+  for (let index = tocWindowStart; index < tocWindowEnd; index += 1) {
     fragment.append(createTocItem(tocEntries[index], index));
   }
 
-  tocRenderedCount = end;
-  els.tocList.append(fragment);
+  if (tocWindowEnd < tocEntries.length) {
+    fragment.append(createTocSpacer(tocEntries.length - tocWindowEnd));
+  }
+  els.tocList.replaceChildren(fragment);
+
+  if (Number.isFinite(options.scrollToIndex)) {
+    window.requestAnimationFrame(() => scrollTocEntryIntoView(options.scrollToIndex));
+    return;
+  }
+
+  if (options.preserveScroll) {
+    window.requestAnimationFrame(() => {
+      els.tocList.scrollTop = previousScrollTop;
+    });
+  }
+}
+
+function renderTocWindowAround(index) {
+  if (!tocEntries.length) {
+    renderTocWindow(0, 0);
+    return;
+  }
+
+  const windowSize = Math.min(TOC_RENDER_BATCH_SIZE, tocEntries.length);
+  const targetIndex = clamp(index, 0, tocEntries.length - 1);
+  const start = clamp(
+    targetIndex - Math.floor(windowSize / 2),
+    0,
+    Math.max(tocEntries.length - windowSize, 0),
+  );
+
+  renderTocWindow(start, start + windowSize, { scrollToIndex: targetIndex });
 }
 
 function fillTocViewport() {
   let guard = 0;
 
   while (
-    tocRenderedCount < tocEntries.length &&
+    tocEntries.length &&
     els.tocList.scrollHeight <= els.tocList.clientHeight + TOC_RENDER_SCROLL_THRESHOLD &&
-    guard < 8
+    guard < 8 &&
+    (tocWindowStart > 0 || tocWindowEnd < tocEntries.length)
   ) {
-    appendTocBatch();
+    const nextStart =
+      tocWindowStart > 0
+        ? Math.max(0, tocWindowStart - TOC_RENDER_BATCH_SIZE)
+        : tocWindowStart;
+    const nextEnd =
+      tocWindowEnd < tocEntries.length
+        ? Math.min(tocEntries.length, tocWindowEnd + TOC_RENDER_BATCH_SIZE)
+        : tocWindowEnd;
+
+    renderTocWindow(nextStart, nextEnd, { preserveScroll: true });
     guard += 1;
   }
 }
 
 function maybeAppendTocBatch() {
-  if (els.tocOverlay.hidden || tocRenderedCount >= tocEntries.length) {
+  if (els.tocOverlay.hidden || !tocEntries.length) {
     return;
   }
 
+  const nearTop = els.tocList.scrollTop <= TOC_RENDER_SCROLL_THRESHOLD;
   const distanceToBottom =
     els.tocList.scrollHeight - els.tocList.scrollTop - els.tocList.clientHeight;
+  const nearBottom = distanceToBottom <= TOC_RENDER_SCROLL_THRESHOLD;
+  let nextStart = tocWindowStart;
+  let nextEnd = tocWindowEnd;
 
-  if (distanceToBottom <= TOC_RENDER_SCROLL_THRESHOLD) {
-    appendTocBatch();
+  if (nearTop && tocWindowStart > 0) {
+    nextStart = Math.max(0, tocWindowStart - TOC_RENDER_BATCH_SIZE);
+  }
+
+  if (nearBottom && tocWindowEnd < tocEntries.length) {
+    nextEnd = Math.min(tocEntries.length, tocWindowEnd + TOC_RENDER_BATCH_SIZE);
+  }
+
+  if (nextStart !== tocWindowStart || nextEnd !== tocWindowEnd) {
+    renderTocWindow(nextStart, nextEnd, { preserveScroll: true });
     fillTocViewport();
   }
 }
@@ -4478,13 +4589,13 @@ function maybeAppendTocBatch() {
 function renderTocList() {
   tocEntries = getEpubTocEntries();
   tocActiveIndex = getEpubNavigationBaseIndex();
-  tocRenderedCount = 0;
+  const activeEntryIndex = getActiveTocEntryIndex(tocEntries, tocActiveIndex);
 
   els.tocList.replaceChildren();
   els.tocList.scrollTop = 0;
   els.tocEmptyState.hidden = tocEntries.length > 0;
 
-  appendTocBatch();
+  renderTocWindowAround(activeEntryIndex);
   window.requestAnimationFrame(fillTocViewport);
 }
 
