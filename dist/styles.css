@@ -437,6 +437,12 @@ canvas {
   font-weight: 650;
 }
 
+.controls > .active {
+  background: var(--ink);
+  color: var(--surface);
+  font-weight: 650;
+}
+
 .edge-jumps {
   display: flex;
   position: fixed;
@@ -479,6 +485,24 @@ canvas {
   padding: 0;
 }
 
+.floating-fullscreen {
+  position: fixed;
+  right: max(16px, env(safe-area-inset-right));
+  bottom: calc(74px + env(safe-area-inset-bottom));
+  z-index: 12;
+  display: none;
+  width: 48px;
+  height: 48px;
+  min-height: 48px;
+  border-color: rgba(36, 33, 29, 0.16);
+  border-radius: 999px;
+  background: rgba(36, 33, 29, 0.92);
+  color: #fff;
+  font-weight: 800;
+  box-shadow: 0 12px 28px rgba(36, 33, 29, 0.28);
+  padding: 0;
+}
+
 .floating-toc {
   position: fixed;
   right: max(16px, env(safe-area-inset-right));
@@ -495,6 +519,62 @@ canvas {
   font-weight: 800;
   box-shadow: 0 12px 28px rgba(36, 33, 29, 0.24);
   padding: 0;
+}
+
+body.is-app-fullscreen {
+  background: #ede7dc;
+}
+
+body.is-app-fullscreen .app-shell {
+  grid-template-rows: 1fr;
+  gap: 0;
+  padding: 0;
+}
+
+body.is-app-fullscreen .topbar {
+  display: none;
+}
+
+body.is-app-fullscreen .reader {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+body.is-app-fullscreen .canvas-wrap,
+body.is-app-fullscreen .epub-pane {
+  padding: 0;
+}
+
+body.is-app-fullscreen .controls {
+  display: block;
+  min-height: 0;
+  height: 0;
+  overflow: visible;
+}
+
+body.is-app-fullscreen .controls > :not(.edge-jumps) {
+  display: none;
+}
+
+body.is-app-fullscreen .floating-toc {
+  display: none !important;
+}
+
+body.is-app-fullscreen .edge-jumps {
+  bottom: calc(182px + env(safe-area-inset-bottom));
+}
+
+body.is-app-fullscreen .floating-lock:not([hidden]) {
+  display: grid;
+  bottom: calc(128px + env(safe-area-inset-bottom));
+  place-items: center;
+}
+
+body.is-app-fullscreen .floating-fullscreen:not([hidden]) {
+  display: grid;
+  place-items: center;
 }
 
 .status {
@@ -848,7 +928,8 @@ canvas {
     padding: 18px;
   }
 
-  .floating-lock {
+  .floating-lock,
+  .floating-fullscreen {
     right: max(12px, env(safe-area-inset-right));
     bottom: calc(66px + env(safe-area-inset-bottom));
     width: 44px;

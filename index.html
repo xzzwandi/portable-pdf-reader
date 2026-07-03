@@ -8,7 +8,7 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./icons/icon.svg" />
-    <link rel="stylesheet" href="./styles.css?v=47" />
+    <link rel="stylesheet" href="./styles.css?v=49" />
   </head>
   <body>
     <div class="app-shell">
@@ -18,7 +18,7 @@
           <div>
             <div class="brand-title">
               <h1>随身阅读</h1>
-              <span id="appVersion" class="version-badge">v47</span>
+              <span id="appVersion" class="version-badge">v49</span>
             </div>
             <p id="docName">未打开文件</p>
           </div>
@@ -73,11 +73,15 @@
 
         <button id="zoomOutButton" type="button" aria-label="缩小">-</button>
         <button id="fitButton" type="button">适宽</button>
+        <button id="fullscreenButton" type="button" aria-pressed="false">全屏</button>
         <button id="zoomInButton" type="button" aria-label="放大">+</button>
       </footer>
 
       <button id="floatingLockButton" class="floating-lock" type="button" aria-label="锁定阅读器">
         锁
+      </button>
+      <button id="floatingFullscreenButton" class="floating-fullscreen" type="button" aria-label="退出全屏" aria-pressed="true" hidden>
+        退
       </button>
       <button id="tocButton" class="floating-toc" type="button" aria-label="打开章节目录" hidden>
         目录
@@ -148,6 +152,6 @@
 
     <script src="./vendor/jszip/jszip.min.js?v=45"></script>
     <script src="./vendor/epubjs/epub.min.js?v=45"></script>
-    <script type="module" src="./app.js?v=47"></script>
+    <script type="module" src="./app.js?v=49"></script>
   </body>
 </html>

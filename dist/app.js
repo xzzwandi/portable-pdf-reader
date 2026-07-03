@@ -11,7 +11,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v47";
+const APP_VERSION = "v49";
 const DOCUMENT_FORMATS = {
   PDF: "pdf",
   EPUB: "epub",
@@ -43,7 +43,9 @@ const els = {
   epubViewer: document.querySelector("#epubViewer"),
   fileInput: document.querySelector("#fileInput"),
   fitButton: document.querySelector("#fitButton"),
+  floatingFullscreenButton: document.querySelector("#floatingFullscreenButton"),
   floatingLockButton: document.querySelector("#floatingLockButton"),
+  fullscreenButton: document.querySelector("#fullscreenButton"),
   imageCloseButton: document.querySelector("#imageCloseButton"),
   imageOverlay: document.querySelector("#imageOverlay"),
   imagePreview: document.querySelector("#imagePreview"),
@@ -108,6 +110,8 @@ let resizeTimer = null;
 let scrollStateTimer = null;
 let touchStart = null;
 let overlayTouchY = 0;
+let appFullscreen = false;
+let syncingNativeFullscreen = false;
 
 const pageRenderTasks = new Map();
 const continuousRenderPromises = new Map();
@@ -705,6 +709,111 @@ function updateViewerMode() {
   els.canvasWrap.classList.toggle("is-continuous", scrollMode);
 }
 
+function updateFullscreenButtons() {
+  const hasDocument = Boolean(pdfDoc || epubBook);
+  const fullscreenLabel = appFullscreen ? "退出全屏" : "全屏";
+
+  els.fullscreenButton.textContent = fullscreenLabel;
+  els.fullscreenButton.disabled = !hasDocument;
+  els.fullscreenButton.classList.toggle("active", appFullscreen);
+  els.fullscreenButton.setAttribute("aria-pressed", String(appFullscreen));
+  els.fullscreenButton.setAttribute("aria-label", fullscreenLabel);
+  els.floatingFullscreenButton.hidden = !appFullscreen || !hasDocument;
+  els.floatingFullscreenButton.textContent = appFullscreen ? "退" : "全";
+  els.floatingFullscreenButton.setAttribute("aria-label", fullscreenLabel);
+  els.floatingFullscreenButton.setAttribute("aria-pressed", String(appFullscreen));
+}
+
+function syncFullscreenLayoutAfterFrame() {
+  window.requestAnimationFrame(() => {
+    lastViewportChangeAt = Date.now();
+
+    if (epubRendition) {
+      epubRendition.resize("100%", "100%", state.epubCfi || undefined);
+      return;
+    }
+
+    if (!pdfDoc) {
+      return;
+    }
+
+    if (isScrollMode()) {
+      renderCurrentView(state.page, { behavior: "auto", restoreScroll: true });
+      return;
+    }
+
+    renderCurrentView(state.page, { behavior: "auto" });
+  });
+}
+
+function setAppFullscreen(enabled, options = {}) {
+  const nextFullscreen = Boolean(enabled);
+
+  if (appFullscreen === nextFullscreen) {
+    updateFullscreenButtons();
+    return;
+  }
+
+  if (pdfDoc && isScrollMode()) {
+    captureContinuousScrollPosition();
+  }
+
+  appFullscreen = nextFullscreen;
+  document.documentElement.classList.toggle("is-app-fullscreen", appFullscreen);
+  document.body.classList.toggle("is-app-fullscreen", appFullscreen);
+  updateFullscreenButtons();
+  updateControls();
+
+  if (options.syncLayout !== false) {
+    syncFullscreenLayoutAfterFrame();
+  }
+}
+
+async function enterNativeFullscreen() {
+  const root = document.documentElement;
+
+  if (!root.requestFullscreen || document.fullscreenElement) {
+    return;
+  }
+
+  syncingNativeFullscreen = true;
+
+  try {
+    await root.requestFullscreen();
+  } catch {
+    // App-level fullscreen still works when native fullscreen is unavailable.
+  } finally {
+    syncingNativeFullscreen = false;
+  }
+}
+
+async function exitNativeFullscreen() {
+  if (!document.exitFullscreen || !document.fullscreenElement) {
+    return;
+  }
+
+  syncingNativeFullscreen = true;
+
+  try {
+    await document.exitFullscreen();
+  } catch {
+    // Best effort only.
+  } finally {
+    syncingNativeFullscreen = false;
+  }
+}
+
+async function toggleAppFullscreen() {
+  const nextFullscreen = !appFullscreen;
+  setAppFullscreen(nextFullscreen);
+
+  if (nextFullscreen) {
+    await enterNativeFullscreen();
+  } else {
+    await exitNativeFullscreen();
+  }
+}
+
 function updateControls() {
   const hasDocument = Boolean(pdfDoc || epubBook);
   const epubMode = hasDocument && isEpubDocument();
@@ -734,6 +843,7 @@ function updateControls() {
   els.zoomOutButton.disabled = !hasDocument || epubMode || state.zoom <= 0.6;
   els.zoomInButton.disabled = !hasDocument || epubMode || state.zoom >= 2.6;
   els.fitButton.disabled = !hasDocument || epubMode;
+  updateFullscreenButtons();
   els.tocButton.hidden = !epubMode;
   els.tocButton.disabled = !epubMode || epubNavigationInProgress;
   els.edgeJumpGroup.hidden = !showEdgeJumps;
@@ -781,6 +891,7 @@ async function closeCurrentDocument() {
   setEpubLoading(false);
   closeImagePreview();
   closeToc();
+  setAppFullscreen(false, { syncLayout: false });
   await cancelCurrentRender();
   clearContinuousPages();
 
@@ -4270,6 +4381,12 @@ function preventLockScroll(event) {
 function wireEvents() {
   els.openButton.addEventListener("click", openFilePicker);
   els.emptyOpenButton.addEventListener("click", openFilePicker);
+  els.fullscreenButton.addEventListener("click", () => {
+    toggleAppFullscreen();
+  });
+  els.floatingFullscreenButton.addEventListener("click", () => {
+    toggleAppFullscreen();
+  });
   els.floatingLockButton.addEventListener("click", lockReader);
   els.libraryButton.addEventListener("click", openLibrary);
   els.libraryCloseButton.addEventListener("click", closeLibrary);
@@ -4383,6 +4500,12 @@ function wireEvents() {
 
   els.canvasWrap.addEventListener("scroll", updateCurrentPageFromScroll, { passive: true });
 
+  document.addEventListener("fullscreenchange", () => {
+    if (!document.fullscreenElement && appFullscreen && !syncingNativeFullscreen) {
+      setAppFullscreen(false);
+    }
+  });
+
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
       persistReaderPositionNow();
@@ -4454,6 +4577,11 @@ function wireEvents() {
 
     if (event.key === "Escape" && !els.tocOverlay.hidden) {
       closeToc();
+      return;
+    }
+
+    if (event.key === "Escape" && appFullscreen) {
+      toggleAppFullscreen();
       return;
     }
 
