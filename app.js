@@ -11,7 +11,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v46";
+const APP_VERSION = "v47";
 const DOCUMENT_FORMATS = {
   PDF: "pdf",
   EPUB: "epub",
@@ -24,6 +24,7 @@ const CONTINUOUS_KEEP_VIEWPORTS = 2.25;
 const CONTINUOUS_RENDER_VIEWPORTS = 1.35;
 const CONTINUOUS_MAX_RENDERED_PAGES = 6;
 const CONTINUOUS_OBSERVER_MARGIN = "700px 0px";
+const PDF_RANGE_CHUNK_SIZE = 1_048_576;
 const MAX_PAGED_CANVAS_PIXELS = 18_000_000;
 const MAX_CONTINUOUS_CANVAS_PIXELS = 6_500_000;
 const MAX_CANVAS_DIMENSION = 8192;
@@ -109,6 +110,7 @@ let touchStart = null;
 let overlayTouchY = 0;
 
 const pageRenderTasks = new Map();
+const continuousRenderPromises = new Map();
 const pendingContinuousPages = new Map();
 let continuousQueueRunning = false;
 
@@ -756,6 +758,7 @@ async function cancelCurrentRender() {
     task.cancel();
   }
   pageRenderTasks.clear();
+  continuousRenderPromises.clear();
 }
 
 function clearContinuousPages() {
@@ -768,6 +771,7 @@ function clearContinuousPages() {
     task.cancel();
   }
   pageRenderTasks.clear();
+  continuousRenderPromises.clear();
   pendingContinuousPages.clear();
   els.continuousPages.replaceChildren();
 }
@@ -853,6 +857,61 @@ function prepareCanvas(canvas, viewport) {
   context.fillRect(0, 0, viewport.width, viewport.height);
 
   return context;
+}
+
+class BlobPdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
+  constructor(blob, initialData, fileName = "") {
+    super(blob.size, initialData, true, fileName);
+    this.blob = blob;
+    this.aborted = false;
+  }
+
+  async requestDataRange(begin, end) {
+    if (this.aborted) {
+      return;
+    }
+
+    const safeBegin = clamp(Math.floor(begin), 0, this.length);
+    const safeEnd = clamp(Math.ceil(end), safeBegin, this.length);
+
+    try {
+      const chunk = new Uint8Array(await this.blob.slice(safeBegin, safeEnd).arrayBuffer());
+
+      if (this.aborted) {
+        return;
+      }
+
+      this.onDataRange(safeBegin, chunk);
+      this.onDataProgress(safeEnd, this.length);
+    } catch (error) {
+      if (!this.aborted) {
+        console.error(error);
+      }
+    }
+  }
+
+  abort() {
+    this.aborted = true;
+  }
+}
+
+async function createPdfLoadingTaskFromBlob(blob, meta = {}) {
+  const initialEnd = Math.min(PDF_RANGE_CHUNK_SIZE, blob.size);
+  const initialData =
+    initialEnd > 0 ? new Uint8Array(await blob.slice(0, initialEnd).arrayBuffer()) : undefined;
+  const range = new BlobPdfDataRangeTransport(blob, initialData, meta.name || state.fileName || "");
+
+  return pdfjsLib.getDocument({
+    range,
+    length: blob.size,
+    rangeChunkSize: PDF_RANGE_CHUNK_SIZE,
+    disableStream: true,
+    disableAutoFetch: true,
+    cMapPacked: true,
+    cMapUrl: `${PDFJS_ROOT}cmaps/`,
+    standardFontDataUrl: `${PDFJS_ROOT}standard_fonts/`,
+    wasmUrl: `${PDFJS_ROOT}image_decoders/`,
+  });
 }
 
 async function renderPage(pageNumber) {
@@ -1058,12 +1117,6 @@ function isPinnedContinuousPage(pageNumber) {
 }
 
 function isContinuousShellNearViewport(shell, extraViewports = CONTINUOUS_KEEP_VIEWPORTS) {
-  const pageNumber = getContinuousShellPageNumber(shell);
-
-  if (isPinnedContinuousPage(pageNumber)) {
-    return true;
-  }
-
   const windowBounds = getContinuousViewportWindow(extraViewports);
   const top = shell.offsetTop - els.continuousPages.offsetTop;
   const bottom = top + Math.max(shell.offsetHeight, 1);
@@ -1142,6 +1195,8 @@ function getNextQueuedContinuousPage() {
       token !== renderToken ||
       !shell ||
       shell.dataset.rendered === "true" ||
+      shell.dataset.rendering === "true" ||
+      continuousRenderPromises.has(pageNumber) ||
       pageRenderTasks.has(pageNumber)
     ) {
       pendingContinuousPages.delete(pageNumber);
@@ -1201,10 +1256,22 @@ function scheduleContinuousPageRender(pageNumber, token = renderToken) {
     return;
   }
 
-  const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
+  const targetPage = Math.round(pageNumber);
+
+  if (!Number.isFinite(targetPage) || targetPage < 1 || targetPage > pdfDoc.numPages) {
+    return;
+  }
+
   const shell = els.continuousPages.querySelector(`[data-page="${targetPage}"]`);
 
-  if (!shell || shell.dataset.rendered === "true" || pageRenderTasks.has(targetPage)) {
+  if (
+    !shell ||
+    shell.dataset.rendered === "true" ||
+    shell.dataset.rendering === "true" ||
+    continuousRenderPromises.has(targetPage) ||
+    pageRenderTasks.has(targetPage) ||
+    pendingContinuousPages.has(targetPage)
+  ) {
     return;
   }
 
@@ -1226,7 +1293,7 @@ function queueVisibleContinuousPages(token = renderToken) {
   }
 }
 
-async function renderContinuousPage(pageNumber, token = renderToken) {
+async function renderContinuousPage(pageNumber, token = renderToken, options = {}) {
   if (!pdfDoc || token !== renderToken) {
     return;
   }
@@ -1238,14 +1305,31 @@ async function renderContinuousPage(pageNumber, token = renderToken) {
     return;
   }
 
-  const existingTask = pageRenderTasks.get(targetPage);
+  const existingRender = continuousRenderPromises.get(targetPage);
 
-  if (existingTask) {
-    await existingTask.promise.catch((error) => {
+  if (existingRender) {
+    await existingRender.catch((error) => {
       if (error?.name !== "RenderingCancelledException") {
         console.error(error);
       }
     });
+    return;
+  }
+
+  const renderPromise = renderContinuousPageInternal(targetPage, shell, token, options);
+  continuousRenderPromises.set(targetPage, renderPromise);
+
+  try {
+    await renderPromise;
+  } finally {
+    if (continuousRenderPromises.get(targetPage) === renderPromise) {
+      continuousRenderPromises.delete(targetPage);
+    }
+  }
+}
+
+async function renderContinuousPageInternal(targetPage, shell, token, options = {}) {
+  if (!options.force && !isContinuousShellNearViewport(shell, CONTINUOUS_RENDER_VIEWPORTS)) {
     return;
   }
 
@@ -1256,6 +1340,11 @@ async function renderContinuousPage(pageNumber, token = renderToken) {
     page = await pdfDoc.getPage(targetPage);
 
     if (token !== renderToken || !pdfDoc) {
+      return;
+    }
+
+    if (!options.force && !isContinuousShellNearViewport(shell, CONTINUOUS_RENDER_VIEWPORTS)) {
+      releaseContinuousCanvas(shell);
       return;
     }
 
@@ -2076,7 +2165,7 @@ async function jumpToContinuousEdge(edge) {
     await renderContinuousDocument(targetPage, { behavior: "auto" });
   }
 
-  await renderContinuousPage(targetPage, renderToken);
+  await renderContinuousPage(targetPage, renderToken, { force: true });
   await waitForNextFrame();
   pruneContinuousPages();
 
@@ -2165,6 +2254,7 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
       });
     }
 
+    releaseScrollTracking();
     const scrollTopAfterInitialPosition = els.canvasWrap.scrollTop;
     await renderContinuousPage(targetPage, token);
 
@@ -3621,14 +3711,7 @@ async function loadPdfFromBlob(blob, meta = {}, requestedPage = 1) {
   showStatus("正在打开 PDF...", true);
 
   try {
-    pdfObjectUrl = URL.createObjectURL(blob);
-    const loadingTask = pdfjsLib.getDocument({
-      url: pdfObjectUrl,
-      cMapPacked: true,
-      cMapUrl: `${PDFJS_ROOT}cmaps/`,
-      standardFontDataUrl: `${PDFJS_ROOT}standard_fonts/`,
-      wasmUrl: `${PDFJS_ROOT}image_decoders/`,
-    });
+    const loadingTask = await createPdfLoadingTaskFromBlob(blob, meta);
     const loadedDoc = await loadingTask.promise;
 
     pdfDoc = loadedDoc;
