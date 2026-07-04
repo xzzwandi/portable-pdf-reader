@@ -894,6 +894,16 @@ body.is-app-fullscreen .floating-fullscreen:not([hidden]) {
   line-height: 1.5;
 }
 
+.lock-message {
+  width: 100%;
+  border: 1px solid rgba(184, 63, 63, 0.26);
+  border-radius: 8px;
+  background: rgba(184, 63, 63, 0.08);
+  color: #8f2424;
+  padding: 8px 10px;
+  text-align: left;
+}
+
 .lock-form,
 .encryption-form {
   display: grid;
