@@ -11,7 +11,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v53";
+const APP_VERSION = "v55";
 const DOCUMENT_FORMATS = {
   PDF: "pdf",
   EPUB: "epub",
@@ -38,6 +38,16 @@ const FULLSCREEN_EPUB_SWIPE_MAX_DRIFT = 52;
 const TOC_RENDER_BATCH_SIZE = 72;
 const TOC_RENDER_SCROLL_THRESHOLD = 320;
 const TOC_ITEM_ESTIMATED_HEIGHT = 58;
+const ENCRYPTION_VERSION = 1;
+const ENCRYPTION_ALGORITHM = "AES-GCM";
+const ENCRYPTION_KEY_ALGORITHM = "PBKDF2-SHA256";
+const ENCRYPTION_KDF_ITERATIONS = 300_000;
+const ENCRYPTION_CHUNK_SIZE = 1_048_576;
+const AES_GCM_IV_BYTES = 12;
+const AES_GCM_NONCE_PREFIX_BYTES = 4;
+const AES_GCM_TAG_BYTES = 16;
+const ENCRYPTED_CHUNK_CACHE_LIMIT = 8;
+const ENCRYPTED_NAME_VERSION = 1;
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -49,6 +59,14 @@ const els = {
   edgeJumpGroup: document.querySelector("#edgeJumpGroup"),
   emptyOpenButton: document.querySelector("#emptyOpenButton"),
   emptyState: document.querySelector("#emptyState"),
+  encryptionDescription: document.querySelector("#encryptionDescription"),
+  encryptionForm: document.querySelector("#encryptionForm"),
+  encryptionLaterButton: document.querySelector("#encryptionLaterButton"),
+  encryptionOverlay: document.querySelector("#encryptionOverlay"),
+  encryptionPasswordInput: document.querySelector("#encryptionPasswordInput"),
+  encryptionProgress: document.querySelector("#encryptionProgress"),
+  encryptionProgressText: document.querySelector("#encryptionProgressText"),
+  encryptionStartButton: document.querySelector("#encryptionStartButton"),
   epubPane: document.querySelector("#epubPane"),
   epubViewer: document.querySelector("#epubViewer"),
   fileInput: document.querySelector("#fileInput"),
@@ -114,6 +132,11 @@ let renderToken = 0;
 let lastLayoutWidth = 0;
 let lockMode = "unlock";
 let lockScrollY = 0;
+let sessionPassword = "";
+const encryptionKeyCache = new Map();
+let encryptionPromptDismissed = false;
+let encryptionMigrationInProgress = false;
+let restoreAttempted = false;
 let scrollTrackingSuppressionDepth = 0;
 let statusTimer = null;
 let resizeTimer = null;
@@ -215,6 +238,266 @@ async function hashPassword(password, salt) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function setSessionPassword(password) {
+  sessionPassword = password || "";
+}
+
+function clearSessionPassword() {
+  sessionPassword = "";
+  encryptionKeyCache.clear();
+}
+
+function isWebCryptoEncryptionAvailable() {
+  return Boolean(window.crypto?.subtle && window.crypto?.getRandomValues);
+}
+
+function randomBytes(length) {
+  const bytes = new Uint8Array(length);
+  window.crypto.getRandomValues(bytes);
+  return bytes;
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function hexToBytes(hex = "") {
+  if (hex.length % 2 !== 0) {
+    throw new Error("Invalid hex string.");
+  }
+
+  const bytes = new Uint8Array(hex.length / 2);
+
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  }
+
+  return bytes;
+}
+
+function getEncryptionOriginalSize(record = {}) {
+  return Number.isFinite(record.encryption?.originalSize)
+    ? record.encryption.originalSize
+    : record.size || record.blob?.size || 0;
+}
+
+function isRecordEncrypted(record = {}) {
+  return (
+    record.encrypted === true &&
+    record.encryption?.version === ENCRYPTION_VERSION &&
+    record.encryption?.algorithm === ENCRYPTION_ALGORITHM &&
+    record.encryption?.keyAlgorithm === ENCRYPTION_KEY_ALGORITHM &&
+    typeof record.encryption?.salt === "string" &&
+    typeof record.encryption?.noncePrefix === "string" &&
+    Number.isFinite(record.encryption?.chunkSize) &&
+    Number.isFinite(record.encryption?.originalSize)
+  );
+}
+
+function isRecordNameEncrypted(record = {}) {
+  return (
+    isRecordEncrypted(record) &&
+    record.encryptedName?.version === ENCRYPTED_NAME_VERSION &&
+    record.encryptedName?.algorithm === ENCRYPTION_ALGORITHM &&
+    typeof record.encryptedName?.iv === "string" &&
+    typeof record.encryptedName?.data === "string"
+  );
+}
+
+function getFallbackDocumentName(format = DOCUMENT_FORMATS.PDF) {
+  return format === DOCUMENT_FORMATS.EPUB ? "未命名.epub" : "未命名.pdf";
+}
+
+function getPlainRecordName(record = {}) {
+  return record.name || getFallbackDocumentName(getDocumentFormat(record));
+}
+
+function recordNeedsEncryptionMigration(record = {}) {
+  return !isRecordEncrypted(record) || !isRecordNameEncrypted(record) || Boolean(record.name);
+}
+
+function createChunkIv(encryption, chunkIndex) {
+  const prefix = hexToBytes(encryption.noncePrefix || "");
+
+  if (prefix.length !== AES_GCM_NONCE_PREFIX_BYTES) {
+    throw new Error("Invalid AES-GCM nonce prefix.");
+  }
+
+  const iv = new Uint8Array(AES_GCM_IV_BYTES);
+  iv.set(prefix, 0);
+
+  let value = Math.max(0, Math.floor(chunkIndex));
+  for (let index = AES_GCM_IV_BYTES - 1; index >= AES_GCM_NONCE_PREFIX_BYTES; index -= 1) {
+    iv[index] = value & 0xff;
+    value = Math.floor(value / 256);
+  }
+
+  return iv;
+}
+
+function createChunkAad(record, encryption, chunkIndex) {
+  const format = getDocumentFormat(record);
+  return new TextEncoder().encode(
+    [
+      "portable-pdf-reader",
+      `encryption-v${encryption.version}`,
+      encryption.algorithm,
+      record.id || "",
+      format,
+      String(encryption.originalSize),
+      String(encryption.chunkSize),
+      String(chunkIndex),
+    ].join("|"),
+  );
+}
+
+function createNameAad(record, encryption) {
+  const format = getDocumentFormat(record);
+  return new TextEncoder().encode(
+    [
+      "portable-pdf-reader",
+      "encrypted-name",
+      `encryption-v${encryption.version}`,
+      encryption.algorithm,
+      record.id || "",
+      format,
+      String(encryption.originalSize),
+      String(encryption.chunkSize),
+    ].join("|"),
+  );
+}
+
+async function verifyLockPassword(password) {
+  const config = getLockConfig();
+
+  if (!config) {
+    return true;
+  }
+
+  return (await hashPassword(password, config.salt)) === config.hash;
+}
+
+async function deriveEncryptionKey(password, encryption) {
+  if (!isWebCryptoEncryptionAvailable()) {
+    throw new Error("Web Crypto encryption is unavailable.");
+  }
+
+  const keyMaterial = await window.crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveKey"],
+  );
+
+  return window.crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt: hexToBytes(encryption.salt),
+      iterations: encryption.iterations || ENCRYPTION_KDF_ITERATIONS,
+      hash: "SHA-256",
+    },
+    keyMaterial,
+    {
+      name: ENCRYPTION_ALGORITHM,
+      length: 256,
+    },
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+
+function getEncryptionKeyCacheId(record = {}) {
+  return `${record.id || ""}:${record.encryption?.salt || ""}`;
+}
+
+async function getEncryptionKeyForRecord(record, password = sessionPassword) {
+  if (!isRecordEncrypted(record)) {
+    return null;
+  }
+
+  if (!password) {
+    throw new Error("Encrypted document is locked.");
+  }
+
+  const cacheId = getEncryptionKeyCacheId(record);
+
+  if (encryptionKeyCache.has(cacheId)) {
+    return encryptionKeyCache.get(cacheId);
+  }
+
+  const key = await deriveEncryptionKey(password, record.encryption);
+  encryptionKeyCache.set(cacheId, key);
+  return key;
+}
+
+async function encryptRecordName(record, key, encryption) {
+  const iv = randomBytes(AES_GCM_IV_BYTES);
+  const plainName = getPlainRecordName(record);
+  const encrypted = await window.crypto.subtle.encrypt(
+    {
+      name: ENCRYPTION_ALGORITHM,
+      iv,
+      additionalData: createNameAad(record, encryption),
+      tagLength: AES_GCM_TAG_BYTES * 8,
+    },
+    key,
+    new TextEncoder().encode(plainName),
+  );
+
+  return {
+    algorithm: ENCRYPTION_ALGORITHM,
+    data: bytesToHex(new Uint8Array(encrypted)),
+    encoding: "utf-8",
+    iv: bytesToHex(iv),
+    tagLength: AES_GCM_TAG_BYTES * 8,
+    version: ENCRYPTED_NAME_VERSION,
+  };
+}
+
+async function decryptRecordName(record, key) {
+  if (!isRecordNameEncrypted(record)) {
+    return getPlainRecordName(record);
+  }
+
+  const decrypted = await window.crypto.subtle.decrypt(
+    {
+      name: ENCRYPTION_ALGORITHM,
+      iv: hexToBytes(record.encryptedName.iv),
+      additionalData: createNameAad(record, record.encryption),
+      tagLength: record.encryptedName.tagLength || AES_GCM_TAG_BYTES * 8,
+    },
+    key,
+    hexToBytes(record.encryptedName.data),
+  );
+
+  return new TextDecoder().decode(decrypted) || getFallbackDocumentName(getDocumentFormat(record));
+}
+
+function withoutPlainRecordName(record) {
+  const next = { ...record };
+  delete next.name;
+  return next;
+}
+
+async function getRecordDisplayName(record = {}) {
+  if (isRecordNameEncrypted(record)) {
+    if (!sessionPassword) {
+      return getFallbackDocumentName(getDocumentFormat(record));
+    }
+
+    try {
+      const key = await getEncryptionKeyForRecord(record);
+      return await decryptRecordName(record, key);
+    } catch (error) {
+      console.warn(error);
+      return getFallbackDocumentName(getDocumentFormat(record));
+    }
+  }
+
+  return getPlainRecordName(record);
+}
+
 function configureLockOverlay(mode) {
   lockMode = mode;
   els.lockPasswordInput.value = "";
@@ -283,6 +566,7 @@ function lockReader() {
   }
 
   persistReaderPositionNow();
+  clearSessionPassword();
   showLockOverlay("unlock");
 }
 
@@ -309,6 +593,8 @@ async function handleLockSubmit(event) {
       salt,
       version: 1,
     });
+    clearSessionPassword();
+    stripStoredPlainFileNames();
     showStatus("密码锁已开启。");
     showLockOverlay("unlock");
     return;
@@ -329,9 +615,11 @@ async function handleLockSubmit(event) {
     return;
   }
 
+  setSessionPassword(password);
   hideLockOverlay();
   showStatus("已解锁。");
   restoreReaderPositionAfterResume();
+  handleUnlockedSession().catch((error) => console.warn(error));
 }
 
 function showStatus(message, sticky = false) {
@@ -421,7 +709,6 @@ function saveReaderState() {
         documentId: state.documentId,
         epubCfi: state.epubCfi,
         epubProgress: state.epubProgress,
-        fileName: state.fileName,
         format: state.format,
         mode: state.mode,
         page: state.page,
@@ -435,6 +722,37 @@ function saveReaderState() {
     saveDocumentProgress();
   } catch {
     // Some private browsing modes disable persistent storage.
+  }
+}
+
+function stripStoredPlainFileNames() {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(STATE_KEY) || "{}");
+
+    if (saved && typeof saved === "object" && "fileName" in saved) {
+      delete saved.fileName;
+      window.localStorage.setItem(STATE_KEY, JSON.stringify(saved));
+    }
+  } catch {
+    // Best effort privacy cleanup.
+  }
+
+  try {
+    const progressMap = getProgressMap();
+    let changed = false;
+
+    for (const progress of Object.values(progressMap)) {
+      if (progress && typeof progress === "object" && "fileName" in progress) {
+        delete progress.fileName;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      window.localStorage.setItem(PROGRESS_KEY, JSON.stringify(progressMap));
+    }
+  } catch {
+    // Best effort privacy cleanup.
   }
 }
 
@@ -553,7 +871,6 @@ function saveDocumentProgress() {
     progressMap[state.documentId] = {
       epubCfi: state.epubCfi,
       epubProgress: state.epubProgress,
-      fileName: state.fileName,
       format: state.format,
       mode: state.mode,
       page: state.page,
@@ -674,7 +991,7 @@ async function saveDocumentFile(file) {
   const existing = await getStoredDocument(id).catch(() => null);
   const blob = file.slice(0, file.size, file.type || type);
   const now = Date.now();
-  const record = {
+  let record = {
     id,
     format,
     name: file.name || fallbackName,
@@ -684,6 +1001,10 @@ async function saveDocumentFile(file) {
     lastOpenedAt: now,
     blob,
   };
+
+  if (getLockConfig() && sessionPassword) {
+    record = await encryptDocumentRecord(record, sessionPassword);
+  }
 
   await putStoredDocument(record);
 
@@ -1011,10 +1332,95 @@ function prepareCanvas(canvas, viewport) {
   return context;
 }
 
-class BlobPdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
-  constructor(blob, initialData, fileName = "") {
-    super(blob.size, initialData, true, fileName);
+class BlobDocumentSource {
+  constructor(blob) {
     this.blob = blob;
+    this.length = blob.size;
+  }
+
+  async readRange(begin, end) {
+    const safeBegin = clamp(Math.floor(begin), 0, this.length);
+    const safeEnd = clamp(Math.ceil(end), safeBegin, this.length);
+    return new Uint8Array(await this.blob.slice(safeBegin, safeEnd).arrayBuffer());
+  }
+}
+
+class EncryptedDocumentSource {
+  constructor(record, key) {
+    this.record = record;
+    this.blob = record.blob;
+    this.encryption = record.encryption;
+    this.key = key;
+    this.length = getEncryptionOriginalSize(record);
+    this.chunkCache = new Map();
+  }
+
+  get chunkSize() {
+    return this.encryption.chunkSize || ENCRYPTION_CHUNK_SIZE;
+  }
+
+  async readEncryptedChunk(chunkIndex) {
+    if (this.chunkCache.has(chunkIndex)) {
+      return this.chunkCache.get(chunkIndex);
+    }
+
+    const plainStart = chunkIndex * this.chunkSize;
+    const plainLength = Math.min(this.chunkSize, Math.max(0, this.length - plainStart));
+    const encryptedOffset = chunkIndex * (this.chunkSize + AES_GCM_TAG_BYTES);
+    const encryptedEnd = encryptedOffset + plainLength + AES_GCM_TAG_BYTES;
+    const encryptedBytes = await this.blob.slice(encryptedOffset, encryptedEnd).arrayBuffer();
+    const decrypted = await window.crypto.subtle.decrypt(
+      {
+        name: ENCRYPTION_ALGORITHM,
+        iv: createChunkIv(this.encryption, chunkIndex),
+        additionalData: createChunkAad(this.record, this.encryption, chunkIndex),
+        tagLength: AES_GCM_TAG_BYTES * 8,
+      },
+      this.key,
+      encryptedBytes,
+    );
+    const bytes = new Uint8Array(decrypted);
+
+    this.chunkCache.set(chunkIndex, bytes);
+
+    if (this.chunkCache.size > ENCRYPTED_CHUNK_CACHE_LIMIT) {
+      const oldestKey = this.chunkCache.keys().next().value;
+      this.chunkCache.delete(oldestKey);
+    }
+
+    return bytes;
+  }
+
+  async readRange(begin, end) {
+    const safeBegin = clamp(Math.floor(begin), 0, this.length);
+    const safeEnd = clamp(Math.ceil(end), safeBegin, this.length);
+    const output = new Uint8Array(safeEnd - safeBegin);
+
+    if (!output.length) {
+      return output;
+    }
+
+    const firstChunk = Math.floor(safeBegin / this.chunkSize);
+    const lastChunk = Math.floor((safeEnd - 1) / this.chunkSize);
+    let outputOffset = 0;
+
+    for (let chunkIndex = firstChunk; chunkIndex <= lastChunk; chunkIndex += 1) {
+      const chunk = await this.readEncryptedChunk(chunkIndex);
+      const chunkPlainStart = chunkIndex * this.chunkSize;
+      const sliceStart = Math.max(0, safeBegin - chunkPlainStart);
+      const sliceEnd = Math.min(chunk.length, safeEnd - chunkPlainStart);
+      output.set(chunk.subarray(sliceStart, sliceEnd), outputOffset);
+      outputOffset += sliceEnd - sliceStart;
+    }
+
+    return output;
+  }
+}
+
+class PdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
+  constructor(source, initialData, fileName = "") {
+    super(source.length, initialData, true, fileName);
+    this.source = source;
     this.aborted = false;
   }
 
@@ -1027,7 +1433,7 @@ class BlobPdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
     const safeEnd = clamp(Math.ceil(end), safeBegin, this.length);
 
     try {
-      const chunk = new Uint8Array(await this.blob.slice(safeBegin, safeEnd).arrayBuffer());
+      const chunk = await this.source.readRange(safeBegin, safeEnd);
 
       if (this.aborted) {
         return;
@@ -1047,15 +1453,99 @@ class BlobPdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
   }
 }
 
-async function createPdfLoadingTaskFromBlob(blob, meta = {}) {
-  const initialEnd = Math.min(PDF_RANGE_CHUNK_SIZE, blob.size);
-  const initialData =
-    initialEnd > 0 ? new Uint8Array(await blob.slice(0, initialEnd).arrayBuffer()) : undefined;
-  const range = new BlobPdfDataRangeTransport(blob, initialData, meta.name || state.fileName || "");
+async function createDocumentSourceFromRecord(record) {
+  if (!isRecordEncrypted(record)) {
+    return new BlobDocumentSource(record.blob);
+  }
+
+  if (!sessionPassword) {
+    throw new Error("Encrypted document is locked.");
+  }
+
+  const key = await getEncryptionKeyForRecord(record);
+  return new EncryptedDocumentSource(record, key);
+}
+
+async function encryptDocumentRecord(record, password, onProgress = () => {}) {
+  if (isRecordEncrypted(record)) {
+    const key = await getEncryptionKeyForRecord(record, password);
+    const encryptedName = isRecordNameEncrypted(record)
+      ? record.encryptedName
+      : await encryptRecordName(record, key, record.encryption);
+
+    onProgress({
+      chunkIndex: 1,
+      totalChunks: 1,
+    });
+
+    return {
+      ...withoutPlainRecordName(record),
+      encryptedName,
+    };
+  }
+
+  if (!record?.blob) {
+    throw new Error("Document record has no blob.");
+  }
+
+  const originalSize = record.size || record.blob.size || 0;
+  const encryption = {
+    algorithm: ENCRYPTION_ALGORITHM,
+    chunkSize: ENCRYPTION_CHUNK_SIZE,
+    encryptedAt: Date.now(),
+    iterations: ENCRYPTION_KDF_ITERATIONS,
+    keyAlgorithm: ENCRYPTION_KEY_ALGORITHM,
+    noncePrefix: bytesToHex(randomBytes(AES_GCM_NONCE_PREFIX_BYTES)),
+    originalSize,
+    salt: bytesToHex(randomBytes(16)),
+    tagLength: AES_GCM_TAG_BYTES * 8,
+    version: ENCRYPTION_VERSION,
+  };
+  const key = await deriveEncryptionKey(password, encryption);
+  const encryptedName = await encryptRecordName(record, key, encryption);
+  const totalChunks = Math.max(1, Math.ceil(originalSize / encryption.chunkSize));
+  const encryptedParts = [];
+
+  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+    const begin = chunkIndex * encryption.chunkSize;
+    const end = Math.min(begin + encryption.chunkSize, originalSize);
+    const plainBytes = await record.blob.slice(begin, end).arrayBuffer();
+    const encryptedBytes = await window.crypto.subtle.encrypt(
+      {
+        name: ENCRYPTION_ALGORITHM,
+        iv: createChunkIv(encryption, chunkIndex),
+        additionalData: createChunkAad(record, encryption, chunkIndex),
+        tagLength: AES_GCM_TAG_BYTES * 8,
+      },
+      key,
+      plainBytes,
+    );
+
+    encryptedParts.push(encryptedBytes);
+    onProgress({
+      chunkIndex: chunkIndex + 1,
+      totalChunks,
+    });
+  }
+
+  return {
+    ...withoutPlainRecordName(record),
+    blob: new Blob(encryptedParts, { type: "application/octet-stream" }),
+    encrypted: true,
+    encryptedName,
+    encryption,
+    size: originalSize,
+  };
+}
+
+async function createPdfLoadingTaskFromSource(source, meta = {}) {
+  const initialEnd = Math.min(PDF_RANGE_CHUNK_SIZE, source.length);
+  const initialData = initialEnd > 0 ? await source.readRange(0, initialEnd) : undefined;
+  const range = new PdfDataRangeTransport(source, initialData, meta.name || state.fileName || "");
 
   return pdfjsLib.getDocument({
     range,
-    length: blob.size,
+    length: source.length,
     rangeChunkSize: PDF_RANGE_CHUNK_SIZE,
     disableStream: true,
     disableAutoFetch: true,
@@ -1064,6 +1554,10 @@ async function createPdfLoadingTaskFromBlob(blob, meta = {}) {
     standardFontDataUrl: `${PDFJS_ROOT}standard_fonts/`,
     wasmUrl: `${PDFJS_ROOT}image_decoders/`,
   });
+}
+
+async function createPdfLoadingTaskFromBlob(blob, meta = {}) {
+  return createPdfLoadingTaskFromSource(new BlobDocumentSource(blob), meta);
 }
 
 async function renderPage(pageNumber) {
@@ -3834,6 +4328,7 @@ function isFullscreenEpubGestureEnabled() {
     els.lockOverlay.hidden &&
     els.libraryOverlay.hidden &&
     els.tocOverlay.hidden &&
+    els.encryptionOverlay.hidden &&
     els.imageOverlay.hidden
   );
 }
@@ -4104,7 +4599,15 @@ async function recreateEpubRenditionAt(section) {
   return displayEpubSection(section);
 }
 
-async function loadEpubFromBlob(blob, meta = {}) {
+function getExactArrayBuffer(bytes) {
+  if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+    return bytes.buffer;
+  }
+
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
+async function loadEpubFromSource(source, meta = {}) {
   await closeCurrentDocument();
   state.format = DOCUMENT_FORMATS.EPUB;
   epubAtEnd = false;
@@ -4120,7 +4623,8 @@ async function loadEpubFromBlob(blob, meta = {}) {
       throw new Error("EPUB 引擎没有加载。");
     }
 
-    const buffer = await blob.arrayBuffer();
+    const bytes = await source.readRange(0, source.length);
+    const buffer = getExactArrayBuffer(bytes);
     const book = window.ePub(undefined, {
       replacements: "blobUrl",
     });
@@ -4160,6 +4664,15 @@ async function loadEpubFromBlob(blob, meta = {}) {
     updateViewerMode();
     showStatus("这个 EPUB 暂时打不开。", true);
   }
+}
+
+async function loadEpubFromBlob(blob, meta = {}) {
+  return loadEpubFromSource(new BlobDocumentSource(blob), meta);
+}
+
+async function loadEpubFromRecord(record, meta = {}) {
+  const source = await createDocumentSourceFromRecord(record);
+  return loadEpubFromSource(source, meta);
 }
 
 async function navigateEpub(direction) {
@@ -4251,7 +4764,7 @@ function handleEdgeJump(edge) {
   handleContinuousEdgeJump(edge);
 }
 
-async function loadPdfFromBlob(blob, meta = {}, requestedPage = 1) {
+async function loadPdfFromSource(source, meta = {}, requestedPage = 1) {
   await closeCurrentDocument();
   state.format = DOCUMENT_FORMATS.PDF;
   state.epubCfi = "";
@@ -4261,7 +4774,7 @@ async function loadPdfFromBlob(blob, meta = {}, requestedPage = 1) {
   showStatus("正在打开 PDF...", true);
 
   try {
-    const loadingTask = await createPdfLoadingTaskFromBlob(blob, meta);
+    const loadingTask = await createPdfLoadingTaskFromSource(source, meta);
     const loadedDoc = await loadingTask.promise;
 
     pdfDoc = loadedDoc;
@@ -4281,6 +4794,15 @@ async function loadPdfFromBlob(blob, meta = {}, requestedPage = 1) {
   }
 }
 
+async function loadPdfFromBlob(blob, meta = {}, requestedPage = 1) {
+  return loadPdfFromSource(new BlobDocumentSource(blob), meta, requestedPage);
+}
+
+async function loadPdfFromRecord(record, meta = {}, requestedPage = 1) {
+  const source = await createDocumentSourceFromRecord(record);
+  return loadPdfFromSource(source, meta, requestedPage);
+}
+
 async function openDocumentRecord(record, options = {}) {
   if (!record?.blob) {
     showStatus("这个文件记录不可用。");
@@ -4294,7 +4816,7 @@ async function openDocumentRecord(record, options = {}) {
   const format = getDocumentFormat(record);
   state.documentId = record.id;
   state.format = format;
-  state.fileName = record.name || (format === DOCUMENT_FORMATS.EPUB ? "未命名.epub" : "未命名.pdf");
+  state.fileName = await getRecordDisplayName(record);
 
   if (options.resetProgress) {
     state.page = 1;
@@ -4309,9 +4831,9 @@ async function openDocumentRecord(record, options = {}) {
   }
 
   if (format === DOCUMENT_FORMATS.EPUB) {
-    await loadEpubFromBlob(record.blob, { id: record.id, name: state.fileName });
+    await loadEpubFromRecord(record, { id: record.id, name: state.fileName });
   } else {
-    await loadPdfFromBlob(record.blob, { id: record.id, name: state.fileName }, state.page);
+    await loadPdfFromRecord(record, { id: record.id, name: state.fileName }, state.page);
   }
 
   await touchStoredDocument(record.id).catch(() => {});
@@ -4332,6 +4854,146 @@ async function openDocumentFromLibrary(documentId) {
   await openDocumentRecord(record);
 }
 
+async function readDocumentsNeedingEncryptionMigration() {
+  const records = await readLibraryDocuments();
+  return records.filter((record) => record?.blob && recordNeedsEncryptionMigration(record));
+}
+
+function updateEncryptionPromptState({ busy = false, progress = 0, text = "" } = {}) {
+  encryptionMigrationInProgress = busy;
+  els.encryptionStartButton.disabled = busy;
+  els.encryptionLaterButton.disabled = busy;
+  els.encryptionPasswordInput.disabled = busy;
+  els.encryptionProgress.hidden = !busy;
+  els.encryptionProgressText.hidden = !busy && !text;
+  els.encryptionProgress.value = clamp(progress, 0, 100);
+  els.encryptionProgressText.textContent = text;
+}
+
+function showEncryptionMigrationPrompt(count) {
+  closeLibrary();
+  closeToc();
+  els.encryptionDescription.textContent = `已开启密码锁，书架里还有 ${count} 个文件尚未完全加密。加密后忘记密码将无法恢复文件。`;
+  els.encryptionPasswordInput.value = "";
+  els.encryptionPasswordInput.hidden = Boolean(sessionPassword);
+  els.encryptionPasswordInput.required = !sessionPassword;
+  els.encryptionStartButton.textContent = "加密文件";
+  updateEncryptionPromptState();
+  els.encryptionOverlay.hidden = false;
+  updatePanelScrollLock();
+
+  if (!sessionPassword) {
+    window.setTimeout(() => els.encryptionPasswordInput.focus(), 40);
+  }
+}
+
+function hideEncryptionMigrationPrompt() {
+  if (encryptionMigrationInProgress) {
+    return;
+  }
+
+  els.encryptionOverlay.hidden = true;
+  updatePanelScrollLock();
+}
+
+async function maybePromptLibraryEncryption() {
+  if (!getLockConfig() || encryptionPromptDismissed || encryptionMigrationInProgress) {
+    return;
+  }
+
+  if (!isWebCryptoEncryptionAvailable()) {
+    showStatus("当前环境不支持文件加密，请用 HTTPS 或 localhost 打开。", true);
+    return;
+  }
+
+  try {
+    const documents = await readDocumentsNeedingEncryptionMigration();
+
+    if (documents.length > 0) {
+      showEncryptionMigrationPrompt(documents.length);
+    }
+  } catch (error) {
+    console.warn(error);
+  }
+}
+
+function updateDocumentEncryptionProgress(fileIndex, totalFiles, record, chunkIndex = 0, totalChunks = 1) {
+  const fileProgress = totalFiles ? fileIndex / totalFiles : 0;
+  const chunkProgress = totalFiles ? (chunkIndex / Math.max(1, totalChunks)) / totalFiles : 0;
+  const progress = Math.round((fileProgress + chunkProgress) * 100);
+  const name = getPlainRecordName(record);
+
+  updateEncryptionPromptState({
+    busy: true,
+    progress,
+    text: `正在加密 ${fileIndex + 1}/${totalFiles}：${name}`,
+  });
+}
+
+async function encryptLibraryDocumentsNeedingMigration(password) {
+  const documents = await readDocumentsNeedingEncryptionMigration();
+
+  for (let index = 0; index < documents.length; index += 1) {
+    const record = documents[index];
+    updateDocumentEncryptionProgress(index, documents.length, record);
+    const encryptedRecord = await encryptDocumentRecord(record, password, ({ chunkIndex, totalChunks }) => {
+      updateDocumentEncryptionProgress(index, documents.length, record, chunkIndex, totalChunks);
+    });
+    await putStoredDocument(encryptedRecord);
+  }
+
+  return documents.length;
+}
+
+async function handleEncryptionMigrationSubmit(event) {
+  event.preventDefault();
+
+  if (encryptionMigrationInProgress) {
+    return;
+  }
+
+  const password = sessionPassword || els.encryptionPasswordInput.value;
+
+  if (password.length < 4) {
+    showStatus("密码至少 4 位。");
+    return;
+  }
+
+  if (!(await verifyLockPassword(password))) {
+    showStatus("密码不对。");
+    els.encryptionPasswordInput.select();
+    return;
+  }
+
+  setSessionPassword(password);
+  updateEncryptionPromptState({
+    busy: true,
+    progress: 0,
+    text: "正在准备加密...",
+  });
+
+  try {
+    const encryptedCount = await encryptLibraryDocumentsNeedingMigration(password);
+    updateEncryptionPromptState({
+      busy: false,
+      progress: 100,
+      text: "",
+    });
+    els.encryptionOverlay.hidden = true;
+    updatePanelScrollLock();
+    await renderLibraryList();
+    showStatus(encryptedCount ? "书架文件已加密。" : "书架文件已经是加密状态。");
+  } catch (error) {
+    console.error(error);
+    updateEncryptionPromptState({
+      busy: false,
+      progress: els.encryptionProgress.value,
+      text: "加密中断，请稍后重试。",
+    });
+    showStatus("文件加密失败，原文件已保留。", true);
+  }
+}
+
 async function handleFileSelection(file) {
   if (!isSupportedDocumentFile(file)) {
     showStatus("请选择 PDF 或 EPUB 文件。");
@@ -4339,6 +5001,10 @@ async function handleFileSelection(file) {
   }
 
   try {
+    if (getLockConfig() && sessionPassword) {
+      showStatus("正在加密并加入书架...", true);
+    }
+
     const record = await saveDocumentFile(file);
     deleteDocumentProgress(record.id);
     await openDocumentRecord(record, { resetProgress: true });
@@ -4376,19 +5042,32 @@ async function restoreLastDocument() {
 
     state.documentId = record.id;
     state.format = getDocumentFormat(record);
-    state.fileName =
-      record.name || (state.format === DOCUMENT_FORMATS.EPUB ? "未命名.epub" : "未命名.pdf");
+    state.fileName = await getRecordDisplayName(record);
     applyDocumentProgress(record.id, state.page || 1);
     showStatus("正在恢复上次阅读...", true);
     if (state.format === DOCUMENT_FORMATS.EPUB) {
-      await loadEpubFromBlob(record.blob, { id: record.id, name: state.fileName });
+      await loadEpubFromRecord(record, { id: record.id, name: state.fileName });
     } else {
-      await loadPdfFromBlob(record.blob, { id: record.id, name: state.fileName }, state.page);
+      await loadPdfFromRecord(record, { id: record.id, name: state.fileName }, state.page);
     }
     renderLibraryList();
   } catch (error) {
     console.warn(error);
   }
+}
+
+async function restoreLastDocumentOnce() {
+  if (restoreAttempted) {
+    return;
+  }
+
+  restoreAttempted = true;
+  await restoreLastDocument();
+}
+
+async function handleUnlockedSession() {
+  await restoreLastDocumentOnce();
+  await maybePromptLibraryEncryption();
 }
 
 function closeLibrary() {
@@ -4397,6 +5076,10 @@ function closeLibrary() {
 }
 
 async function openLibrary() {
+  if (!els.encryptionOverlay.hidden) {
+    return;
+  }
+
   closeToc();
   await renderLibraryList();
   els.libraryOverlay.hidden = false;
@@ -4427,14 +5110,15 @@ function openToc() {
 }
 
 function updatePanelScrollLock() {
-  const panelOpen = !els.libraryOverlay.hidden || !els.tocOverlay.hidden;
+  const panelOpen =
+    !els.libraryOverlay.hidden || !els.tocOverlay.hidden || !els.encryptionOverlay.hidden;
 
   document.documentElement.classList.toggle("is-panel-open", panelOpen);
   document.body.classList.toggle("is-panel-open", panelOpen);
 }
 
 function getScrollablePanelList(target) {
-  return target?.closest?.(".library-list, .toc-list") || null;
+  return target?.closest?.(".library-list, .toc-list, .encryption-panel") || null;
 }
 
 function rememberPanelTouch(event) {
@@ -4442,7 +5126,7 @@ function rememberPanelTouch(event) {
 }
 
 function preventPanelScrollLeak(event) {
-  if (els.libraryOverlay.hidden && els.tocOverlay.hidden) {
+  if (els.libraryOverlay.hidden && els.tocOverlay.hidden && els.encryptionOverlay.hidden) {
     return;
   }
 
@@ -4950,11 +5634,10 @@ async function renderLibraryList() {
       openButton.type = "button";
 
       name.className = "library-name";
-      name.textContent =
-        record.name || (format === DOCUMENT_FORMATS.EPUB ? "未命名.epub" : "未命名.pdf");
+      name.textContent = await getRecordDisplayName(record);
 
       meta.className = "library-meta";
-      meta.textContent = `${isActive ? "正在阅读 · " : ""}${format.toUpperCase()} · ${progressLabel} · ${formatFileSize(record.size || record.blob?.size || 0)}`;
+      meta.textContent = `${isActive ? "正在阅读 · " : ""}${format.toUpperCase()} · ${progressLabel} · ${formatFileSize(record.size || record.blob?.size || 0)}${isRecordEncrypted(record) ? " · 已加密" : ""}`;
 
       deleteButton.className = "library-delete";
       deleteButton.type = "button";
@@ -5015,7 +5698,7 @@ function restoreReaderPositionAfterResume() {
 }
 
 function openFilePicker() {
-  if (!els.lockOverlay.hidden || !els.imageOverlay.hidden) {
+  if (!els.lockOverlay.hidden || !els.encryptionOverlay.hidden || !els.imageOverlay.hidden) {
     return;
   }
 
@@ -5059,6 +5742,20 @@ function wireEvents() {
   els.lockForm.addEventListener("submit", handleLockSubmit);
   els.lockOverlay.addEventListener("touchmove", preventLockScroll, { passive: false });
   els.lockOverlay.addEventListener("wheel", preventLockScroll, { passive: false });
+  els.encryptionForm.addEventListener("submit", handleEncryptionMigrationSubmit);
+  els.encryptionLaterButton.addEventListener("click", () => {
+    encryptionPromptDismissed = true;
+    hideEncryptionMigrationPrompt();
+  });
+  els.encryptionOverlay.addEventListener("click", (event) => {
+    if (event.target === els.encryptionOverlay) {
+      encryptionPromptDismissed = true;
+      hideEncryptionMigrationPrompt();
+    }
+  });
+  els.encryptionOverlay.addEventListener("touchstart", rememberPanelTouch, { passive: true });
+  els.encryptionOverlay.addEventListener("touchmove", preventPanelScrollLeak, { passive: false });
+  els.encryptionOverlay.addEventListener("wheel", preventPanelScrollLeak, { passive: false });
   els.libraryOverlay.addEventListener("click", (event) => {
     if (event.target === els.libraryOverlay) {
       closeLibrary();
@@ -5371,8 +6068,12 @@ async function registerServiceWorker() {
 
 function initializeLock() {
   if (getLockConfig()) {
+    stripStoredPlainFileNames();
     showLockOverlay("unlock");
+    return true;
   }
+
+  return false;
 }
 
 function initializeVersionBadge() {
@@ -5384,6 +6085,10 @@ wireEvents();
 setReaderVisible(false);
 updateViewerMode();
 updateControls();
-initializeLock();
+const startedLocked = initializeLock();
 registerServiceWorker();
-restoreLastDocument();
+if (startedLocked) {
+  renderLibraryList();
+} else {
+  handleUnlockedSession().catch((error) => console.warn(error));
+}
