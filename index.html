@@ -8,7 +8,7 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./icons/icon.svg" />
-    <link rel="stylesheet" href="./styles.css?v=52" />
+    <link rel="stylesheet" href="./styles.css?v=53" />
   </head>
   <body>
     <div class="app-shell">
@@ -18,7 +18,7 @@
           <div>
             <div class="brand-title">
               <h1>随身阅读</h1>
-              <span id="appVersion" class="version-badge">v52</span>
+              <span id="appVersion" class="version-badge">v53</span>
             </div>
             <p id="docName">未打开文件</p>
           </div>
@@ -127,19 +127,25 @@
           <form id="lockForm" class="lock-form">
             <input
               id="lockPasswordInput"
-              type="password"
-              autocomplete="current-password"
+              type="text"
+              autocomplete="off"
+              autocapitalize="none"
+              data-password-mask="true"
               inputmode="text"
               minlength="4"
               placeholder="输入密码"
+              spellcheck="false"
             />
             <input
               id="lockConfirmInput"
-              type="password"
-              autocomplete="new-password"
+              type="text"
+              autocomplete="off"
+              autocapitalize="none"
+              data-password-mask="true"
               inputmode="text"
               minlength="4"
               placeholder="再次输入密码"
+              spellcheck="false"
               hidden
             />
             <button id="lockSubmitButton" class="primary" type="submit">解锁</button>
@@ -152,6 +158,6 @@
 
     <script src="./vendor/jszip/jszip.min.js?v=45"></script>
     <script src="./vendor/epubjs/epub.min.js?v=45"></script>
-    <script type="module" src="./app.js?v=52"></script>
+    <script type="module" src="./app.js?v=53"></script>
   </body>
 </html>

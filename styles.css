@@ -881,6 +881,14 @@ body.is-app-fullscreen .floating-fullscreen:not([hidden]) {
   padding: 0 12px;
 }
 
+.lock-form input[data-password-mask="true"] {
+  -webkit-text-security: disc;
+}
+
+.lock-form input[data-password-mask="true"]::placeholder {
+  -webkit-text-security: none;
+}
+
 @media (max-width: 680px) {
   .app-shell {
     gap: 10px;
