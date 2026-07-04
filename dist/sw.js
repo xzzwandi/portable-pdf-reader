@@ -1,15 +1,17 @@
-const CACHE_NAME = "portable-pdf-reader-v55";
+const CACHE_NAME = "portable-pdf-reader-v57";
 const APP_SHELL = [
   "./",
   "./index.html",
-  "./styles.css?v=55",
-  "./app.js?v=55",
+  "./styles.css?v=57",
+  "./app.js?v=57",
   "./manifest.webmanifest",
   "./icons/icon.svg",
   "./vendor/jszip/jszip.min.js?v=46",
   "./vendor/epubjs/epub.min.js?v=46",
   "./vendor/pdfjs/pdf.min.mjs",
   "./vendor/pdfjs/pdf.worker.min.mjs",
+  "./vendor/libsodium/libsodium-wrappers.mjs",
+  "./vendor/libsodium/libsodium-sumo.mjs",
 ];
 
 self.addEventListener("install", (event) => {

@@ -8,7 +8,7 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./icons/icon.svg" />
-    <link rel="stylesheet" href="./styles.css?v=55" />
+    <link rel="stylesheet" href="./styles.css?v=57" />
   </head>
   <body>
     <div class="app-shell">
@@ -18,7 +18,7 @@
           <div>
             <div class="brand-title">
               <h1>随身阅读</h1>
-              <span id="appVersion" class="version-badge">v55</span>
+              <span id="appVersion" class="version-badge">v57</span>
             </div>
             <p id="docName">未打开文件</p>
           </div>
@@ -151,6 +151,7 @@
           <div class="lock-mark" aria-hidden="true">PDF</div>
           <h2 id="lockTitle">密码锁</h2>
           <p id="lockDescription">输入密码后继续阅读。</p>
+          <p id="lockMessage" class="lock-message" role="alert" hidden></p>
 
           <form id="lockForm" class="lock-form">
             <input
@@ -186,6 +187,6 @@
 
     <script src="./vendor/jszip/jszip.min.js?v=45"></script>
     <script src="./vendor/epubjs/epub.min.js?v=45"></script>
-    <script type="module" src="./app.js?v=55"></script>
+    <script type="module" src="./app.js?v=57"></script>
   </body>
 </html>

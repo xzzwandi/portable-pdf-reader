@@ -1,3 +1,4 @@
+import sodium from "./vendor/libsodium/libsodium-wrappers.mjs";
 import * as pdfjsLib from "./vendor/pdfjs/pdf.min.mjs";
 
 const PDFJS_ROOT = new URL("./vendor/pdfjs/", import.meta.url).href;
@@ -11,7 +12,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v55";
+const APP_VERSION = "v57";
 const DOCUMENT_FORMATS = {
   PDF: "pdf",
   EPUB: "epub",
@@ -38,14 +39,22 @@ const FULLSCREEN_EPUB_SWIPE_MAX_DRIFT = 52;
 const TOC_RENDER_BATCH_SIZE = 72;
 const TOC_RENDER_SCROLL_THRESHOLD = 320;
 const TOC_ITEM_ESTIMATED_HEIGHT = 58;
-const ENCRYPTION_VERSION = 1;
-const ENCRYPTION_ALGORITHM = "AES-GCM";
-const ENCRYPTION_KEY_ALGORITHM = "PBKDF2-SHA256";
+const ENCRYPTION_VERSION = 2;
+const AES_GCM_ENCRYPTION_VERSION = 1;
+const AES_GCM_ALGORITHM = "AES-GCM";
+const XCHACHA20_POLY1305_ALGORITHM = "XCHACHA20-POLY1305";
+const PBKDF2_KEY_ALGORITHM = "PBKDF2-SHA256";
+const ARGON2ID13_KEY_ALGORITHM = "ARGON2ID13";
+const ENCRYPTION_ALGORITHM = XCHACHA20_POLY1305_ALGORITHM;
+const ENCRYPTION_KEY_ALGORITHM = ARGON2ID13_KEY_ALGORITHM;
 const ENCRYPTION_KDF_ITERATIONS = 300_000;
 const ENCRYPTION_CHUNK_SIZE = 1_048_576;
 const AES_GCM_IV_BYTES = 12;
 const AES_GCM_NONCE_PREFIX_BYTES = 4;
 const AES_GCM_TAG_BYTES = 16;
+const XCHACHA_NONCE_BYTES = 24;
+const XCHACHA_NONCE_PREFIX_BYTES = 16;
+const XCHACHA_TAG_BYTES = 16;
 const ENCRYPTED_CHUNK_CACHE_LIMIT = 8;
 const ENCRYPTED_NAME_VERSION = 1;
 
@@ -89,6 +98,7 @@ const els = {
   lockConfirmInput: document.querySelector("#lockConfirmInput"),
   lockDescription: document.querySelector("#lockDescription"),
   lockForm: document.querySelector("#lockForm"),
+  lockMessage: document.querySelector("#lockMessage"),
   lockOverlay: document.querySelector("#lockOverlay"),
   lockPasswordInput: document.querySelector("#lockPasswordInput"),
   lockSubmitButton: document.querySelector("#lockSubmitButton"),
@@ -229,13 +239,29 @@ function createSalt() {
 }
 
 async function hashPassword(password, salt) {
+  const input = new TextEncoder().encode(`${salt}:${password}`);
+
   if (!window.crypto?.subtle) {
-    return hashString(`${salt}:${password}:local-lock`);
+    try {
+      const sodiumApi = await ensureSodiumReady();
+      return bytesToHex(sodiumApi.crypto_hash_sha256(input));
+    } catch (error) {
+      console.warn(error);
+      return hashString(`${salt}:${password}:local-lock`);
+    }
   }
 
-  const input = new TextEncoder().encode(`${salt}:${password}`);
   const digest = await window.crypto.subtle.digest("SHA-256", input);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function hashLegacyLocalPassword(password, salt) {
+  return hashString(`${salt}:${password}:local-lock`);
+}
+
+async function getPasswordHashCandidates(password, salt) {
+  const hashes = [await hashPassword(password, salt), hashLegacyLocalPassword(password, salt)];
+  return [...new Set(hashes)];
 }
 
 function setSessionPassword(password) {
@@ -245,6 +271,29 @@ function setSessionPassword(password) {
 function clearSessionPassword() {
   sessionPassword = "";
   encryptionKeyCache.clear();
+}
+
+async function ensureSodiumReady() {
+  await sodium.ready;
+  return sodium;
+}
+
+async function isSodiumEncryptionAvailable() {
+  if (!window.crypto?.getRandomValues) {
+    return false;
+  }
+
+  try {
+    const sodiumApi = await ensureSodiumReady();
+    return Boolean(
+      sodiumApi.crypto_aead_xchacha20poly1305_ietf_encrypt &&
+        sodiumApi.crypto_aead_xchacha20poly1305_ietf_decrypt &&
+        sodiumApi.crypto_pwhash,
+    );
+  } catch (error) {
+    console.warn(error);
+    return false;
+  }
 }
 
 function isWebCryptoEncryptionAvailable() {
@@ -281,24 +330,59 @@ function getEncryptionOriginalSize(record = {}) {
     : record.size || record.blob?.size || 0;
 }
 
+function isAesGcmRecordEncryption(encryption = {}) {
+  return (
+    encryption?.version === AES_GCM_ENCRYPTION_VERSION &&
+    encryption?.algorithm === AES_GCM_ALGORITHM &&
+    encryption?.keyAlgorithm === PBKDF2_KEY_ALGORITHM &&
+    typeof encryption?.salt === "string" &&
+    typeof encryption?.noncePrefix === "string" &&
+    Number.isFinite(encryption?.chunkSize) &&
+    Number.isFinite(encryption?.originalSize)
+  );
+}
+
+function isXChaChaRecordEncryption(encryption = {}) {
+  return (
+    encryption?.version === ENCRYPTION_VERSION &&
+    encryption?.algorithm === XCHACHA20_POLY1305_ALGORITHM &&
+    encryption?.keyAlgorithm === ARGON2ID13_KEY_ALGORITHM &&
+    typeof encryption?.salt === "string" &&
+    typeof encryption?.noncePrefix === "string" &&
+    Number.isFinite(encryption?.chunkSize) &&
+    Number.isFinite(encryption?.originalSize)
+  );
+}
+
 function isRecordEncrypted(record = {}) {
   return (
     record.encrypted === true &&
-    record.encryption?.version === ENCRYPTION_VERSION &&
-    record.encryption?.algorithm === ENCRYPTION_ALGORITHM &&
-    record.encryption?.keyAlgorithm === ENCRYPTION_KEY_ALGORITHM &&
-    typeof record.encryption?.salt === "string" &&
-    typeof record.encryption?.noncePrefix === "string" &&
-    Number.isFinite(record.encryption?.chunkSize) &&
-    Number.isFinite(record.encryption?.originalSize)
+    (isXChaChaRecordEncryption(record.encryption) || isAesGcmRecordEncryption(record.encryption))
+  );
+}
+
+function isCurrentRecordEncryption(record = {}) {
+  return (
+    record.encrypted === true &&
+    isXChaChaRecordEncryption(record.encryption)
   );
 }
 
 function isRecordNameEncrypted(record = {}) {
+  if (!isRecordEncrypted(record) || record.encryptedName?.version !== ENCRYPTED_NAME_VERSION) {
+    return false;
+  }
+
+  if (isXChaChaRecordEncryption(record.encryption)) {
+    return (
+      record.encryptedName?.algorithm === XCHACHA20_POLY1305_ALGORITHM &&
+      typeof record.encryptedName?.nonce === "string" &&
+      typeof record.encryptedName?.data === "string"
+    );
+  }
+
   return (
-    isRecordEncrypted(record) &&
-    record.encryptedName?.version === ENCRYPTED_NAME_VERSION &&
-    record.encryptedName?.algorithm === ENCRYPTION_ALGORITHM &&
+    record.encryptedName?.algorithm === AES_GCM_ALGORITHM &&
     typeof record.encryptedName?.iv === "string" &&
     typeof record.encryptedName?.data === "string"
   );
@@ -313,7 +397,15 @@ function getPlainRecordName(record = {}) {
 }
 
 function recordNeedsEncryptionMigration(record = {}) {
-  return !isRecordEncrypted(record) || !isRecordNameEncrypted(record) || Boolean(record.name);
+  if (!isRecordEncrypted(record)) {
+    return true;
+  }
+
+  if (!isCurrentRecordEncryption(record)) {
+    return false;
+  }
+
+  return !isRecordNameEncrypted(record) || Boolean(record.name);
 }
 
 function createChunkIv(encryption, chunkIndex) {
@@ -333,6 +425,33 @@ function createChunkIv(encryption, chunkIndex) {
   }
 
   return iv;
+}
+
+function createChunkNonce(encryption, chunkIndex) {
+  const prefix = hexToBytes(encryption.noncePrefix || "");
+
+  if (prefix.length !== XCHACHA_NONCE_PREFIX_BYTES) {
+    throw new Error("Invalid XChaCha20-Poly1305 nonce prefix.");
+  }
+
+  const nonce = new Uint8Array(XCHACHA_NONCE_BYTES);
+  nonce.set(prefix, 0);
+
+  let value = Math.max(0, Math.floor(chunkIndex));
+  for (let index = XCHACHA_NONCE_BYTES - 1; index >= XCHACHA_NONCE_PREFIX_BYTES; index -= 1) {
+    nonce[index] = value & 0xff;
+    value = Math.floor(value / 256);
+  }
+
+  return nonce;
+}
+
+function getEncryptionTagBytes(encryption = {}) {
+  if (Number.isFinite(encryption.tagLength) && encryption.tagLength > 0) {
+    return Math.ceil(encryption.tagLength / 8);
+  }
+
+  return encryption.algorithm === AES_GCM_ALGORITHM ? AES_GCM_TAG_BYTES : XCHACHA_TAG_BYTES;
 }
 
 function createChunkAad(record, encryption, chunkIndex) {
@@ -374,12 +493,12 @@ async function verifyLockPassword(password) {
     return true;
   }
 
-  return (await hashPassword(password, config.salt)) === config.hash;
+  return (await getPasswordHashCandidates(password, config.salt)).includes(config.hash);
 }
 
-async function deriveEncryptionKey(password, encryption) {
+async function deriveAesGcmKey(password, encryption) {
   if (!isWebCryptoEncryptionAvailable()) {
-    throw new Error("Web Crypto encryption is unavailable.");
+    throw new Error("AES-GCM records require Web Crypto. Open this record over HTTPS or localhost.");
   }
 
   const keyMaterial = await window.crypto.subtle.importKey(
@@ -399,7 +518,7 @@ async function deriveEncryptionKey(password, encryption) {
     },
     keyMaterial,
     {
-      name: ENCRYPTION_ALGORITHM,
+      name: AES_GCM_ALGORITHM,
       length: 256,
     },
     false,
@@ -407,8 +526,43 @@ async function deriveEncryptionKey(password, encryption) {
   );
 }
 
+async function deriveXChaChaKey(password, encryption) {
+  const sodiumApi = await ensureSodiumReady();
+  const salt = hexToBytes(encryption.salt);
+
+  if (salt.length !== sodiumApi.crypto_pwhash_SALTBYTES) {
+    throw new Error("Invalid Argon2id salt.");
+  }
+
+  return sodiumApi.crypto_pwhash(
+    sodiumApi.crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
+    password,
+    salt,
+    encryption.opsLimit || sodiumApi.crypto_pwhash_OPSLIMIT_INTERACTIVE,
+    encryption.memLimit || sodiumApi.crypto_pwhash_MEMLIMIT_INTERACTIVE,
+    sodiumApi.crypto_pwhash_ALG_ARGON2ID13,
+  );
+}
+
+async function deriveEncryptionKey(password, encryption) {
+  if (encryption?.algorithm === AES_GCM_ALGORITHM) {
+    return deriveAesGcmKey(password, encryption);
+  }
+
+  if (encryption?.algorithm === XCHACHA20_POLY1305_ALGORITHM) {
+    return deriveXChaChaKey(password, encryption);
+  }
+
+  throw new Error("Unsupported document encryption.");
+}
+
 function getEncryptionKeyCacheId(record = {}) {
-  return `${record.id || ""}:${record.encryption?.salt || ""}`;
+  return [
+    record.id || "",
+    record.encryption?.version || "",
+    record.encryption?.algorithm || "",
+    record.encryption?.salt || "",
+  ].join(":");
 }
 
 async function getEncryptionKeyForRecord(record, password = sessionPassword) {
@@ -432,25 +586,48 @@ async function getEncryptionKeyForRecord(record, password = sessionPassword) {
 }
 
 async function encryptRecordName(record, key, encryption) {
-  const iv = randomBytes(AES_GCM_IV_BYTES);
   const plainName = getPlainRecordName(record);
-  const encrypted = await window.crypto.subtle.encrypt(
-    {
-      name: ENCRYPTION_ALGORITHM,
-      iv,
-      additionalData: createNameAad(record, encryption),
+  const plainBytes = new TextEncoder().encode(plainName);
+
+  if (encryption.algorithm === AES_GCM_ALGORITHM) {
+    const iv = randomBytes(AES_GCM_IV_BYTES);
+    const encrypted = await window.crypto.subtle.encrypt(
+      {
+        name: AES_GCM_ALGORITHM,
+        iv,
+        additionalData: createNameAad(record, encryption),
+        tagLength: AES_GCM_TAG_BYTES * 8,
+      },
+      key,
+      plainBytes,
+    );
+
+    return {
+      algorithm: AES_GCM_ALGORITHM,
+      data: bytesToHex(new Uint8Array(encrypted)),
+      encoding: "utf-8",
+      iv: bytesToHex(iv),
       tagLength: AES_GCM_TAG_BYTES * 8,
-    },
+      version: ENCRYPTED_NAME_VERSION,
+    };
+  }
+
+  const sodiumApi = await ensureSodiumReady();
+  const nonce = randomBytes(sodiumApi.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+  const encrypted = sodiumApi.crypto_aead_xchacha20poly1305_ietf_encrypt(
+    plainBytes,
+    createNameAad(record, encryption),
+    null,
+    nonce,
     key,
-    new TextEncoder().encode(plainName),
   );
 
   return {
-    algorithm: ENCRYPTION_ALGORITHM,
-    data: bytesToHex(new Uint8Array(encrypted)),
+    algorithm: XCHACHA20_POLY1305_ALGORITHM,
+    data: bytesToHex(encrypted),
     encoding: "utf-8",
-    iv: bytesToHex(iv),
-    tagLength: AES_GCM_TAG_BYTES * 8,
+    nonce: bytesToHex(nonce),
+    tagLength: sodiumApi.crypto_aead_xchacha20poly1305_ietf_ABYTES * 8,
     version: ENCRYPTED_NAME_VERSION,
   };
 }
@@ -460,15 +637,28 @@ async function decryptRecordName(record, key) {
     return getPlainRecordName(record);
   }
 
-  const decrypted = await window.crypto.subtle.decrypt(
-    {
-      name: ENCRYPTION_ALGORITHM,
-      iv: hexToBytes(record.encryptedName.iv),
-      additionalData: createNameAad(record, record.encryption),
-      tagLength: record.encryptedName.tagLength || AES_GCM_TAG_BYTES * 8,
-    },
-    key,
+  if (record.encryption.algorithm === AES_GCM_ALGORITHM) {
+    const decrypted = await window.crypto.subtle.decrypt(
+      {
+        name: AES_GCM_ALGORITHM,
+        iv: hexToBytes(record.encryptedName.iv),
+        additionalData: createNameAad(record, record.encryption),
+        tagLength: record.encryptedName.tagLength || AES_GCM_TAG_BYTES * 8,
+      },
+      key,
+      hexToBytes(record.encryptedName.data),
+    );
+
+    return new TextDecoder().decode(decrypted) || getFallbackDocumentName(getDocumentFormat(record));
+  }
+
+  const sodiumApi = await ensureSodiumReady();
+  const decrypted = sodiumApi.crypto_aead_xchacha20poly1305_ietf_decrypt(
+    null,
     hexToBytes(record.encryptedName.data),
+    createNameAad(record, record.encryption),
+    hexToBytes(record.encryptedName.nonce),
+    key,
   );
 
   return new TextDecoder().decode(decrypted) || getFallbackDocumentName(getDocumentFormat(record));
@@ -504,6 +694,7 @@ function configureLockOverlay(mode) {
   els.lockConfirmInput.value = "";
   els.lockConfirmInput.hidden = mode !== "setup";
   els.lockCancelButton.hidden = mode !== "setup";
+  setLockMessage("");
 
   if (mode === "setup") {
     els.lockTitle.textContent = "设置密码";
@@ -518,6 +709,21 @@ function configureLockOverlay(mode) {
     els.lockPasswordInput.autocomplete = "off";
     els.lockSubmitButton.textContent = "解锁";
   }
+}
+
+function setLockMessage(message = "") {
+  if (!els.lockMessage) {
+    return;
+  }
+
+  els.lockMessage.textContent = message;
+  els.lockMessage.hidden = !message;
+}
+
+function setLockBusy(busy) {
+  els.lockSubmitButton.disabled = busy;
+  els.lockPasswordInput.disabled = busy;
+  els.lockConfirmInput.disabled = busy;
 }
 
 function freezePageBehindLock() {
@@ -572,54 +778,73 @@ function lockReader() {
 
 async function handleLockSubmit(event) {
   event.preventDefault();
+  setLockMessage("");
 
   const password = els.lockPasswordInput.value;
 
   if (password.length < 4) {
-    showStatus("密码至少 4 位。");
+    setLockMessage("密码至少 4 位。");
     return;
   }
 
-  if (lockMode === "setup") {
-    if (password !== els.lockConfirmInput.value) {
-      showStatus("两次输入的密码不一致。");
-      return;
-    }
+  setLockBusy(true);
 
-    const salt = createSalt();
-    const hash = await hashPassword(password, salt);
-    setLockConfig({
-      hash,
-      salt,
-      version: 1,
-    });
-    clearSessionPassword();
-    stripStoredPlainFileNames();
-    showStatus("密码锁已开启。");
-    showLockOverlay("unlock");
+  if (lockMode === "setup") {
+    try {
+      if (password !== els.lockConfirmInput.value) {
+        setLockMessage("两次输入的密码不一致。");
+        return;
+      }
+
+      const salt = createSalt();
+      const hash = await hashPassword(password, salt);
+      setLockConfig({
+        hash,
+        hashAlgorithm: "SHA-256",
+        salt,
+        version: 2,
+      });
+      clearSessionPassword();
+      stripStoredPlainFileNames();
+      showStatus("密码锁已开启。");
+      showLockOverlay("unlock");
+    } catch (error) {
+      console.error(error);
+      setLockMessage("密码锁设置失败，请再试一次。");
+    } finally {
+      setLockBusy(false);
+    }
     return;
   }
 
   const config = getLockConfig();
 
   if (!config) {
+    setLockBusy(false);
     hideLockOverlay();
     return;
   }
 
-  const hash = await hashPassword(password, config.salt);
+  try {
+    const hashes = await getPasswordHashCandidates(password, config.salt);
 
-  if (hash !== config.hash) {
-    showStatus("密码不对。");
-    els.lockPasswordInput.select();
-    return;
+    if (!hashes.includes(config.hash)) {
+      setLockMessage("密码不对。");
+      els.lockPasswordInput.select();
+      return;
+    }
+
+    setSessionPassword(password);
+    hideLockOverlay();
+    showStatus("已解锁。");
+    restoreReaderPositionAfterResume();
+    handleUnlockedSession().catch((error) => console.warn(error));
+  } catch (error) {
+    console.error(error);
+    setLockMessage("解锁失败，请再试一次。");
+  } finally {
+    setLockBusy(false);
   }
-
-  setSessionPassword(password);
-  hideLockOverlay();
-  showStatus("已解锁。");
-  restoreReaderPositionAfterResume();
-  handleUnlockedSession().catch((error) => console.warn(error));
 }
 
 function showStatus(message, sticky = false) {
@@ -1366,20 +1591,34 @@ class EncryptedDocumentSource {
 
     const plainStart = chunkIndex * this.chunkSize;
     const plainLength = Math.min(this.chunkSize, Math.max(0, this.length - plainStart));
-    const encryptedOffset = chunkIndex * (this.chunkSize + AES_GCM_TAG_BYTES);
-    const encryptedEnd = encryptedOffset + plainLength + AES_GCM_TAG_BYTES;
-    const encryptedBytes = await this.blob.slice(encryptedOffset, encryptedEnd).arrayBuffer();
-    const decrypted = await window.crypto.subtle.decrypt(
-      {
-        name: ENCRYPTION_ALGORITHM,
-        iv: createChunkIv(this.encryption, chunkIndex),
-        additionalData: createChunkAad(this.record, this.encryption, chunkIndex),
-        tagLength: AES_GCM_TAG_BYTES * 8,
-      },
-      this.key,
-      encryptedBytes,
-    );
-    const bytes = new Uint8Array(decrypted);
+    const tagBytes = getEncryptionTagBytes(this.encryption);
+    const encryptedOffset = chunkIndex * (this.chunkSize + tagBytes);
+    const encryptedEnd = encryptedOffset + plainLength + tagBytes;
+    const encryptedBytes = new Uint8Array(await this.blob.slice(encryptedOffset, encryptedEnd).arrayBuffer());
+    let bytes;
+
+    if (this.encryption.algorithm === AES_GCM_ALGORITHM) {
+      const decrypted = await window.crypto.subtle.decrypt(
+        {
+          name: AES_GCM_ALGORITHM,
+          iv: createChunkIv(this.encryption, chunkIndex),
+          additionalData: createChunkAad(this.record, this.encryption, chunkIndex),
+          tagLength: this.encryption.tagLength || AES_GCM_TAG_BYTES * 8,
+        },
+        this.key,
+        encryptedBytes,
+      );
+      bytes = new Uint8Array(decrypted);
+    } else {
+      const sodiumApi = await ensureSodiumReady();
+      bytes = sodiumApi.crypto_aead_xchacha20poly1305_ietf_decrypt(
+        null,
+        encryptedBytes,
+        createChunkAad(this.record, this.encryption, chunkIndex),
+        createChunkNonce(this.encryption, chunkIndex),
+        this.key,
+      );
+    }
 
     this.chunkCache.set(chunkIndex, bytes);
 
@@ -1468,6 +1707,14 @@ async function createDocumentSourceFromRecord(record) {
 
 async function encryptDocumentRecord(record, password, onProgress = () => {}) {
   if (isRecordEncrypted(record)) {
+    if (!isCurrentRecordEncryption(record)) {
+      onProgress({
+        chunkIndex: 1,
+        totalChunks: 1,
+      });
+      return record;
+    }
+
     const key = await getEncryptionKeyForRecord(record, password);
     const encryptedName = isRecordNameEncrypted(record)
       ? record.encryptedName
@@ -1489,16 +1736,18 @@ async function encryptDocumentRecord(record, password, onProgress = () => {}) {
   }
 
   const originalSize = record.size || record.blob.size || 0;
+  const sodiumApi = await ensureSodiumReady();
   const encryption = {
     algorithm: ENCRYPTION_ALGORITHM,
     chunkSize: ENCRYPTION_CHUNK_SIZE,
     encryptedAt: Date.now(),
-    iterations: ENCRYPTION_KDF_ITERATIONS,
     keyAlgorithm: ENCRYPTION_KEY_ALGORITHM,
-    noncePrefix: bytesToHex(randomBytes(AES_GCM_NONCE_PREFIX_BYTES)),
+    memLimit: sodiumApi.crypto_pwhash_MEMLIMIT_INTERACTIVE,
+    noncePrefix: bytesToHex(randomBytes(XCHACHA_NONCE_PREFIX_BYTES)),
+    opsLimit: sodiumApi.crypto_pwhash_OPSLIMIT_INTERACTIVE,
     originalSize,
-    salt: bytesToHex(randomBytes(16)),
-    tagLength: AES_GCM_TAG_BYTES * 8,
+    salt: bytesToHex(randomBytes(sodiumApi.crypto_pwhash_SALTBYTES)),
+    tagLength: sodiumApi.crypto_aead_xchacha20poly1305_ietf_ABYTES * 8,
     version: ENCRYPTION_VERSION,
   };
   const key = await deriveEncryptionKey(password, encryption);
@@ -1509,16 +1758,13 @@ async function encryptDocumentRecord(record, password, onProgress = () => {}) {
   for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
     const begin = chunkIndex * encryption.chunkSize;
     const end = Math.min(begin + encryption.chunkSize, originalSize);
-    const plainBytes = await record.blob.slice(begin, end).arrayBuffer();
-    const encryptedBytes = await window.crypto.subtle.encrypt(
-      {
-        name: ENCRYPTION_ALGORITHM,
-        iv: createChunkIv(encryption, chunkIndex),
-        additionalData: createChunkAad(record, encryption, chunkIndex),
-        tagLength: AES_GCM_TAG_BYTES * 8,
-      },
-      key,
+    const plainBytes = new Uint8Array(await record.blob.slice(begin, end).arrayBuffer());
+    const encryptedBytes = sodiumApi.crypto_aead_xchacha20poly1305_ietf_encrypt(
       plainBytes,
+      createChunkAad(record, encryption, chunkIndex),
+      null,
+      createChunkNonce(encryption, chunkIndex),
+      key,
     );
 
     encryptedParts.push(encryptedBytes);
@@ -4901,8 +5147,8 @@ async function maybePromptLibraryEncryption() {
     return;
   }
 
-  if (!isWebCryptoEncryptionAvailable()) {
-    showStatus("当前环境不支持文件加密，请用 HTTPS 或 localhost 打开。", true);
+  if (!(await isSodiumEncryptionAvailable())) {
+    showStatus("当前浏览器不支持安全随机数或 libsodium 初始化失败，暂时无法加密文件。", true);
     return;
   }
 
