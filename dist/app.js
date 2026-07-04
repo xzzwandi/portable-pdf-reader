@@ -12,7 +12,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v57";
+const APP_VERSION = "v58";
 const DOCUMENT_FORMATS = {
   PDF: "pdf",
   EPUB: "epub",
@@ -25,7 +25,7 @@ const CONTINUOUS_KEEP_VIEWPORTS = 2.25;
 const CONTINUOUS_RENDER_VIEWPORTS = 1.35;
 const CONTINUOUS_MAX_RENDERED_PAGES = 6;
 const CONTINUOUS_OBSERVER_MARGIN = "700px 0px";
-const CONTINUOUS_RENDER_TIMEOUT_MS = 25_000;
+const CONTINUOUS_RENDER_TIMEOUT_MS = 60_000;
 const CONTINUOUS_HEALTH_CHECK_DELAY_MS = 700;
 const CONTINUOUS_HEALTH_CHECK_INTERVAL_MS = 1_500;
 const CONTINUOUS_BLANK_RETRY_LIMIT = 3;
@@ -2500,7 +2500,7 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, opt
     await task.promise;
 
     if (!isContinuousRenderCurrent(targetPage, shell, token, runId)) {
-      releaseContinuousCanvas(shell);
+      // A stale render can finish after a retry has reused the shell; leave the newer canvas alone.
       return;
     }
 
