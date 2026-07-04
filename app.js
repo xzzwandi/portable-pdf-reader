@@ -11,7 +11,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v52";
+const APP_VERSION = "v53";
 const DOCUMENT_FORMATS = {
   PDF: "pdf",
   EPUB: "epub",
@@ -24,6 +24,11 @@ const CONTINUOUS_KEEP_VIEWPORTS = 2.25;
 const CONTINUOUS_RENDER_VIEWPORTS = 1.35;
 const CONTINUOUS_MAX_RENDERED_PAGES = 6;
 const CONTINUOUS_OBSERVER_MARGIN = "700px 0px";
+const CONTINUOUS_RENDER_TIMEOUT_MS = 25_000;
+const CONTINUOUS_HEALTH_CHECK_DELAY_MS = 700;
+const CONTINUOUS_HEALTH_CHECK_INTERVAL_MS = 1_500;
+const CONTINUOUS_BLANK_RETRY_LIMIT = 3;
+const CONTINUOUS_CLEANUP_IDLE_MS = 3_500;
 const PDF_RANGE_CHUNK_SIZE = 1_048_576;
 const MAX_PAGED_CANVAS_PIXELS = 18_000_000;
 const MAX_CONTINUOUS_CANVAS_PIXELS = 6_500_000;
@@ -128,7 +133,12 @@ let tocWindowEnd = 0;
 const pageRenderTasks = new Map();
 const continuousRenderPromises = new Map();
 const pendingContinuousPages = new Map();
+const continuousRenderRuns = new Map();
+const continuousBlankRetries = new Map();
 let continuousQueueRunning = false;
+let continuousRenderRunId = 0;
+let continuousHealthTimer = null;
+let continuousCleanupTimer = null;
 
 const state = {
   documentId: "",
@@ -216,13 +226,13 @@ function configureLockOverlay(mode) {
     els.lockTitle.textContent = "设置密码";
     els.lockDescription.textContent = "设置后，打开这个阅读器需要先输入密码。";
     els.lockPasswordInput.placeholder = "设置密码，至少 4 位";
-    els.lockPasswordInput.autocomplete = "new-password";
+    els.lockPasswordInput.autocomplete = "off";
     els.lockSubmitButton.textContent = "保存并锁定";
   } else {
     els.lockTitle.textContent = "密码锁";
     els.lockDescription.textContent = "输入密码后继续阅读。";
     els.lockPasswordInput.placeholder = "输入密码";
-    els.lockPasswordInput.autocomplete = "current-password";
+    els.lockPasswordInput.autocomplete = "off";
     els.lockSubmitButton.textContent = "解锁";
   }
 }
@@ -880,6 +890,9 @@ function updateControls() {
 }
 
 async function cancelCurrentRender() {
+  clearContinuousHealthTimer();
+  clearContinuousCleanupTimer();
+
   if (renderTask) {
     renderTask.cancel();
     renderTask = null;
@@ -890,9 +903,13 @@ async function cancelCurrentRender() {
   }
   pageRenderTasks.clear();
   continuousRenderPromises.clear();
+  continuousRenderRuns.clear();
 }
 
 function clearContinuousPages() {
+  clearContinuousHealthTimer();
+  clearContinuousCleanupTimer();
+
   if (pageObserver) {
     pageObserver.disconnect();
     pageObserver = null;
@@ -904,6 +921,8 @@ function clearContinuousPages() {
   pageRenderTasks.clear();
   continuousRenderPromises.clear();
   pendingContinuousPages.clear();
+  continuousRenderRuns.clear();
+  continuousBlankRetries.clear();
   els.continuousPages.replaceChildren();
 }
 
@@ -1231,6 +1250,47 @@ function releaseContinuousCanvas(shell) {
   ensureContinuousPlaceholder(shell);
   delete shell.dataset.rendered;
   delete shell.dataset.rendering;
+  delete shell.dataset.renderedAt;
+  delete shell.dataset.renderStartedAt;
+  delete shell.dataset.renderRunId;
+}
+
+function clearContinuousHealthTimer() {
+  window.clearTimeout(continuousHealthTimer);
+  continuousHealthTimer = null;
+}
+
+function clearContinuousCleanupTimer() {
+  window.clearTimeout(continuousCleanupTimer);
+  continuousCleanupTimer = null;
+}
+
+function scheduleContinuousPdfCleanup() {
+  if (!pdfDoc || !isScrollMode()) {
+    return;
+  }
+
+  clearContinuousCleanupTimer();
+  continuousCleanupTimer = window.setTimeout(() => {
+    continuousCleanupTimer = null;
+
+    if (
+      !pdfDoc ||
+      !isScrollMode() ||
+      pageRenderTasks.size ||
+      continuousRenderPromises.size ||
+      pendingContinuousPages.size
+    ) {
+      return;
+    }
+
+    try {
+      const cleanupResult = pdfDoc.cleanup?.();
+      cleanupResult?.catch?.(() => {});
+    } catch {
+      // Best-effort memory cleanup only.
+    }
+  }, CONTINUOUS_CLEANUP_IDLE_MS);
 }
 
 function getContinuousViewportWindow(extraViewports = CONTINUOUS_KEEP_VIEWPORTS) {
@@ -1261,6 +1321,168 @@ function getContinuousShellDistance(shell) {
   const top = shell.offsetTop - els.continuousPages.offsetTop;
   const shellCenter = top + Math.max(shell.offsetHeight, 1) / 2;
   return Math.abs(shellCenter - center);
+}
+
+function getVisibleContinuousShells(extraViewports = 0.35) {
+  if (!els.continuousPages.childElementCount) {
+    return [];
+  }
+
+  return Array.from(els.continuousPages.querySelectorAll(".page-shell"))
+    .filter((shell) => isContinuousShellNearViewport(shell, extraViewports))
+    .sort((a, b) => getContinuousShellDistance(a) - getContinuousShellDistance(b));
+}
+
+function isCanvasLikelyBlank(canvas) {
+  if (!canvas || canvas.width < 2 || canvas.height < 2) {
+    return true;
+  }
+
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+
+  if (!context) {
+    return false;
+  }
+
+  const sampleColumns = 17;
+  const sampleRows = 23;
+  let nonWhitePixels = 0;
+
+  try {
+    for (let row = 0; row < sampleRows; row += 1) {
+      const y = clamp(
+        Math.floor(((row + 0.5) / sampleRows) * canvas.height),
+        0,
+        canvas.height - 1,
+      );
+
+      for (let column = 0; column < sampleColumns; column += 1) {
+        const x = clamp(
+          Math.floor(((column + 0.5) / sampleColumns) * canvas.width),
+          0,
+          canvas.width - 1,
+        );
+        const data = context.getImageData(x, y, 1, 1).data;
+
+        if (data[3] > 0 && (data[0] < 245 || data[1] < 245 || data[2] < 245)) {
+          nonWhitePixels += 1;
+
+          if (nonWhitePixels >= 2) {
+            return false;
+          }
+        }
+      }
+    }
+  } catch {
+    return false;
+  }
+
+  return true;
+}
+
+function isContinuousRenderCurrent(pageNumber, shell, token, runId) {
+  return (
+    token === renderToken &&
+    Boolean(pdfDoc) &&
+    continuousRenderRuns.get(pageNumber) === runId &&
+    shell.dataset.renderRunId === String(runId)
+  );
+}
+
+function recoverContinuousPageRender(pageNumber, shell, token) {
+  if (!pdfDoc || token !== renderToken || !isScrollMode()) {
+    return false;
+  }
+
+  const task = pageRenderTasks.get(pageNumber);
+
+  try {
+    task?.cancel?.();
+  } catch {
+    // PDF.js cancellation is best effort.
+  }
+
+  pageRenderTasks.delete(pageNumber);
+  continuousRenderPromises.delete(pageNumber);
+  continuousRenderRuns.delete(pageNumber);
+  pendingContinuousPages.delete(pageNumber);
+  releaseContinuousCanvas(shell);
+  scheduleContinuousPageRender(pageNumber, token);
+  return true;
+}
+
+function checkVisibleContinuousPages() {
+  if (!pdfDoc || !isScrollMode() || !els.continuousPages.childElementCount) {
+    return;
+  }
+
+  const token = renderToken;
+  const now = Date.now();
+  let hasUnsettledVisiblePage = false;
+
+  for (const shell of getVisibleContinuousShells().slice(0, CONTINUOUS_MAX_RENDERED_PAGES)) {
+    const pageNumber = getContinuousShellPageNumber(shell);
+
+    if (!Number.isFinite(pageNumber)) {
+      continue;
+    }
+
+    if (shell.dataset.rendering === "true") {
+      hasUnsettledVisiblePage = true;
+      const startedAt = Number.parseInt(shell.dataset.renderStartedAt || "0", 10);
+
+      if (startedAt && now - startedAt > CONTINUOUS_RENDER_TIMEOUT_MS) {
+        recoverContinuousPageRender(pageNumber, shell, token);
+      }
+
+      continue;
+    }
+
+    if (shell.dataset.rendered === "true") {
+      const canvas = shell.querySelector("canvas");
+
+      if (!isCanvasLikelyBlank(canvas)) {
+        continuousBlankRetries.delete(pageNumber);
+        continue;
+      }
+
+      const retryCount = continuousBlankRetries.get(pageNumber) || 0;
+
+      if (retryCount < CONTINUOUS_BLANK_RETRY_LIMIT) {
+        continuousBlankRetries.set(pageNumber, retryCount + 1);
+        recoverContinuousPageRender(pageNumber, shell, token);
+        hasUnsettledVisiblePage = true;
+      }
+
+      continue;
+    }
+
+    if (
+      !pendingContinuousPages.has(pageNumber) &&
+      !continuousRenderPromises.has(pageNumber) &&
+      !pageRenderTasks.has(pageNumber)
+    ) {
+      scheduleContinuousPageRender(pageNumber, token);
+    }
+
+    hasUnsettledVisiblePage = true;
+  }
+
+  if (hasUnsettledVisiblePage || pendingContinuousPages.size || continuousRenderPromises.size) {
+    scheduleContinuousHealthCheck(CONTINUOUS_HEALTH_CHECK_INTERVAL_MS);
+  }
+}
+
+function scheduleContinuousHealthCheck(delay = CONTINUOUS_HEALTH_CHECK_DELAY_MS) {
+  if (!pdfDoc || !isScrollMode() || !els.continuousPages.childElementCount) {
+    return;
+  }
+
+  clearContinuousHealthTimer();
+  continuousHealthTimer = window.setTimeout(() => {
+    continuousHealthTimer = null;
+    checkVisibleContinuousPages();
+  }, delay);
 }
 
 function pruneContinuousPages() {
@@ -1308,13 +1530,12 @@ function pruneContinuousPages() {
       .forEach((shell) => releaseContinuousCanvas(shell));
   }
 
-  if (pageRenderTasks.size === 0) {
-    try {
-      const cleanupResult = pdfDoc.cleanup?.();
-      cleanupResult?.catch?.(() => {});
-    } catch {
-      // Best-effort memory cleanup only.
-    }
+  if (
+    pageRenderTasks.size === 0 &&
+    continuousRenderPromises.size === 0 &&
+    pendingContinuousPages.size === 0
+  ) {
+    scheduleContinuousPdfCleanup();
   }
 }
 
@@ -1373,7 +1594,7 @@ async function runContinuousRenderQueue() {
         break;
       }
 
-      await renderContinuousPage(next.pageNumber, next.token);
+      await renderContinuousPageWithTimeout(next.pageNumber, next.token);
     }
   } finally {
     continuousQueueRunning = false;
@@ -1381,6 +1602,31 @@ async function runContinuousRenderQueue() {
     if (pendingContinuousPages.size && pdfDoc && isScrollMode()) {
       window.setTimeout(runContinuousRenderQueue, 0);
     }
+  }
+}
+
+async function renderContinuousPageWithTimeout(pageNumber, token) {
+  let timeoutId = 0;
+  const render = renderContinuousPage(pageNumber, token).catch((error) => {
+    if (error?.name !== "RenderingCancelledException") {
+      console.error(error);
+    }
+  });
+  const timeout = new Promise((resolve) => {
+    timeoutId = window.setTimeout(() => resolve("timeout"), CONTINUOUS_RENDER_TIMEOUT_MS);
+  });
+  const result = await Promise.race([render, timeout]);
+
+  window.clearTimeout(timeoutId);
+
+  if (result !== "timeout") {
+    return;
+  }
+
+  const shell = els.continuousPages.querySelector(`[data-page="${pageNumber}"]`);
+
+  if (shell) {
+    recoverContinuousPageRender(pageNumber, shell, token);
   }
 }
 
@@ -1408,8 +1654,10 @@ function scheduleContinuousPageRender(pageNumber, token = renderToken) {
     return;
   }
 
+  clearContinuousCleanupTimer();
   pendingContinuousPages.set(targetPage, token);
   runContinuousRenderQueue();
+  scheduleContinuousHealthCheck(CONTINUOUS_HEALTH_CHECK_INTERVAL_MS);
 }
 
 function queueVisibleContinuousPages(token = renderToken) {
@@ -1424,6 +1672,8 @@ function queueVisibleContinuousPages(token = renderToken) {
   for (const shell of shells.slice(0, CONTINUOUS_MAX_RENDERED_PAGES)) {
     scheduleContinuousPageRender(getContinuousShellPageNumber(shell), token);
   }
+
+  scheduleContinuousHealthCheck();
 }
 
 async function renderContinuousPage(pageNumber, token = renderToken, options = {}) {
@@ -1434,7 +1684,7 @@ async function renderContinuousPage(pageNumber, token = renderToken, options = {
   const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
   const shell = els.continuousPages.querySelector(`[data-page="${targetPage}"]`);
 
-  if (!shell || shell.dataset.rendered === "true") {
+  if (!shell || (!options.force && shell.dataset.rendered === "true")) {
     return;
   }
 
@@ -1449,7 +1699,11 @@ async function renderContinuousPage(pageNumber, token = renderToken, options = {
     return;
   }
 
-  const renderPromise = renderContinuousPageInternal(targetPage, shell, token, options);
+  const runId = (continuousRenderRunId += 1);
+  continuousRenderRuns.set(targetPage, runId);
+  shell.dataset.renderRunId = String(runId);
+
+  const renderPromise = renderContinuousPageInternal(targetPage, shell, token, runId, options);
   continuousRenderPromises.set(targetPage, renderPromise);
 
   try {
@@ -1458,21 +1712,33 @@ async function renderContinuousPage(pageNumber, token = renderToken, options = {
     if (continuousRenderPromises.get(targetPage) === renderPromise) {
       continuousRenderPromises.delete(targetPage);
     }
+
+    if (
+      pdfDoc &&
+      isScrollMode() &&
+      pageRenderTasks.size === 0 &&
+      continuousRenderPromises.size === 0 &&
+      pendingContinuousPages.size === 0
+    ) {
+      scheduleContinuousPdfCleanup();
+    }
   }
 }
 
-async function renderContinuousPageInternal(targetPage, shell, token, options = {}) {
+async function renderContinuousPageInternal(targetPage, shell, token, runId, options = {}) {
   if (!options.force && !isContinuousShellNearViewport(shell, CONTINUOUS_RENDER_VIEWPORTS)) {
     return;
   }
 
   shell.dataset.rendering = "true";
+  shell.dataset.renderStartedAt = String(Date.now());
   let page = null;
+  let task = null;
 
   try {
     page = await pdfDoc.getPage(targetPage);
 
-    if (token !== renderToken || !pdfDoc) {
+    if (!isContinuousRenderCurrent(targetPage, shell, token, runId)) {
       return;
     }
 
@@ -1485,7 +1751,7 @@ async function renderContinuousPageInternal(targetPage, shell, token, options = 
     const canvas = ensureContinuousCanvas(shell, viewport);
     const context = prepareCanvas(canvas, viewport);
 
-    const task = page.render({
+    task = page.render({
       canvasContext: context,
       viewport,
     });
@@ -1493,25 +1759,40 @@ async function renderContinuousPageInternal(targetPage, shell, token, options = 
     pageRenderTasks.set(targetPage, task);
     await task.promise;
 
-    if (token !== renderToken) {
+    if (!isContinuousRenderCurrent(targetPage, shell, token, runId)) {
       releaseContinuousCanvas(shell);
       return;
     }
 
     shell.dataset.rendered = "true";
+    shell.dataset.renderedAt = String(Date.now());
+    scheduleContinuousHealthCheck(260);
   } catch (error) {
     if (error?.name !== "RenderingCancelledException") {
       console.error(error);
     }
-    releaseContinuousCanvas(shell);
+
+    if (isContinuousRenderCurrent(targetPage, shell, token, runId)) {
+      releaseContinuousCanvas(shell);
+    }
   } finally {
     try {
       page?.cleanup?.();
     } catch {
       // Best-effort PDF.js page cache cleanup.
     }
-    pageRenderTasks.delete(targetPage);
-    delete shell.dataset.rendering;
+
+    if (pageRenderTasks.get(targetPage) === task) {
+      pageRenderTasks.delete(targetPage);
+    }
+
+    if (continuousRenderRuns.get(targetPage) === runId) {
+      continuousRenderRuns.delete(targetPage);
+      delete shell.dataset.rendering;
+      delete shell.dataset.renderStartedAt;
+      delete shell.dataset.renderRunId;
+    }
+
     pruneContinuousPages();
   }
 }
@@ -4886,6 +5167,7 @@ function wireEvents() {
 
     lastViewportChangeAt = Date.now();
     restoreReaderPositionAfterResume();
+    scheduleContinuousHealthCheck(300);
   });
 
   window.addEventListener("pagehide", persistReaderPositionNow);
@@ -4893,10 +5175,12 @@ function wireEvents() {
   window.addEventListener("pageshow", () => {
     lastViewportChangeAt = Date.now();
     restoreReaderPositionAfterResume();
+    scheduleContinuousHealthCheck(300);
   });
   window.addEventListener("focus", () => {
     lastViewportChangeAt = Date.now();
     restoreReaderPositionAfterResume();
+    scheduleContinuousHealthCheck(300);
   });
 
   window.addEventListener("resize", () => {
