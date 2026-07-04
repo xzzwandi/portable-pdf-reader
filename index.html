@@ -8,7 +8,7 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./icons/icon.svg" />
-    <link rel="stylesheet" href="./styles.css?v=53" />
+    <link rel="stylesheet" href="./styles.css?v=55" />
   </head>
   <body>
     <div class="app-shell">
@@ -18,7 +18,7 @@
           <div>
             <div class="brand-title">
               <h1>随身阅读</h1>
-              <span id="appVersion" class="version-badge">v53</span>
+              <span id="appVersion" class="version-badge">v55</span>
             </div>
             <p id="docName">未打开文件</p>
           </div>
@@ -106,6 +106,34 @@
         </section>
       </div>
 
+      <div id="encryptionOverlay" class="encryption-overlay" hidden>
+        <section class="encryption-panel" role="dialog" aria-modal="true" aria-labelledby="encryptionTitle">
+          <div class="lock-mark" aria-hidden="true">密</div>
+          <h2 id="encryptionTitle">需要加密书架文件</h2>
+          <p id="encryptionDescription">已开启密码锁，书架里还有文件尚未加密。</p>
+
+          <form id="encryptionForm" class="encryption-form">
+            <input
+              id="encryptionPasswordInput"
+              type="text"
+              autocomplete="off"
+              autocapitalize="none"
+              data-password-mask="true"
+              inputmode="text"
+              minlength="4"
+              placeholder="输入密码"
+              spellcheck="false"
+              hidden
+            />
+            <progress id="encryptionProgress" max="100" value="0" hidden></progress>
+            <p id="encryptionProgressText" class="encryption-progress-text" hidden></p>
+            <button id="encryptionStartButton" class="primary" type="submit">加密文件</button>
+          </form>
+
+          <button id="encryptionLaterButton" type="button">稍后</button>
+        </section>
+      </div>
+
       <div id="tocOverlay" class="toc-overlay" hidden>
         <section class="toc-panel" role="dialog" aria-modal="true" aria-labelledby="tocTitle">
           <header class="toc-header">
@@ -158,6 +186,6 @@
 
     <script src="./vendor/jszip/jszip.min.js?v=45"></script>
     <script src="./vendor/epubjs/epub.min.js?v=45"></script>
-    <script type="module" src="./app.js?v=53"></script>
+    <script type="module" src="./app.js?v=55"></script>
   </body>
 </html>
