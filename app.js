@@ -49,7 +49,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=73";
+} from "./src/constants.js?v=76";
 import {
   bytesToHex,
   createChunkAad,
@@ -74,24 +74,25 @@ import {
   randomBytes,
   recordNeedsEncryptionMigration,
   withDetectedEncryptedPayloadLocation,
+  withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=73";
+} from "./src/encryption.js?v=76";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=73";
+} from "./src/utils.js?v=76";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=73";
+} from "./src/encrypted-backups.js?v=76";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=73";
+} from "./src/pdf-sources.js?v=76";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -195,6 +196,7 @@ let encryptionMigrationInProgress = false;
 let backupOperationInProgress = false;
 let pendingBackupRequest = null;
 let documentOpenToken = 0;
+let libraryOpenRequestId = 0;
 let activePdfLoadingTask = null;
 let activePdfRangeFailurePromise = null;
 let restoreAttempted = false;
@@ -220,6 +222,7 @@ const pendingContinuousPages = new Map();
 const continuousRenderRuns = new Map();
 const continuousBlankRetries = new Map();
 const pagedBlankRetries = new Map();
+const libraryRecordCache = new Map();
 let continuousQueueRunning = false;
 let continuousRenderRunId = 0;
 let continuousHealthTimer = null;
@@ -266,6 +269,7 @@ async function destroyPdfLoadingTask(loadingTask) {
 function beginDocumentOpen() {
   documentOpenToken += 1;
   activePdfRangeFailurePromise = null;
+  interruptCurrentRender();
 
   if (activePdfLoadingTask) {
     destroyPdfLoadingTask(activePdfLoadingTask);
@@ -400,6 +404,14 @@ async function getRecordDisplayName(record = {}) {
   }
 
   return getPlainRecordName(record);
+}
+
+function getRecordOpeningLabel(record = {}) {
+  if (record.name) {
+    return record.name;
+  }
+
+  return getFallbackDocumentName(getDocumentFormat(record));
 }
 
 function configureLockOverlay(mode) {
@@ -1073,7 +1085,7 @@ async function saveImportedEncryptedBackupRecord(
 
   if (backupPassword === targetPassword) {
     await verifyEncryptedBackupRecord(record, backupPassword);
-    recordToSave = await withDetectedEncryptedPayloadLocation(record);
+    recordToSave = withPayloadOnlyEncryptedBlob(await withDetectedEncryptedPayloadLocation(record));
   } else {
     recordToSave = await reencryptEncryptedRecord(record, backupPassword, targetPassword, onProgress);
   }
@@ -1515,21 +1527,34 @@ function updateControls() {
   els.scrollModeButton.setAttribute("aria-pressed", String(scrollMode || epubMode));
 }
 
-async function cancelCurrentRender() {
+function cancelCurrentRender() {
   clearContinuousHealthTimer();
   clearContinuousCleanupTimer();
 
   if (renderTask) {
-    renderTask.cancel();
+    try {
+      renderTask.cancel();
+    } catch {
+      // PDF.js cancellation is best effort.
+    }
     renderTask = null;
   }
 
   for (const task of pageRenderTasks.values()) {
-    task.cancel();
+    try {
+      task.cancel();
+    } catch {
+      // PDF.js cancellation is best effort.
+    }
   }
   pageRenderTasks.clear();
   continuousRenderPromises.clear();
   continuousRenderRuns.clear();
+}
+
+function interruptCurrentRender() {
+  cancelCurrentRender();
+  pendingContinuousPages.clear();
 }
 
 function clearContinuousPages() {
@@ -1784,6 +1809,7 @@ async function renderPage(pageNumber, options = {}) {
   }
 
   const token = ++renderToken;
+  const documentToken = documentOpenToken;
   const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
   const blankRetryCount = Math.max(0, Math.floor(options.blankRetryCount || 0));
   state.page = targetPage;
@@ -1804,7 +1830,7 @@ async function renderPage(pageNumber, options = {}) {
       timeoutMs: PDF_RENDER_TIMEOUT_MS,
     });
 
-    if (token !== renderToken || !pdfDoc) {
+    if (token !== renderToken || documentToken !== documentOpenToken || !pdfDoc) {
       return;
     }
 
@@ -1823,14 +1849,20 @@ async function renderPage(pageNumber, options = {}) {
       timeoutMs: PDF_RENDER_TIMEOUT_MS,
     });
 
-    if (token !== renderToken) {
+    if (token !== renderToken || documentToken !== documentOpenToken) {
       return;
     }
 
     if (isCanvasLikelyBlank(scratchCanvas) && blankRetryCount < PAGED_BLANK_RETRY_LIMIT) {
       pagedBlankRetries.set(targetPage, blankRetryCount + 1);
       window.setTimeout(() => {
-        if (token === renderToken && pdfDoc && state.page === targetPage && !isScrollMode()) {
+        if (
+          token === renderToken &&
+          documentToken === documentOpenToken &&
+          pdfDoc &&
+          state.page === targetPage &&
+          !isScrollMode()
+        ) {
           renderPage(targetPage, { blankRetryCount: blankRetryCount + 1 }).catch((error) => {
             console.error(error);
           });
@@ -1845,6 +1877,10 @@ async function renderPage(pageNumber, options = {}) {
     saveReaderState();
     hideStatus();
   } catch (error) {
+    if (documentToken !== documentOpenToken) {
+      return;
+    }
+
     if (error?.name === "RenderingCancelledException") {
       return;
     }
@@ -2446,7 +2482,8 @@ async function renderContinuousPage(pageNumber, token = renderToken, options = {
   continuousRenderRuns.set(targetPage, runId);
   shell.dataset.renderRunId = String(runId);
 
-  const renderPromise = renderContinuousPageInternal(targetPage, shell, token, runId, options);
+  const documentToken = documentOpenToken;
+  const renderPromise = renderContinuousPageInternal(targetPage, shell, token, runId, documentToken, options);
   continuousRenderPromises.set(targetPage, renderPromise);
 
   try {
@@ -2468,7 +2505,7 @@ async function renderContinuousPage(pageNumber, token = renderToken, options = {
   }
 }
 
-async function renderContinuousPageInternal(targetPage, shell, token, runId, options = {}) {
+async function renderContinuousPageInternal(targetPage, shell, token, runId, documentToken, options = {}) {
   if (!options.force && !isContinuousShellNearViewport(shell, CONTINUOUS_RENDER_VIEWPORTS)) {
     return;
   }
@@ -2484,7 +2521,10 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, opt
       timeoutMs: PDF_RENDER_TIMEOUT_MS,
     });
 
-    if (!isContinuousRenderCurrent(targetPage, shell, token, runId)) {
+    if (
+      documentToken !== documentOpenToken ||
+      !isContinuousRenderCurrent(targetPage, shell, token, runId)
+    ) {
       return;
     }
 
@@ -2494,8 +2534,8 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, opt
     }
 
     const viewport = getScaledViewport(page);
-    const canvas = ensureContinuousCanvas(shell, viewport);
-    const context = prepareCanvas(canvas, viewport);
+    const scratchCanvas = document.createElement("canvas");
+    const context = prepareCanvas(scratchCanvas, viewport);
 
     task = page.render({
       canvasContext: context,
@@ -2508,15 +2548,46 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, opt
       timeoutMs: PDF_RENDER_TIMEOUT_MS,
     });
 
-    if (!isContinuousRenderCurrent(targetPage, shell, token, runId)) {
+    if (
+      documentToken !== documentOpenToken ||
+      !isContinuousRenderCurrent(targetPage, shell, token, runId)
+    ) {
       // A stale render can finish after a retry has reused the shell; leave the newer canvas alone.
       return;
     }
 
+    if (isCanvasLikelyBlank(scratchCanvas)) {
+      const retryCount = continuousBlankRetries.get(targetPage) || 0;
+
+      if (retryCount < CONTINUOUS_BLANK_RETRY_LIMIT) {
+        continuousBlankRetries.set(targetPage, retryCount + 1);
+        releaseContinuousCanvas(shell);
+        window.setTimeout(() => {
+          if (
+            token === renderToken &&
+            documentToken === documentOpenToken &&
+            pdfDoc &&
+            isScrollMode() &&
+            shell.isConnected
+          ) {
+            scheduleContinuousPageRender(targetPage, token);
+          }
+        }, PAGED_BLANK_RETRY_DELAY_MS);
+        return;
+      }
+    }
+
+    continuousBlankRetries.delete(targetPage);
+    const canvas = ensureContinuousCanvas(shell, viewport);
+    commitRenderedCanvas(scratchCanvas, canvas);
     shell.dataset.rendered = "true";
     shell.dataset.renderedAt = String(Date.now());
     scheduleContinuousHealthCheck(260);
   } catch (error) {
+    if (documentToken !== documentOpenToken) {
+      return;
+    }
+
     if (error?.name !== "RenderingCancelledException") {
       console.error(error);
     }
@@ -2527,7 +2598,10 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, opt
       // Best-effort cancellation after a timed-out render.
     }
 
-    if (isContinuousRenderCurrent(targetPage, shell, token, runId)) {
+    if (
+      documentToken === documentOpenToken &&
+      isContinuousRenderCurrent(targetPage, shell, token, runId)
+    ) {
       releaseContinuousCanvas(shell);
     }
   } finally {
@@ -3371,6 +3445,7 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
   }
 
   const token = ++renderToken;
+  const documentToken = documentOpenToken;
   let releasedScrollTracking = false;
   scrollTrackingSuppressionDepth += 1;
   const releaseScrollTracking = () => {
@@ -3396,7 +3471,7 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
 
     const estimatedSize = await estimateContinuousPageSize();
 
-    if (token !== renderToken || !pdfDoc) {
+    if (token !== renderToken || documentToken !== documentOpenToken || !pdfDoc) {
       return;
     }
 
@@ -3417,7 +3492,7 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
     const scrollTopAfterInitialPosition = els.canvasWrap.scrollTop;
     await renderContinuousPage(targetPage, token);
 
-    if (token !== renderToken) {
+    if (token !== renderToken || documentToken !== documentOpenToken) {
       return;
     }
 
@@ -3443,6 +3518,10 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
     saveReaderState();
     hideStatus();
   } catch (error) {
+    if (documentToken !== documentOpenToken) {
+      return;
+    }
+
     if (error?.name === "RenderingCancelledException") {
       return;
     }
@@ -4858,8 +4937,17 @@ function getExactArrayBuffer(bytes) {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
-async function loadEpubFromSource(source, meta = {}) {
+async function loadEpubFromSource(source, meta = {}, openToken = beginDocumentOpen()) {
+  if (!isDocumentOpenCurrent(openToken)) {
+    return false;
+  }
+
   await closeCurrentDocument();
+
+  if (!isDocumentOpenCurrent(openToken)) {
+    return false;
+  }
+
   state.format = DOCUMENT_FORMATS.EPUB;
   epubAtEnd = false;
   epubAtStart = false;
@@ -4875,12 +4963,22 @@ async function loadEpubFromSource(source, meta = {}) {
     }
 
     const bytes = await source.readRange(0, source.length);
+
+    if (!isDocumentOpenCurrent(openToken)) {
+      return false;
+    }
+
     const buffer = getExactArrayBuffer(bytes);
     const book = window.ePub(undefined, {
       replacements: "blobUrl",
     });
     await book.open(buffer, "binary");
     await book.ready;
+
+    if (!isDocumentOpenCurrent(openToken)) {
+      book.destroy?.();
+      return false;
+    }
 
     epubBook = book;
     createEpubRendition();
@@ -4893,6 +4991,11 @@ async function loadEpubFromSource(source, meta = {}) {
 
     updateControls();
     await epubRendition.display(state.epubCfi || undefined);
+
+    if (!isDocumentOpenCurrent(openToken)) {
+      return false;
+    }
+
     await waitForNextFrame();
     await waitForNextFrame();
     await waitForEpubImageRepairs();
@@ -4906,7 +5009,12 @@ async function loadEpubFromSource(source, meta = {}) {
     saveReaderState();
     hideStatus();
     setEpubLoading(false);
+    return true;
   } catch (error) {
+    if (!isDocumentOpenCurrent(openToken)) {
+      return false;
+    }
+
     console.error(error);
     setEpubLoading(false);
     await closeCurrentDocument();
@@ -4914,16 +5022,22 @@ async function loadEpubFromSource(source, meta = {}) {
     setReaderVisible(false);
     updateViewerMode();
     showStatus("这个 EPUB 暂时打不开。", true);
+    return false;
   }
 }
 
-async function loadEpubFromBlob(blob, meta = {}) {
-  return loadEpubFromSource(new BlobDocumentSource(blob), meta);
+async function loadEpubFromBlob(blob, meta = {}, openToken = beginDocumentOpen()) {
+  return loadEpubFromSource(new BlobDocumentSource(blob), meta, openToken);
 }
 
-async function loadEpubFromRecord(record, meta = {}) {
+async function loadEpubFromRecord(record, meta = {}, openToken = beginDocumentOpen()) {
   const source = await createDocumentSourceFromRecord(record);
-  return loadEpubFromSource(source, meta);
+
+  if (!isDocumentOpenCurrent(openToken)) {
+    return false;
+  }
+
+  return loadEpubFromSource(source, meta, openToken);
 }
 
 async function navigateEpub(direction) {
@@ -5114,79 +5228,118 @@ async function loadPdfFromRecord(record, meta = {}, requestedPage = 1, openToken
 async function openDocumentRecord(record, options = {}) {
   if (!record?.blob) {
     showStatus("这个文件记录不可用。");
-    return;
+    return false;
   }
 
-  const openToken = beginDocumentOpen();
   const previousState = { ...state };
-  record = await normalizeEncryptedRecordPayload(record);
+  const openToken = beginDocumentOpen();
+  const openingLabel = getRecordOpeningLabel(record);
+  showStatus(`正在打开 ${openingLabel}...`, true);
 
-  if (!isDocumentOpenCurrent(openToken)) {
-    return;
-  }
+  try {
+    record = await normalizeEncryptedRecordPayload(record);
 
-  if (pdfDoc || epubBook) {
-    persistReaderPositionNow();
-  }
+    if (!isDocumentOpenCurrent(openToken)) {
+      return false;
+    }
 
-  const format = getDocumentFormat(record);
-  state.documentId = record.id;
-  state.format = format;
-  state.fileName = await getRecordDisplayName(record);
-
-  if (!isDocumentOpenCurrent(openToken)) {
-    return;
-  }
-
-  if (options.resetProgress) {
-    state.page = 1;
-    state.scrollPage = 1;
-    state.scrollOffsetRatio = 0;
-    state.scrollTop = 0;
-    state.epubCfi = "";
-    state.epubProgress = 0;
-    state.zoom = 1;
-  } else {
-    applyDocumentProgress(record.id, options.fallbackPage || 1);
-  }
-
-  let opened = true;
-
-  if (format === DOCUMENT_FORMATS.EPUB) {
-    opened = await loadEpubFromRecord(record, { id: record.id, name: state.fileName }) !== false;
-  } else {
-    opened = await loadPdfFromRecord(record, { id: record.id, name: state.fileName }, state.page, openToken);
-  }
-
-  if (!isDocumentOpenCurrent(openToken)) {
-    return;
-  }
-
-  if (!opened) {
     if (pdfDoc || epubBook) {
+      persistReaderPositionNow();
+    }
+
+    const format = getDocumentFormat(record);
+    const displayName = await getRecordDisplayName(record);
+
+    if (!isDocumentOpenCurrent(openToken)) {
+      return false;
+    }
+
+    state.documentId = record.id;
+    state.format = format;
+    state.fileName = displayName;
+    showStatus(`正在打开 ${displayName}...`, true);
+
+    if (options.resetProgress) {
+      state.page = 1;
+      state.scrollPage = 1;
+      state.scrollOffsetRatio = 0;
+      state.scrollTop = 0;
+      state.epubCfi = "";
+      state.epubProgress = 0;
+      state.zoom = 1;
+    } else {
+      applyDocumentProgress(record.id, options.fallbackPage || 1);
+    }
+
+    let opened = false;
+
+    if (format === DOCUMENT_FORMATS.EPUB) {
+      opened = await loadEpubFromRecord(record, { id: record.id, name: state.fileName }, openToken) === true;
+    } else {
+      opened = await loadPdfFromRecord(record, { id: record.id, name: state.fileName }, state.page, openToken) === true;
+    }
+
+    if (!isDocumentOpenCurrent(openToken)) {
+      return false;
+    }
+
+    if (!opened) {
       Object.assign(state, previousState);
       updateViewerMode();
       updateControls();
+      return false;
     }
-    return;
-  }
 
-  await touchStoredDocument(record.id, record).catch(() => {});
-  saveReaderState();
-  renderLibraryList();
+    await touchStoredDocument(record.id, record).catch(() => {});
+    saveReaderState();
+    renderLibraryList();
+    showStatus(`已打开 ${state.fileName}`);
+    return true;
+  } catch (error) {
+    if (!isDocumentOpenCurrent(openToken)) {
+      return false;
+    }
+
+    console.error(error);
+
+    Object.assign(state, previousState);
+    updateViewerMode();
+    updateControls();
+
+    showStatus("这个文件暂时打不开。", true);
+    return false;
+  }
 }
 
 async function openDocumentFromLibrary(documentId) {
-  const record = await getStoredDocument(documentId).catch(() => null);
-
-  if (!record?.blob) {
-    showStatus("这个文件已经不在本机存储里。");
-    renderLibraryList();
-    return;
-  }
-
+  const requestId = (libraryOpenRequestId += 1);
+  const cachedRecord = libraryRecordCache.get(documentId);
+  showStatus(`正在打开 ${getRecordOpeningLabel(cachedRecord)}...`, true);
   closeLibrary();
-  await openDocumentRecord(record);
+
+  try {
+    const record = await getStoredDocument(documentId).catch(() => null);
+
+    if (requestId !== libraryOpenRequestId) {
+      return false;
+    }
+
+    if (!record?.blob) {
+      showStatus("这个文件已经不在本机存储里。");
+      renderLibraryList();
+      return false;
+    }
+
+    return await openDocumentRecord(record);
+  } catch (error) {
+    if (requestId !== libraryOpenRequestId) {
+      return false;
+    }
+
+    console.error(error);
+    showStatus("这个文件暂时打不开。", true);
+    return false;
+  }
 }
 
 async function readDocumentsNeedingEncryptionMigration() {
@@ -5444,9 +5597,9 @@ async function restoreLastDocument() {
     let opened = true;
 
     if (state.format === DOCUMENT_FORMATS.EPUB) {
-      opened = await loadEpubFromRecord(record, { id: record.id, name: state.fileName }) !== false;
+      opened = await loadEpubFromRecord(record, { id: record.id, name: state.fileName }) === true;
     } else {
-      opened = await loadPdfFromRecord(record, { id: record.id, name: state.fileName }, state.page) !== false;
+      opened = await loadPdfFromRecord(record, { id: record.id, name: state.fileName }, state.page) === true;
     }
 
     if (opened) {
@@ -6019,10 +6172,13 @@ async function renderLibraryList() {
   try {
     const documents = await readLibraryDocuments();
     const fragment = document.createDocumentFragment();
+    libraryRecordCache.clear();
 
     els.libraryEmptyState.hidden = documents.length > 0;
 
     for (const record of documents) {
+      libraryRecordCache.set(record.id, record);
+
       const progress = readDocumentProgress(record.id);
       const item = document.createElement("article");
       const openButton = document.createElement("button");
@@ -6044,6 +6200,8 @@ async function renderLibraryList() {
 
       openButton.className = "library-open";
       openButton.type = "button";
+      openButton.dataset.libraryAction = "open";
+      openButton.dataset.documentId = record.id;
 
       name.className = "library-name";
       name.textContent = await getRecordDisplayName(record);
@@ -6055,16 +6213,17 @@ async function renderLibraryList() {
 
       exportButton.className = "library-export";
       exportButton.type = "button";
+      exportButton.dataset.libraryAction = "export";
+      exportButton.dataset.documentId = record.id;
       exportButton.textContent = "导出";
 
       deleteButton.className = "library-delete";
       deleteButton.type = "button";
+      deleteButton.dataset.libraryAction = "delete";
+      deleteButton.dataset.documentId = record.id;
       deleteButton.textContent = "删除";
 
       openButton.append(name, meta);
-      openButton.addEventListener("click", () => openDocumentFromLibrary(record.id));
-      exportButton.addEventListener("click", () => showBackupExportPrompt(record));
-      deleteButton.addEventListener("click", () => deleteDocumentFromLibrary(record.id));
 
       actions.append(exportButton, deleteButton);
       item.append(openButton, actions);
@@ -6077,6 +6236,51 @@ async function renderLibraryList() {
     els.libraryList.replaceChildren();
     els.libraryEmptyState.hidden = false;
     els.libraryEmptyState.textContent = "书架暂时打不开。";
+  }
+}
+
+function handleLibraryListClick(event) {
+  const button = event.target?.closest?.("button[data-library-action]");
+
+  if (!button || !els.libraryList.contains(button)) {
+    return;
+  }
+
+  const documentId = button.dataset.documentId || "";
+  const action = button.dataset.libraryAction || "";
+
+  if (!documentId) {
+    return;
+  }
+
+  event.preventDefault();
+
+  if (action === "open") {
+    openDocumentFromLibrary(documentId).catch((error) => {
+      console.error(error);
+      showStatus("这个文件暂时打不开。", true);
+    });
+    return;
+  }
+
+  if (action === "export") {
+    const record = libraryRecordCache.get(documentId);
+
+    if (!record) {
+      showStatus("这个文件已经不在本机存储里。");
+      renderLibraryList();
+      return;
+    }
+
+    showBackupExportPrompt(record);
+    return;
+  }
+
+  if (action === "delete") {
+    deleteDocumentFromLibrary(documentId).catch((error) => {
+      console.error(error);
+      showStatus("删除失败，请再试一次。", true);
+    });
   }
 }
 
@@ -6149,6 +6353,7 @@ function wireEvents() {
   els.floatingLockButton.addEventListener("click", lockReader);
   els.libraryButton.addEventListener("click", openLibrary);
   els.libraryCloseButton.addEventListener("click", closeLibrary);
+  els.libraryList.addEventListener("click", handleLibraryListClick);
   els.tocButton.addEventListener("click", openToc);
   els.tocCloseButton.addEventListener("click", closeToc);
   els.tocList.addEventListener("click", handleTocListClick);
@@ -6516,7 +6721,7 @@ function createSelfTestPdfBytes(label, pageCount = 3, fillerBytes = 0) {
   for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
     const pageObjectId = 4 + pageIndex * 2;
     const contentObjectId = pageObjectId + 1;
-    const content = `BT /F1 22 Tf 36 120 Td (${safeLabel} page ${pageIndex + 1}) Tj ET`;
+    const content = `0 0 0 rg 36 82 220 12 re f BT /F1 22 Tf 36 120 Td (${safeLabel} page ${pageIndex + 1}) Tj ET`;
 
     pageObjectIds.push(pageObjectId);
     objects[pageObjectId] =
@@ -6585,22 +6790,79 @@ function updateSelfTestResult(status, detail = "") {
   };
 }
 
+function getSelfTestRenderedCanvas() {
+  if (isScrollMode()) {
+    return (
+      els.continuousPages.querySelector('.page-shell[data-rendered="true"] canvas') ||
+      els.continuousPages.querySelector("canvas")
+    );
+  }
+
+  return els.canvas;
+}
+
+function assertSelfTestPdfRendered(label, { requireNonBlank = false } = {}) {
+  const canvas = getSelfTestRenderedCanvas();
+
+  if (!pdfDoc || !canvas?.width || !canvas?.height) {
+    throw new Error(`${label} did not render a PDF page; status=${els.status.textContent || ""}`);
+  }
+
+  if (requireNonBlank && isCanvasLikelyBlank(canvas)) {
+    throw new Error(`${label} rendered a blank PDF canvas; status=${els.status.textContent || ""}`);
+  }
+}
+
 async function openSelfTestRecord(record, options, label) {
   const timeoutMs = 20_000;
   const timeout = wait(timeoutMs).then(() => {
     throw new Error(`${label} timed out after ${timeoutMs}ms; status=${els.status.textContent || ""}`);
   });
 
-  await Promise.race([openDocumentRecord(record, options), timeout]);
-  await waitForNextFrame();
+  const opened = await Promise.race([openDocumentRecord(record, options), timeout]);
 
-  if (!pdfDoc || !els.canvas.width || !els.canvas.height) {
-    throw new Error(`${label} did not render a PDF page; status=${els.status.textContent || ""}`);
+  if (opened !== true) {
+    throw new Error(`${label} did not open; status=${els.status.textContent || ""}`);
   }
+
+  await waitForNextFrame();
+  assertSelfTestPdfRendered(label);
 
   if (/失败|打不开|不可用/.test(els.status.textContent || "")) {
     throw new Error(`${label} ended with status=${els.status.textContent}`);
   }
+}
+
+async function waitForSelfTestRecordVisible(record, label, { requireNonBlank = false } = {}) {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    await wait(250);
+
+    if (state.documentId === record.id && pdfDoc) {
+      await waitForNextFrame();
+      assertSelfTestPdfRendered(label, { requireNonBlank });
+      return;
+    }
+
+    if (/失败|打不开|不可用/.test(els.status.textContent || "")) {
+      throw new Error(`${label} failed with status=${els.status.textContent}`);
+    }
+  }
+
+  throw new Error(`${label} did not become visible; status=${els.status.textContent || ""}`);
+}
+
+async function clickSelfTestLibraryRecord(record, label) {
+  await openLibrary();
+  const button = Array.from(
+    els.libraryList.querySelectorAll('button[data-library-action="open"]'),
+  ).find((candidate) => candidate.dataset.documentId === record.id);
+
+  if (!button) {
+    throw new Error(`${label} library button was not rendered.`);
+  }
+
+  button.click();
+  await waitForSelfTestRecordVisible(record, label, { requireNonBlank: true });
 }
 
 async function runEncryptedSwitchSelfTest() {
@@ -6652,10 +6914,11 @@ async function runEncryptedSwitchSelfTest() {
   }
 
   if (
-    getEncryptedPayloadOffset(storedEncryptedRecord) <= 0 ||
-    storedEncryptedRecord.blob.size <= getExpectedEncryptedPayloadSize(storedEncryptedRecord)
+    getEncryptedPayloadOffset(storedEncryptedRecord) !== 0 ||
+    Number.isFinite(storedEncryptedRecord.encryptedPayloadSize) ||
+    storedEncryptedRecord.blob.size !== getExpectedEncryptedPayloadSize(storedEncryptedRecord)
   ) {
-    throw new Error("Imported encrypted self-test record did not preserve the backup container.");
+    throw new Error("Imported encrypted self-test record was not saved as a payload-only library record.");
   }
 
   updateSelfTestResult("running", "reopen encrypted PDF after switching");
@@ -6676,14 +6939,80 @@ async function runEncryptedSwitchSelfTest() {
   console.info("Encrypted switch self-test passed.");
 }
 
+async function rapidOpenSelfTestRecords(records, count, delayMs) {
+  const opens = [];
+
+  for (let index = 0; index < count; index += 1) {
+    const record = records[index % records.length];
+    const label = `rapid open ${index + 1}`;
+    const open = Promise.race([
+      openDocumentRecord(record, { resetProgress: true }),
+      wait(25_000).then(() => {
+        throw new Error(`${label} timed out after 25000ms; status=${els.status.textContent || ""}`);
+      }),
+    ]).catch((error) => error);
+
+    opens.push(open);
+    await wait(delayMs);
+  }
+
+  await Promise.allSettled(opens);
+}
+
+async function runRapidSwitchSelfTest() {
+  const firstId = `${DOCUMENT_ID_PREFIX}selftest-rapid-a`;
+  const secondId = `${DOCUMENT_ID_PREFIX}selftest-rapid-b`;
+
+  updateSelfTestResult("running", "prepare rapid switch PDFs");
+  window.__portableReaderSelfTestMetrics = {};
+  showStatus("自测：准备快速切换 PDF...", true);
+  await deleteStoredDocument(firstId).catch(() => {});
+  await deleteStoredDocument(secondId).catch(() => {});
+  deleteDocumentProgress(firstId);
+  deleteDocumentProgress(secondId);
+
+  const firstRecord = createSelfTestPdfRecord(firstId, "rapid switch a", 8, PDF_RANGE_CHUNK_SIZE * 4);
+  const secondRecord = createSelfTestPdfRecord(secondId, "rapid switch b", 9, PDF_RANGE_CHUNK_SIZE * 5);
+
+  await putStoredDocument(firstRecord);
+  await putStoredDocument(secondRecord);
+
+  updateSelfTestResult("running", "library click open");
+  showStatus("自测：点击书架文件...", true);
+  state.mode = READ_MODES.PAGED;
+  await clickSelfTestLibraryRecord(firstRecord, "library click PDF");
+
+  updateSelfTestResult("running", "rapid switch paged mode");
+  showStatus("自测：分页模式快速切换...", true);
+  state.mode = READ_MODES.PAGED;
+  await rapidOpenSelfTestRecords([firstRecord, secondRecord], 8, 45);
+  await openSelfTestRecord(secondRecord, { resetProgress: true }, "rapid paged final PDF");
+  assertSelfTestPdfRendered("rapid paged final PDF", { requireNonBlank: true });
+
+  updateSelfTestResult("running", "rapid switch scroll mode");
+  showStatus("自测：连续模式快速切换...", true);
+  state.mode = READ_MODES.SCROLL;
+  await rapidOpenSelfTestRecords([secondRecord, firstRecord], 8, 45);
+  await openSelfTestRecord(firstRecord, { resetProgress: true }, "rapid scroll final PDF");
+  assertSelfTestPdfRendered("rapid scroll final PDF", { requireNonBlank: true });
+
+  updateSelfTestResult("passed", "rapid PDF switching rendered visible pages");
+  showStatus("自测通过：快速切换 PDF 后可正常渲染。");
+  console.info("Rapid PDF switch self-test passed.");
+}
+
 async function runSelfTest(mode) {
-  if (mode !== "encrypted-switch") {
+  if (!["encrypted-switch", "rapid-switch"].includes(mode)) {
     showStatus(`未知自测：${mode}`, true);
     return;
   }
 
   try {
-    await runEncryptedSwitchSelfTest();
+    if (mode === "rapid-switch") {
+      await runRapidSwitchSelfTest();
+    } else {
+      await runEncryptedSwitchSelfTest();
+    }
   } catch (error) {
     console.error(error);
     updateSelfTestResult("failed", error?.message || String(error));

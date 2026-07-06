@@ -6,7 +6,7 @@ import {
   PDF_RANGE_CHUNK_SIZE,
   PDF_SOURCE_READ_RETRY_DELAY_MS,
   PDF_SOURCE_READ_RETRY_LIMIT,
-} from "./constants.js?v=73";
+} from "./constants.js?v=76";
 import {
   createChunkAad,
   createChunkIv,
@@ -16,8 +16,8 @@ import {
   getEncryptedPayloadSize,
   getEncryptionOriginalSize,
   getEncryptionTagBytes,
-} from "./encryption.js?v=73";
-import { clamp, wait } from "./utils.js?v=73";
+} from "./encryption.js?v=76";
+import { clamp, wait } from "./utils.js?v=76";
 
 const PDFJS_ROOT = new URL("../vendor/pdfjs/", import.meta.url).href;
 pdfjsLib.GlobalWorkerOptions.workerSrc = `${PDFJS_ROOT}pdf.worker.min.mjs`;

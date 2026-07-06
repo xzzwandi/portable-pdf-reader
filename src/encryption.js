@@ -19,8 +19,8 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./constants.js?v=73";
-import { readUint32Bytes } from "./utils.js?v=73";
+} from "./constants.js?v=76";
+import { readUint32Bytes } from "./utils.js?v=76";
 
 export async function ensureSodiumReady() {
   await sodium.ready;
@@ -260,6 +260,34 @@ export function withoutEncryptedPayloadLocation(record) {
   return next;
 }
 
+export function withPayloadOnlyEncryptedBlob(record = {}) {
+  if (!isRecordEncrypted(record) || !record.blob) {
+    return record;
+  }
+
+  const offset = getEncryptedPayloadOffset(record);
+  const size = getEncryptedPayloadSize(record);
+  const blobSize = record.blob.size || 0;
+  const expectedPayloadSize = getExpectedEncryptedPayloadSize(record);
+
+  if (offset === 0 && (!Number.isFinite(record.encryptedPayloadSize) || size === blobSize)) {
+    return withoutEncryptedPayloadLocation(record);
+  }
+
+  if (size <= 0 || offset + size > blobSize) {
+    throw new Error("Encrypted document payload location is invalid.");
+  }
+
+  if (expectedPayloadSize > 0 && size !== expectedPayloadSize) {
+    throw new Error("Encrypted document payload size is invalid.");
+  }
+
+  return withoutEncryptedPayloadLocation({
+    ...record,
+    blob: record.blob.slice(offset, offset + size, "application/octet-stream"),
+  });
+}
+
 export function withStableEncryptedBackupBlob(record = {}) {
   if (
     !isRecordEncrypted(record) ||
@@ -377,7 +405,7 @@ export async function normalizeEncryptedRecordPayload(record = {}) {
     return record;
   }
 
-  return withDetectedEncryptedPayloadLocation(record);
+  return withPayloadOnlyEncryptedBlob(await withDetectedEncryptedPayloadLocation(record));
 }
 
 export function createChunkAad(record, encryption, chunkIndex) {

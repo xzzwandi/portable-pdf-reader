@@ -4,7 +4,7 @@ import {
   ENCRYPTED_BACKUP_MAGIC,
   ENCRYPTED_BACKUP_MAX_HEADER_BYTES,
   ENCRYPTED_BACKUP_VERSION,
-} from "./constants.js?v=73";
+} from "./constants.js?v=76";
 import {
   getDocumentFormat,
   getEncryptedPayloadBlob,
@@ -14,8 +14,8 @@ import {
   isRecordNameEncrypted,
   withDetectedEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./encryption.js?v=73";
-import { createUint32Bytes, readUint32Bytes } from "./utils.js?v=73";
+} from "./encryption.js?v=76";
+import { createUint32Bytes, readUint32Bytes } from "./utils.js?v=76";
 
 function isLibraryDocument(record) {
   return Boolean(record?.blob && typeof record.id === "string" && record.id.startsWith(DOCUMENT_ID_PREFIX));
