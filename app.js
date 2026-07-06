@@ -12,7 +12,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v61";
+const APP_VERSION = "v62";
 const ENCRYPTED_BACKUP_EXTENSION = ".pprenc";
 const ENCRYPTED_BACKUP_MAGIC = "PPRENC1\n";
 const ENCRYPTED_BACKUP_VERSION = 1;
@@ -469,6 +469,108 @@ function getEncryptionTagBytes(encryption = {}) {
   }
 
   return encryption.algorithm === AES_GCM_ALGORITHM ? AES_GCM_TAG_BYTES : XCHACHA_TAG_BYTES;
+}
+
+function getEncryptedPayloadOffset(record = {}) {
+  return Number.isFinite(record.encryptedPayloadOffset)
+    ? Math.max(0, Math.floor(record.encryptedPayloadOffset))
+    : 0;
+}
+
+function getEncryptedPayloadSize(record = {}) {
+  const offset = getEncryptedPayloadOffset(record);
+
+  if (Number.isFinite(record.encryptedPayloadSize)) {
+    return Math.max(0, Math.floor(record.encryptedPayloadSize));
+  }
+
+  return Math.max(0, (record.blob?.size || 0) - offset);
+}
+
+function getEncryptedPayloadBlob(record = {}) {
+  const offset = getEncryptedPayloadOffset(record);
+  const size = getEncryptedPayloadSize(record);
+  return record.blob?.slice(offset, offset + size, "application/octet-stream");
+}
+
+function withoutEncryptedPayloadLocation(record) {
+  const next = { ...record };
+  delete next.encryptedPayloadOffset;
+  delete next.encryptedPayloadSize;
+  return next;
+}
+
+async function detectEmbeddedEncryptedBackupPayload(record = {}) {
+  const blob = record.blob;
+
+  if (!blob?.size) {
+    return null;
+  }
+
+  const magicBytes = new TextEncoder().encode(ENCRYPTED_BACKUP_MAGIC);
+  const prefixLength = magicBytes.length + 4;
+
+  if (blob.size <= prefixLength) {
+    return null;
+  }
+
+  const prefix = new Uint8Array(await blob.slice(0, prefixLength).arrayBuffer());
+
+  for (let index = 0; index < magicBytes.length; index += 1) {
+    if (prefix[index] !== magicBytes[index]) {
+      return null;
+    }
+  }
+
+  const headerLength = readUint32Bytes(prefix, magicBytes.length);
+  const dataOffset = prefixLength + headerLength;
+
+  if (
+    headerLength <= 0 ||
+    headerLength > ENCRYPTED_BACKUP_MAX_HEADER_BYTES ||
+    dataOffset >= blob.size
+  ) {
+    return null;
+  }
+
+  try {
+    const headerBytes = await blob.slice(prefixLength, dataOffset).arrayBuffer();
+    const header = JSON.parse(new TextDecoder().decode(headerBytes));
+    const payload = header?.record || {};
+    const encryptedPayloadSize = blob.size - dataOffset;
+
+    if (
+      header?.app !== "portable-pdf-reader" ||
+      header?.kind !== "encrypted-document" ||
+      header?.version !== ENCRYPTED_BACKUP_VERSION ||
+      payload.id !== record.id ||
+      payload.encryption?.salt !== record.encryption?.salt ||
+      payload.encryption?.algorithm !== record.encryption?.algorithm ||
+      (Number.isFinite(header?.blob?.size) && header.blob.size !== encryptedPayloadSize)
+    ) {
+      return null;
+    }
+
+    return {
+      encryptedPayloadOffset: dataOffset,
+      encryptedPayloadSize,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function withDetectedEncryptedPayloadLocation(record = {}) {
+  if (
+    !isRecordEncrypted(record) ||
+    getEncryptedPayloadOffset(record) > 0 ||
+    Number.isFinite(record.encryptedPayloadSize)
+  ) {
+    return record;
+  }
+
+  const detected = await detectEmbeddedEncryptedBackupPayload(record);
+  return detected ? { ...record, ...detected } : record;
 }
 
 function createChunkAad(record, encryption, chunkIndex) {
@@ -1273,8 +1375,11 @@ async function saveDocumentFile(file) {
   return record;
 }
 
-async function touchStoredDocument(documentId) {
-  const record = await getStoredDocument(documentId).catch(() => null);
+async function touchStoredDocument(documentId, replacementRecord = null) {
+  const record =
+    replacementRecord?.id === documentId
+      ? replacementRecord
+      : await getStoredDocument(documentId).catch(() => null);
 
   if (!record?.blob) {
     return;
@@ -1323,6 +1428,7 @@ function triggerDownload(blob, fileName) {
 function createEncryptedBackupHeader(record) {
   const format = getDocumentFormat(record);
   const type = format === DOCUMENT_FORMATS.EPUB ? "application/epub+zip" : "application/pdf";
+  const payloadSize = getEncryptedPayloadSize(record);
 
   return {
     app: "portable-pdf-reader",
@@ -1340,14 +1446,16 @@ function createEncryptedBackupHeader(record) {
       updatedAt: record.updatedAt || Date.now(),
     },
     blob: {
-      size: record.blob?.size || 0,
+      size: payloadSize,
       type: "application/octet-stream",
     },
   };
 }
 
 async function createEncryptedBackupBlob(record) {
-  const headerBytes = new TextEncoder().encode(JSON.stringify(createEncryptedBackupHeader(record)));
+  const payloadRecord = await withDetectedEncryptedPayloadLocation(record);
+  const payloadBlob = getEncryptedPayloadBlob(payloadRecord);
+  const headerBytes = new TextEncoder().encode(JSON.stringify(createEncryptedBackupHeader(payloadRecord)));
 
   if (headerBytes.length > ENCRYPTED_BACKUP_MAX_HEADER_BYTES) {
     throw new Error("Encrypted backup metadata is too large.");
@@ -1358,7 +1466,7 @@ async function createEncryptedBackupBlob(record) {
       new TextEncoder().encode(ENCRYPTED_BACKUP_MAGIC),
       createUint32Bytes(headerBytes.length),
       headerBytes,
-      record.blob,
+      payloadBlob,
     ],
     { type: "application/octet-stream" },
   );
@@ -1392,21 +1500,34 @@ async function readEncryptedBackupFile(file) {
 
   const headerBytes = await file.slice(prefixLength, dataOffset).arrayBuffer();
   const header = JSON.parse(new TextDecoder().decode(headerBytes));
-  const blob = file.slice(dataOffset, file.size, "application/octet-stream");
+  const encryptedPayloadSize = file.size - dataOffset;
 
-  return { header, blob };
+  return {
+    blob: file,
+    encryptedPayloadOffset: dataOffset,
+    encryptedPayloadSize,
+    header,
+  };
 }
 
-function createRecordFromEncryptedBackup(header, blob) {
+function createRecordFromEncryptedBackup(header, blob, payloadLocation = {}) {
   const payload = header?.record || {};
   const format = payload.format === DOCUMENT_FORMATS.EPUB ? DOCUMENT_FORMATS.EPUB : DOCUMENT_FORMATS.PDF;
   const type = format === DOCUMENT_FORMATS.EPUB ? "application/epub+zip" : "application/pdf";
   const now = Date.now();
   const expectedBlobSize = header?.blob?.size;
+  const encryptedPayloadOffset = Number.isFinite(payloadLocation.encryptedPayloadOffset)
+    ? payloadLocation.encryptedPayloadOffset
+    : 0;
+  const encryptedPayloadSize = Number.isFinite(payloadLocation.encryptedPayloadSize)
+    ? payloadLocation.encryptedPayloadSize
+    : Math.max(0, blob?.size || 0);
   const record = withoutPlainRecordName({
     blob,
     encrypted: true,
     encryptedName: payload.encryptedName,
+    encryptedPayloadOffset,
+    encryptedPayloadSize,
     encryption: payload.encryption,
     format,
     id: payload.id,
@@ -1420,7 +1541,7 @@ function createRecordFromEncryptedBackup(header, blob) {
     header?.app !== "portable-pdf-reader" ||
     header?.kind !== "encrypted-document" ||
     header?.version !== ENCRYPTED_BACKUP_VERSION ||
-    (Number.isFinite(expectedBlobSize) && expectedBlobSize !== blob.size) ||
+    (Number.isFinite(expectedBlobSize) && expectedBlobSize !== encryptedPayloadSize) ||
     !isLibraryDocument(record) ||
     !isRecordEncrypted(record) ||
     !isRecordNameEncrypted(record)
@@ -1432,8 +1553,11 @@ function createRecordFromEncryptedBackup(header, blob) {
 }
 
 async function parseEncryptedBackupFile(file) {
-  const { header, blob } = await readEncryptedBackupFile(file);
-  return createRecordFromEncryptedBackup(header, blob);
+  const { header, blob, encryptedPayloadOffset, encryptedPayloadSize } = await readEncryptedBackupFile(file);
+  return createRecordFromEncryptedBackup(header, blob, {
+    encryptedPayloadOffset,
+    encryptedPayloadSize,
+  });
 }
 
 async function importEncryptedBackupFile(file) {
@@ -1492,9 +1616,11 @@ async function encryptDocumentFromSource(record, source, plainName, password, on
     });
   }
 
+  const encryptedBlob = new Blob(encryptedParts, { type: "application/octet-stream" });
+
   return {
-    ...withoutPlainRecordName(record),
-    blob: new Blob(encryptedParts, { type: "application/octet-stream" }),
+    ...withoutEncryptedPayloadLocation(withoutPlainRecordName(record)),
+    blob: encryptedBlob,
     encrypted: true,
     encryptedName,
     encryption,
@@ -2120,8 +2246,16 @@ class EncryptedDocumentSource {
     const plainLength = Math.min(this.chunkSize, Math.max(0, this.length - plainStart));
     const tagBytes = getEncryptionTagBytes(this.encryption);
     const encryptedOffset = chunkIndex * (this.chunkSize + tagBytes);
-    const encryptedEnd = encryptedOffset + plainLength + tagBytes;
-    const encryptedBytes = new Uint8Array(await this.blob.slice(encryptedOffset, encryptedEnd).arrayBuffer());
+    const encryptedPayloadOffset = getEncryptedPayloadOffset(this.record);
+    const encryptedStart = encryptedPayloadOffset + encryptedOffset;
+    const encryptedEnd = encryptedStart + plainLength + tagBytes;
+    const encryptedPayloadEnd = encryptedPayloadOffset + getEncryptedPayloadSize(this.record);
+
+    if (encryptedEnd > encryptedPayloadEnd) {
+      throw new Error("Encrypted document payload is incomplete.");
+    }
+
+    const encryptedBytes = new Uint8Array(await this.blob.slice(encryptedStart, encryptedEnd).arrayBuffer());
     let bytes;
 
     if (this.encryption.algorithm === AES_GCM_ALGORITHM) {
@@ -2228,8 +2362,9 @@ async function createDocumentSourceFromRecord(record) {
     throw new Error("Encrypted document is locked.");
   }
 
-  const key = await getEncryptionKeyForRecord(record);
-  return new EncryptedDocumentSource(record, key);
+  const payloadRecord = await withDetectedEncryptedPayloadLocation(record);
+  const key = await getEncryptionKeyForRecord(payloadRecord);
+  return new EncryptedDocumentSource(payloadRecord, key);
 }
 
 async function encryptDocumentRecord(record, password, onProgress = () => {}) {
@@ -2301,9 +2436,11 @@ async function encryptDocumentRecord(record, password, onProgress = () => {}) {
     });
   }
 
+  const encryptedBlob = new Blob(encryptedParts, { type: "application/octet-stream" });
+
   return {
-    ...withoutPlainRecordName(record),
-    blob: new Blob(encryptedParts, { type: "application/octet-stream" }),
+    ...withoutEncryptedPayloadLocation(withoutPlainRecordName(record)),
+    blob: encryptedBlob,
     encrypted: true,
     encryptedName,
     encryption,
@@ -5582,6 +5719,8 @@ async function openDocumentRecord(record, options = {}) {
     return;
   }
 
+  record = await withDetectedEncryptedPayloadLocation(record);
+
   if (pdfDoc || epubBook) {
     persistReaderPositionNow();
   }
@@ -5609,7 +5748,7 @@ async function openDocumentRecord(record, options = {}) {
     await loadPdfFromRecord(record, { id: record.id, name: state.fileName }, state.page);
   }
 
-  await touchStoredDocument(record.id).catch(() => {});
+  await touchStoredDocument(record.id, record).catch(() => {});
   saveReaderState();
   renderLibraryList();
 }
@@ -5871,6 +6010,8 @@ async function restoreLastDocument() {
       renderLibraryList();
       return;
     }
+
+    record = await withDetectedEncryptedPayloadLocation(record);
 
     state.documentId = record.id;
     state.format = getDocumentFormat(record);
