@@ -1,9 +1,14 @@
-const CACHE_NAME = "portable-pdf-reader-v64";
+const CACHE_NAME = "portable-pdf-reader-v73";
 const APP_SHELL = [
   "./",
   "./index.html",
-  "./styles.css?v=64",
-  "./app.js?v=64",
+  "./styles.css?v=73",
+  "./app.js?v=73",
+  "./src/constants.js?v=73",
+  "./src/encryption.js?v=73",
+  "./src/encrypted-backups.js?v=73",
+  "./src/pdf-sources.js?v=73",
+  "./src/utils.js?v=73",
   "./manifest.webmanifest",
   "./icons/icon.svg",
   "./vendor/jszip/jszip.min.js?v=46",
@@ -39,6 +44,25 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  const url = new URL(event.request.url);
+
+  if (url.origin !== self.location.origin || url.pathname.endsWith("/sw.js")) {
+    return;
+  }
+
+  if (event.request.mode === "navigate" || event.request.destination === "document") {
+    event.respondWith(
+      fetch(event.request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+          return response;
+        })
+        .catch(() => caches.match(event.request).then((cached) => cached || caches.match("./index.html"))),
+    );
+    return;
+  }
+
   event.respondWith(
     caches.match(event.request).then((cached) => {
       if (cached) {
@@ -46,8 +70,10 @@ self.addEventListener("fetch", (event) => {
       }
 
       return fetch(event.request).then((response) => {
-        const copy = response.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+        if (response.ok) {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+        }
         return response;
       });
     }),

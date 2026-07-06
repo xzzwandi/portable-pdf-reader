@@ -1,68 +1,97 @@
 import sodium from "./vendor/libsodium/libsodium-wrappers.mjs";
-import * as pdfjsLib from "./vendor/pdfjs/pdf.min.mjs";
-
-const PDFJS_ROOT = new URL("./vendor/pdfjs/", import.meta.url).href;
-pdfjsLib.GlobalWorkerOptions.workerSrc = `${PDFJS_ROOT}pdf.worker.min.mjs`;
-
-const DB_NAME = "portable-pdf-reader";
-const DB_VERSION = 1;
-const STORE_NAME = "documents";
-const DOCUMENT_ID_PREFIX = "doc:";
-const LAST_DOCUMENT_ID = "last-document";
-const LOCK_KEY = "portable-pdf-reader-lock";
-const PROGRESS_KEY = "portable-pdf-reader-document-progress";
-const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v64";
-const ENCRYPTED_BACKUP_EXTENSION = ".pprenc";
-const ENCRYPTED_BACKUP_MAGIC = "PPRENC1\n";
-const ENCRYPTED_BACKUP_VERSION = 1;
-const ENCRYPTED_BACKUP_MAX_HEADER_BYTES = 262_144;
-const DOCUMENT_FORMATS = {
-  PDF: "pdf",
-  EPUB: "epub",
-};
-const READ_MODES = {
-  PAGED: "paged",
-  SCROLL: "scroll",
-};
-const CONTINUOUS_KEEP_VIEWPORTS = 2.25;
-const CONTINUOUS_RENDER_VIEWPORTS = 1.35;
-const CONTINUOUS_MAX_RENDERED_PAGES = 6;
-const CONTINUOUS_OBSERVER_MARGIN = "700px 0px";
-const CONTINUOUS_RENDER_TIMEOUT_MS = 60_000;
-const CONTINUOUS_HEALTH_CHECK_DELAY_MS = 700;
-const CONTINUOUS_HEALTH_CHECK_INTERVAL_MS = 1_500;
-const CONTINUOUS_BLANK_RETRY_LIMIT = 3;
-const CONTINUOUS_CLEANUP_IDLE_MS = 3_500;
-const PAGED_BLANK_RETRY_LIMIT = 2;
-const PAGED_BLANK_RETRY_DELAY_MS = 120;
-const PDF_RANGE_CHUNK_SIZE = 1_048_576;
-const MAX_PAGED_CANVAS_PIXELS = 18_000_000;
-const MAX_CONTINUOUS_CANVAS_PIXELS = 6_500_000;
-const MAX_CANVAS_DIMENSION = 8192;
-const FULLSCREEN_EPUB_SWIPE_DISTANCE = 72;
-const FULLSCREEN_EPUB_SWIPE_MAX_DRIFT = 52;
-const TOC_RENDER_BATCH_SIZE = 72;
-const TOC_RENDER_SCROLL_THRESHOLD = 320;
-const TOC_ITEM_ESTIMATED_HEIGHT = 58;
-const ENCRYPTION_VERSION = 2;
-const AES_GCM_ENCRYPTION_VERSION = 1;
-const AES_GCM_ALGORITHM = "AES-GCM";
-const XCHACHA20_POLY1305_ALGORITHM = "XCHACHA20-POLY1305";
-const PBKDF2_KEY_ALGORITHM = "PBKDF2-SHA256";
-const ARGON2ID13_KEY_ALGORITHM = "ARGON2ID13";
-const ENCRYPTION_ALGORITHM = XCHACHA20_POLY1305_ALGORITHM;
-const ENCRYPTION_KEY_ALGORITHM = ARGON2ID13_KEY_ALGORITHM;
-const ENCRYPTION_KDF_ITERATIONS = 300_000;
-const ENCRYPTION_CHUNK_SIZE = 1_048_576;
-const AES_GCM_IV_BYTES = 12;
-const AES_GCM_NONCE_PREFIX_BYTES = 4;
-const AES_GCM_TAG_BYTES = 16;
-const XCHACHA_NONCE_BYTES = 24;
-const XCHACHA_NONCE_PREFIX_BYTES = 16;
-const XCHACHA_TAG_BYTES = 16;
-const ENCRYPTED_CHUNK_CACHE_LIMIT = 8;
-const ENCRYPTED_NAME_VERSION = 1;
+import {
+  AES_GCM_ENCRYPTION_VERSION,
+  AES_GCM_IV_BYTES,
+  AES_GCM_NONCE_PREFIX_BYTES,
+  APP_VERSION,
+  ARGON2ID13_KEY_ALGORITHM,
+  CONTINUOUS_BLANK_RETRY_LIMIT,
+  CONTINUOUS_CLEANUP_IDLE_MS,
+  CONTINUOUS_HEALTH_CHECK_DELAY_MS,
+  CONTINUOUS_HEALTH_CHECK_INTERVAL_MS,
+  CONTINUOUS_KEEP_VIEWPORTS,
+  CONTINUOUS_MAX_RENDERED_PAGES,
+  CONTINUOUS_OBSERVER_MARGIN,
+  CONTINUOUS_RENDER_TIMEOUT_MS,
+  CONTINUOUS_RENDER_VIEWPORTS,
+  DB_NAME,
+  DB_VERSION,
+  DOCUMENT_FORMATS,
+  DOCUMENT_ID_PREFIX,
+  ENCRYPTED_BACKUP_EXTENSION,
+  ENCRYPTED_NAME_VERSION,
+  ENCRYPTION_ALGORITHM,
+  ENCRYPTION_CHUNK_SIZE,
+  ENCRYPTION_KDF_ITERATIONS,
+  ENCRYPTION_KEY_ALGORITHM,
+  ENCRYPTION_VERSION,
+  FULLSCREEN_EPUB_SWIPE_DISTANCE,
+  FULLSCREEN_EPUB_SWIPE_MAX_DRIFT,
+  LAST_DOCUMENT_ID,
+  LOCK_KEY,
+  MAX_CANVAS_DIMENSION,
+  MAX_CONTINUOUS_CANVAS_PIXELS,
+  MAX_PAGED_CANVAS_PIXELS,
+  PAGED_BLANK_RETRY_DELAY_MS,
+  PAGED_BLANK_RETRY_LIMIT,
+  PBKDF2_KEY_ALGORITHM,
+  PDF_LOAD_TIMEOUT_MS,
+  PDF_RANGE_CHUNK_SIZE,
+  PDF_RENDER_TIMEOUT_MS,
+  PROGRESS_KEY,
+  READ_MODES,
+  STATE_KEY,
+  STORE_NAME,
+  TOC_ITEM_ESTIMATED_HEIGHT,
+  TOC_RENDER_BATCH_SIZE,
+  TOC_RENDER_SCROLL_THRESHOLD,
+  XCHACHA20_POLY1305_ALGORITHM,
+  XCHACHA_NONCE_BYTES,
+  XCHACHA_NONCE_PREFIX_BYTES,
+  XCHACHA_TAG_BYTES,
+} from "./src/constants.js?v=73";
+import {
+  bytesToHex,
+  createChunkAad,
+  createChunkNonce,
+  decryptRecordName,
+  deriveEncryptionKey,
+  deriveRecordEncryptionKey,
+  encryptRecordName,
+  ensureSodiumReady,
+  getDocumentFormat,
+  getEncryptedPayloadOffset,
+  getEncryptionOriginalSize,
+  getExpectedEncryptedPayloadSize,
+  getFallbackDocumentName,
+  getPlainRecordName,
+  isCurrentRecordEncryption,
+  isRecordEncrypted,
+  isRecordNameEncrypted,
+  isSodiumEncryptionAvailable,
+  isWebCryptoEncryptionAvailable,
+  normalizeEncryptedRecordPayload,
+  randomBytes,
+  recordNeedsEncryptionMigration,
+  withDetectedEncryptedPayloadLocation,
+  withoutEncryptedPayloadLocation,
+  withoutPlainRecordName,
+} from "./src/encryption.js?v=73";
+import {
+  clamp,
+  wait,
+  waitForNextFrame,
+} from "./src/utils.js?v=73";
+import {
+  createEncryptedBackupBlob,
+  parseEncryptedBackupFile,
+} from "./src/encrypted-backups.js?v=73";
+import {
+  BlobDocumentSource,
+  EncryptedDocumentSource,
+  createPdfLoadingTaskFromSource,
+  setPdfSourceMetricHandler,
+} from "./src/pdf-sources.js?v=73";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -167,6 +196,7 @@ let backupOperationInProgress = false;
 let pendingBackupRequest = null;
 let documentOpenToken = 0;
 let activePdfLoadingTask = null;
+let activePdfRangeFailurePromise = null;
 let restoreAttempted = false;
 let scrollTrackingSuppressionDepth = 0;
 let statusTimer = null;
@@ -209,10 +239,6 @@ const state = {
   mode: READ_MODES.PAGED,
 };
 
-function clamp(value, min, max) {
-  return Math.min(Math.max(value, min), max);
-}
-
 function isScrollMode() {
   return state.format === DOCUMENT_FORMATS.PDF && state.mode === READ_MODES.SCROLL;
 }
@@ -239,6 +265,7 @@ async function destroyPdfLoadingTask(loadingTask) {
 
 function beginDocumentOpen() {
   documentOpenToken += 1;
+  activePdfRangeFailurePromise = null;
 
   if (activePdfLoadingTask) {
     destroyPdfLoadingTask(activePdfLoadingTask);
@@ -318,321 +345,6 @@ function clearSessionPassword() {
   encryptionKeyCache.clear();
 }
 
-async function ensureSodiumReady() {
-  await sodium.ready;
-  return sodium;
-}
-
-async function isSodiumEncryptionAvailable() {
-  if (!window.crypto?.getRandomValues) {
-    return false;
-  }
-
-  try {
-    const sodiumApi = await ensureSodiumReady();
-    return Boolean(
-      sodiumApi.crypto_aead_xchacha20poly1305_ietf_encrypt &&
-        sodiumApi.crypto_aead_xchacha20poly1305_ietf_decrypt &&
-        sodiumApi.crypto_pwhash,
-    );
-  } catch (error) {
-    console.warn(error);
-    return false;
-  }
-}
-
-function isWebCryptoEncryptionAvailable() {
-  return Boolean(window.crypto?.subtle && window.crypto?.getRandomValues);
-}
-
-function randomBytes(length) {
-  const bytes = new Uint8Array(length);
-  window.crypto.getRandomValues(bytes);
-  return bytes;
-}
-
-function bytesToHex(bytes) {
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function hexToBytes(hex = "") {
-  if (hex.length % 2 !== 0) {
-    throw new Error("Invalid hex string.");
-  }
-
-  const bytes = new Uint8Array(hex.length / 2);
-
-  for (let index = 0; index < bytes.length; index += 1) {
-    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
-  }
-
-  return bytes;
-}
-
-function getEncryptionOriginalSize(record = {}) {
-  return Number.isFinite(record.encryption?.originalSize)
-    ? record.encryption.originalSize
-    : record.size || record.blob?.size || 0;
-}
-
-function isAesGcmRecordEncryption(encryption = {}) {
-  return (
-    encryption?.version === AES_GCM_ENCRYPTION_VERSION &&
-    encryption?.algorithm === AES_GCM_ALGORITHM &&
-    encryption?.keyAlgorithm === PBKDF2_KEY_ALGORITHM &&
-    typeof encryption?.salt === "string" &&
-    typeof encryption?.noncePrefix === "string" &&
-    Number.isFinite(encryption?.chunkSize) &&
-    Number.isFinite(encryption?.originalSize)
-  );
-}
-
-function isXChaChaRecordEncryption(encryption = {}) {
-  return (
-    encryption?.version === ENCRYPTION_VERSION &&
-    encryption?.algorithm === XCHACHA20_POLY1305_ALGORITHM &&
-    encryption?.keyAlgorithm === ARGON2ID13_KEY_ALGORITHM &&
-    typeof encryption?.salt === "string" &&
-    typeof encryption?.noncePrefix === "string" &&
-    Number.isFinite(encryption?.chunkSize) &&
-    Number.isFinite(encryption?.originalSize)
-  );
-}
-
-function isRecordEncrypted(record = {}) {
-  return (
-    record.encrypted === true &&
-    (isXChaChaRecordEncryption(record.encryption) || isAesGcmRecordEncryption(record.encryption))
-  );
-}
-
-function isCurrentRecordEncryption(record = {}) {
-  return (
-    record.encrypted === true &&
-    isXChaChaRecordEncryption(record.encryption)
-  );
-}
-
-function isRecordNameEncrypted(record = {}) {
-  if (!isRecordEncrypted(record) || record.encryptedName?.version !== ENCRYPTED_NAME_VERSION) {
-    return false;
-  }
-
-  if (isXChaChaRecordEncryption(record.encryption)) {
-    return (
-      record.encryptedName?.algorithm === XCHACHA20_POLY1305_ALGORITHM &&
-      typeof record.encryptedName?.nonce === "string" &&
-      typeof record.encryptedName?.data === "string"
-    );
-  }
-
-  return (
-    record.encryptedName?.algorithm === AES_GCM_ALGORITHM &&
-    typeof record.encryptedName?.iv === "string" &&
-    typeof record.encryptedName?.data === "string"
-  );
-}
-
-function getFallbackDocumentName(format = DOCUMENT_FORMATS.PDF) {
-  return format === DOCUMENT_FORMATS.EPUB ? "未命名.epub" : "未命名.pdf";
-}
-
-function getPlainRecordName(record = {}) {
-  return record.name || getFallbackDocumentName(getDocumentFormat(record));
-}
-
-function recordNeedsEncryptionMigration(record = {}) {
-  if (!isRecordEncrypted(record)) {
-    return true;
-  }
-
-  if (!isCurrentRecordEncryption(record)) {
-    return false;
-  }
-
-  return !isRecordNameEncrypted(record) || Boolean(record.name);
-}
-
-function createChunkIv(encryption, chunkIndex) {
-  const prefix = hexToBytes(encryption.noncePrefix || "");
-
-  if (prefix.length !== AES_GCM_NONCE_PREFIX_BYTES) {
-    throw new Error("Invalid AES-GCM nonce prefix.");
-  }
-
-  const iv = new Uint8Array(AES_GCM_IV_BYTES);
-  iv.set(prefix, 0);
-
-  let value = Math.max(0, Math.floor(chunkIndex));
-  for (let index = AES_GCM_IV_BYTES - 1; index >= AES_GCM_NONCE_PREFIX_BYTES; index -= 1) {
-    iv[index] = value & 0xff;
-    value = Math.floor(value / 256);
-  }
-
-  return iv;
-}
-
-function createChunkNonce(encryption, chunkIndex) {
-  const prefix = hexToBytes(encryption.noncePrefix || "");
-
-  if (prefix.length !== XCHACHA_NONCE_PREFIX_BYTES) {
-    throw new Error("Invalid XChaCha20-Poly1305 nonce prefix.");
-  }
-
-  const nonce = new Uint8Array(XCHACHA_NONCE_BYTES);
-  nonce.set(prefix, 0);
-
-  let value = Math.max(0, Math.floor(chunkIndex));
-  for (let index = XCHACHA_NONCE_BYTES - 1; index >= XCHACHA_NONCE_PREFIX_BYTES; index -= 1) {
-    nonce[index] = value & 0xff;
-    value = Math.floor(value / 256);
-  }
-
-  return nonce;
-}
-
-function getEncryptionTagBytes(encryption = {}) {
-  if (Number.isFinite(encryption.tagLength) && encryption.tagLength > 0) {
-    return Math.ceil(encryption.tagLength / 8);
-  }
-
-  return encryption.algorithm === AES_GCM_ALGORITHM ? AES_GCM_TAG_BYTES : XCHACHA_TAG_BYTES;
-}
-
-function getEncryptedPayloadOffset(record = {}) {
-  return Number.isFinite(record.encryptedPayloadOffset)
-    ? Math.max(0, Math.floor(record.encryptedPayloadOffset))
-    : 0;
-}
-
-function getEncryptedPayloadSize(record = {}) {
-  const offset = getEncryptedPayloadOffset(record);
-
-  if (Number.isFinite(record.encryptedPayloadSize)) {
-    return Math.max(0, Math.floor(record.encryptedPayloadSize));
-  }
-
-  return Math.max(0, (record.blob?.size || 0) - offset);
-}
-
-function getEncryptedPayloadBlob(record = {}) {
-  const offset = getEncryptedPayloadOffset(record);
-  const size = getEncryptedPayloadSize(record);
-  return record.blob?.slice(offset, offset + size, "application/octet-stream");
-}
-
-function withoutEncryptedPayloadLocation(record) {
-  const next = { ...record };
-  delete next.encryptedPayloadOffset;
-  delete next.encryptedPayloadSize;
-  return next;
-}
-
-async function detectEmbeddedEncryptedBackupPayload(record = {}) {
-  const blob = record.blob;
-
-  if (!blob?.size) {
-    return null;
-  }
-
-  const magicBytes = new TextEncoder().encode(ENCRYPTED_BACKUP_MAGIC);
-  const prefixLength = magicBytes.length + 4;
-
-  if (blob.size <= prefixLength) {
-    return null;
-  }
-
-  const prefix = new Uint8Array(await blob.slice(0, prefixLength).arrayBuffer());
-
-  for (let index = 0; index < magicBytes.length; index += 1) {
-    if (prefix[index] !== magicBytes[index]) {
-      return null;
-    }
-  }
-
-  const headerLength = readUint32Bytes(prefix, magicBytes.length);
-  const dataOffset = prefixLength + headerLength;
-
-  if (
-    headerLength <= 0 ||
-    headerLength > ENCRYPTED_BACKUP_MAX_HEADER_BYTES ||
-    dataOffset >= blob.size
-  ) {
-    return null;
-  }
-
-  try {
-    const headerBytes = await blob.slice(prefixLength, dataOffset).arrayBuffer();
-    const header = JSON.parse(new TextDecoder().decode(headerBytes));
-    const payload = header?.record || {};
-    const encryptedPayloadSize = blob.size - dataOffset;
-
-    if (
-      header?.app !== "portable-pdf-reader" ||
-      header?.kind !== "encrypted-document" ||
-      header?.version !== ENCRYPTED_BACKUP_VERSION ||
-      payload.id !== record.id ||
-      payload.encryption?.salt !== record.encryption?.salt ||
-      payload.encryption?.algorithm !== record.encryption?.algorithm ||
-      (Number.isFinite(header?.blob?.size) && header.blob.size !== encryptedPayloadSize)
-    ) {
-      return null;
-    }
-
-    return {
-      encryptedPayloadOffset: dataOffset,
-      encryptedPayloadSize,
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function withDetectedEncryptedPayloadLocation(record = {}) {
-  if (
-    !isRecordEncrypted(record) ||
-    getEncryptedPayloadOffset(record) > 0 ||
-    Number.isFinite(record.encryptedPayloadSize)
-  ) {
-    return record;
-  }
-
-  const detected = await detectEmbeddedEncryptedBackupPayload(record);
-  return detected ? { ...record, ...detected } : record;
-}
-
-function createChunkAad(record, encryption, chunkIndex) {
-  const format = getDocumentFormat(record);
-  return new TextEncoder().encode(
-    [
-      "portable-pdf-reader",
-      `encryption-v${encryption.version}`,
-      encryption.algorithm,
-      record.id || "",
-      format,
-      String(encryption.originalSize),
-      String(encryption.chunkSize),
-      String(chunkIndex),
-    ].join("|"),
-  );
-}
-
-function createNameAad(record, encryption) {
-  const format = getDocumentFormat(record);
-  return new TextEncoder().encode(
-    [
-      "portable-pdf-reader",
-      "encrypted-name",
-      `encryption-v${encryption.version}`,
-      encryption.algorithm,
-      record.id || "",
-      format,
-      String(encryption.originalSize),
-      String(encryption.chunkSize),
-    ].join("|"),
-  );
-}
-
 async function verifyLockPassword(password) {
   const config = getLockConfig();
 
@@ -641,66 +353,6 @@ async function verifyLockPassword(password) {
   }
 
   return (await getPasswordHashCandidates(password, config.salt)).includes(config.hash);
-}
-
-async function deriveAesGcmKey(password, encryption) {
-  if (!isWebCryptoEncryptionAvailable()) {
-    throw new Error("AES-GCM records require Web Crypto. Open this record over HTTPS or localhost.");
-  }
-
-  const keyMaterial = await window.crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(password),
-    "PBKDF2",
-    false,
-    ["deriveKey"],
-  );
-
-  return window.crypto.subtle.deriveKey(
-    {
-      name: "PBKDF2",
-      salt: hexToBytes(encryption.salt),
-      iterations: encryption.iterations || ENCRYPTION_KDF_ITERATIONS,
-      hash: "SHA-256",
-    },
-    keyMaterial,
-    {
-      name: AES_GCM_ALGORITHM,
-      length: 256,
-    },
-    false,
-    ["encrypt", "decrypt"],
-  );
-}
-
-async function deriveXChaChaKey(password, encryption) {
-  const sodiumApi = await ensureSodiumReady();
-  const salt = hexToBytes(encryption.salt);
-
-  if (salt.length !== sodiumApi.crypto_pwhash_SALTBYTES) {
-    throw new Error("Invalid Argon2id salt.");
-  }
-
-  return sodiumApi.crypto_pwhash(
-    sodiumApi.crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
-    password,
-    salt,
-    encryption.opsLimit || sodiumApi.crypto_pwhash_OPSLIMIT_INTERACTIVE,
-    encryption.memLimit || sodiumApi.crypto_pwhash_MEMLIMIT_INTERACTIVE,
-    sodiumApi.crypto_pwhash_ALG_ARGON2ID13,
-  );
-}
-
-async function deriveEncryptionKey(password, encryption) {
-  if (encryption?.algorithm === AES_GCM_ALGORITHM) {
-    return deriveAesGcmKey(password, encryption);
-  }
-
-  if (encryption?.algorithm === XCHACHA20_POLY1305_ALGORITHM) {
-    return deriveXChaChaKey(password, encryption);
-  }
-
-  throw new Error("Unsupported document encryption.");
 }
 
 function getEncryptionKeyCacheId(record = {}) {
@@ -730,103 +382,6 @@ async function getEncryptionKeyForRecord(record, password = sessionPassword) {
   const key = await deriveEncryptionKey(password, record.encryption);
   encryptionKeyCache.set(cacheId, key);
   return key;
-}
-
-async function deriveRecordEncryptionKey(record, password) {
-  if (!isRecordEncrypted(record)) {
-    return null;
-  }
-
-  if (!password) {
-    throw new Error("Encrypted document is locked.");
-  }
-
-  return deriveEncryptionKey(password, record.encryption);
-}
-
-async function encryptRecordName(record, key, encryption) {
-  const plainName = getPlainRecordName(record);
-  const plainBytes = new TextEncoder().encode(plainName);
-
-  if (encryption.algorithm === AES_GCM_ALGORITHM) {
-    const iv = randomBytes(AES_GCM_IV_BYTES);
-    const encrypted = await window.crypto.subtle.encrypt(
-      {
-        name: AES_GCM_ALGORITHM,
-        iv,
-        additionalData: createNameAad(record, encryption),
-        tagLength: AES_GCM_TAG_BYTES * 8,
-      },
-      key,
-      plainBytes,
-    );
-
-    return {
-      algorithm: AES_GCM_ALGORITHM,
-      data: bytesToHex(new Uint8Array(encrypted)),
-      encoding: "utf-8",
-      iv: bytesToHex(iv),
-      tagLength: AES_GCM_TAG_BYTES * 8,
-      version: ENCRYPTED_NAME_VERSION,
-    };
-  }
-
-  const sodiumApi = await ensureSodiumReady();
-  const nonce = randomBytes(sodiumApi.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
-  const encrypted = sodiumApi.crypto_aead_xchacha20poly1305_ietf_encrypt(
-    plainBytes,
-    createNameAad(record, encryption),
-    null,
-    nonce,
-    key,
-  );
-
-  return {
-    algorithm: XCHACHA20_POLY1305_ALGORITHM,
-    data: bytesToHex(encrypted),
-    encoding: "utf-8",
-    nonce: bytesToHex(nonce),
-    tagLength: sodiumApi.crypto_aead_xchacha20poly1305_ietf_ABYTES * 8,
-    version: ENCRYPTED_NAME_VERSION,
-  };
-}
-
-async function decryptRecordName(record, key) {
-  if (!isRecordNameEncrypted(record)) {
-    return getPlainRecordName(record);
-  }
-
-  if (record.encryption.algorithm === AES_GCM_ALGORITHM) {
-    const decrypted = await window.crypto.subtle.decrypt(
-      {
-        name: AES_GCM_ALGORITHM,
-        iv: hexToBytes(record.encryptedName.iv),
-        additionalData: createNameAad(record, record.encryption),
-        tagLength: record.encryptedName.tagLength || AES_GCM_TAG_BYTES * 8,
-      },
-      key,
-      hexToBytes(record.encryptedName.data),
-    );
-
-    return new TextDecoder().decode(decrypted) || getFallbackDocumentName(getDocumentFormat(record));
-  }
-
-  const sodiumApi = await ensureSodiumReady();
-  const decrypted = sodiumApi.crypto_aead_xchacha20poly1305_ietf_decrypt(
-    null,
-    hexToBytes(record.encryptedName.data),
-    createNameAad(record, record.encryption),
-    hexToBytes(record.encryptedName.nonce),
-    key,
-  );
-
-  return new TextDecoder().decode(decrypted) || getFallbackDocumentName(getDocumentFormat(record));
-}
-
-function withoutPlainRecordName(record) {
-  const next = { ...record };
-  delete next.name;
-  return next;
 }
 
 async function getRecordDisplayName(record = {}) {
@@ -1224,18 +779,6 @@ function getDocumentFormatFromFile(file) {
   return "";
 }
 
-function getDocumentFormat(record = {}) {
-  if (record.format === DOCUMENT_FORMATS.EPUB || record.type === "application/epub+zip") {
-    return DOCUMENT_FORMATS.EPUB;
-  }
-
-  if (record.format === DOCUMENT_FORMATS.PDF || record.type === "application/pdf") {
-    return DOCUMENT_FORMATS.PDF;
-  }
-
-  return getDocumentFormatFromName(record.name || "");
-}
-
 function getProgressMap() {
   try {
     return JSON.parse(window.localStorage.getItem(PROGRESS_KEY) || "{}");
@@ -1427,16 +970,6 @@ function isEncryptedBackupFile(file) {
   return Boolean(file?.name?.toLowerCase().endsWith(ENCRYPTED_BACKUP_EXTENSION));
 }
 
-function createUint32Bytes(value) {
-  const bytes = new Uint8Array(4);
-  new DataView(bytes.buffer).setUint32(0, value, false);
-  return bytes;
-}
-
-function readUint32Bytes(bytes, offset = 0) {
-  return new DataView(bytes.buffer, bytes.byteOffset + offset, 4).getUint32(0, false);
-}
-
 function createEncryptedBackupFileName(record = {}) {
   return `portable-reader-${hashString(record.id || String(Date.now()))}${ENCRYPTED_BACKUP_EXTENSION}`;
 }
@@ -1451,141 +984,6 @@ function triggerDownload(blob, fileName) {
   link.click();
   link.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
-}
-
-function createEncryptedBackupHeader(record) {
-  const format = getDocumentFormat(record);
-  const type = format === DOCUMENT_FORMATS.EPUB ? "application/epub+zip" : "application/pdf";
-  const payloadSize = getEncryptedPayloadSize(record);
-
-  return {
-    app: "portable-pdf-reader",
-    kind: "encrypted-document",
-    version: ENCRYPTED_BACKUP_VERSION,
-    exportedAt: Date.now(),
-    record: {
-      encrypted: true,
-      encryptedName: record.encryptedName,
-      encryption: record.encryption,
-      format,
-      id: record.id,
-      size: getEncryptionOriginalSize(record),
-      type: record.type || type,
-      updatedAt: record.updatedAt || Date.now(),
-    },
-    blob: {
-      size: payloadSize,
-      type: "application/octet-stream",
-    },
-  };
-}
-
-async function createEncryptedBackupBlob(record) {
-  const payloadRecord = await withDetectedEncryptedPayloadLocation(record);
-  const payloadBlob = getEncryptedPayloadBlob(payloadRecord);
-  const headerBytes = new TextEncoder().encode(JSON.stringify(createEncryptedBackupHeader(payloadRecord)));
-
-  if (headerBytes.length > ENCRYPTED_BACKUP_MAX_HEADER_BYTES) {
-    throw new Error("Encrypted backup metadata is too large.");
-  }
-
-  return new Blob(
-    [
-      new TextEncoder().encode(ENCRYPTED_BACKUP_MAGIC),
-      createUint32Bytes(headerBytes.length),
-      headerBytes,
-      payloadBlob,
-    ],
-    { type: "application/octet-stream" },
-  );
-}
-
-async function readEncryptedBackupFile(file) {
-  const magicBytes = new TextEncoder().encode(ENCRYPTED_BACKUP_MAGIC);
-  const prefixLength = magicBytes.length + 4;
-  const prefix = new Uint8Array(await file.slice(0, prefixLength).arrayBuffer());
-
-  if (prefix.length !== prefixLength) {
-    throw new Error("Invalid encrypted backup.");
-  }
-
-  for (let index = 0; index < magicBytes.length; index += 1) {
-    if (prefix[index] !== magicBytes[index]) {
-      throw new Error("Invalid encrypted backup.");
-    }
-  }
-
-  const headerLength = readUint32Bytes(prefix, magicBytes.length);
-  const dataOffset = prefixLength + headerLength;
-
-  if (
-    headerLength <= 0 ||
-    headerLength > ENCRYPTED_BACKUP_MAX_HEADER_BYTES ||
-    dataOffset > file.size
-  ) {
-    throw new Error("Invalid encrypted backup.");
-  }
-
-  const headerBytes = await file.slice(prefixLength, dataOffset).arrayBuffer();
-  const header = JSON.parse(new TextDecoder().decode(headerBytes));
-  const encryptedPayloadSize = file.size - dataOffset;
-
-  return {
-    blob: file,
-    encryptedPayloadOffset: dataOffset,
-    encryptedPayloadSize,
-    header,
-  };
-}
-
-function createRecordFromEncryptedBackup(header, blob, payloadLocation = {}) {
-  const payload = header?.record || {};
-  const format = payload.format === DOCUMENT_FORMATS.EPUB ? DOCUMENT_FORMATS.EPUB : DOCUMENT_FORMATS.PDF;
-  const type = format === DOCUMENT_FORMATS.EPUB ? "application/epub+zip" : "application/pdf";
-  const now = Date.now();
-  const expectedBlobSize = header?.blob?.size;
-  const encryptedPayloadOffset = Number.isFinite(payloadLocation.encryptedPayloadOffset)
-    ? payloadLocation.encryptedPayloadOffset
-    : 0;
-  const encryptedPayloadSize = Number.isFinite(payloadLocation.encryptedPayloadSize)
-    ? payloadLocation.encryptedPayloadSize
-    : Math.max(0, blob?.size || 0);
-  const record = withoutPlainRecordName({
-    blob,
-    encrypted: true,
-    encryptedName: payload.encryptedName,
-    encryptedPayloadOffset,
-    encryptedPayloadSize,
-    encryption: payload.encryption,
-    format,
-    id: payload.id,
-    lastOpenedAt: now,
-    size: Number.isFinite(payload.size) ? payload.size : payload.encryption?.originalSize || blob.size,
-    type: payload.type || type,
-    updatedAt: Number.isFinite(payload.updatedAt) ? payload.updatedAt : now,
-  });
-
-  if (
-    header?.app !== "portable-pdf-reader" ||
-    header?.kind !== "encrypted-document" ||
-    header?.version !== ENCRYPTED_BACKUP_VERSION ||
-    (Number.isFinite(expectedBlobSize) && expectedBlobSize !== encryptedPayloadSize) ||
-    !isLibraryDocument(record) ||
-    !isRecordEncrypted(record) ||
-    !isRecordNameEncrypted(record)
-  ) {
-    throw new Error("Invalid encrypted backup.");
-  }
-
-  return record;
-}
-
-async function parseEncryptedBackupFile(file) {
-  const { header, blob, encryptedPayloadOffset, encryptedPayloadSize } = await readEncryptedBackupFile(file);
-  return createRecordFromEncryptedBackup(header, blob, {
-    encryptedPayloadOffset,
-    encryptedPayloadSize,
-  });
 }
 
 async function importEncryptedBackupFile(file) {
@@ -1675,6 +1073,7 @@ async function saveImportedEncryptedBackupRecord(
 
   if (backupPassword === targetPassword) {
     await verifyEncryptedBackupRecord(record, backupPassword);
+    recordToSave = await withDetectedEncryptedPayloadLocation(record);
   } else {
     recordToSave = await reencryptEncryptedRecord(record, backupPassword, targetPassword, onProgress);
   }
@@ -1690,7 +1089,7 @@ async function saveImportedEncryptedBackupRecord(
     deleteDocumentProgress(recordToSave.id);
   }
 
-  return recordToSave;
+  return (await getStoredDocument(recordToSave.id).catch(() => null)) || recordToSave;
 }
 
 async function exportEncryptedDocumentBackup(documentId) {
@@ -2166,6 +1565,8 @@ async function closeCurrentDocument() {
     activePdfLoadingTask = null;
   }
 
+  activePdfRangeFailurePromise = null;
+
   await cancelCurrentRender();
   clearContinuousPages();
 
@@ -2262,147 +1663,24 @@ function commitRenderedCanvas(sourceCanvas, targetCanvas) {
   context.drawImage(sourceCanvas, 0, 0);
 }
 
-class BlobDocumentSource {
-  constructor(blob) {
-    this.blob = blob;
-    this.length = blob.size;
+async function waitForPdfOperation(promise, {
+  failurePromise = activePdfRangeFailurePromise,
+  label = "PDF operation",
+  timeoutMs = PDF_RENDER_TIMEOUT_MS,
+} = {}) {
+  const pending = [promise];
+
+  if (failurePromise) {
+    pending.push(failurePromise);
   }
 
-  async readRange(begin, end) {
-    const safeBegin = clamp(Math.floor(begin), 0, this.length);
-    const safeEnd = clamp(Math.ceil(end), safeBegin, this.length);
-    return new Uint8Array(await this.blob.slice(safeBegin, safeEnd).arrayBuffer());
-  }
-}
-
-class EncryptedDocumentSource {
-  constructor(record, key) {
-    this.record = record;
-    this.blob = record.blob;
-    this.encryption = record.encryption;
-    this.key = key;
-    this.length = getEncryptionOriginalSize(record);
-    this.chunkCache = new Map();
+  if (timeoutMs > 0) {
+    pending.push(wait(timeoutMs).then(() => {
+      throw new Error(`${label} timed out after ${timeoutMs}ms.`);
+    }));
   }
 
-  get chunkSize() {
-    return this.encryption.chunkSize || ENCRYPTION_CHUNK_SIZE;
-  }
-
-  async readEncryptedChunk(chunkIndex) {
-    if (this.chunkCache.has(chunkIndex)) {
-      return this.chunkCache.get(chunkIndex);
-    }
-
-    const plainStart = chunkIndex * this.chunkSize;
-    const plainLength = Math.min(this.chunkSize, Math.max(0, this.length - plainStart));
-    const tagBytes = getEncryptionTagBytes(this.encryption);
-    const encryptedOffset = chunkIndex * (this.chunkSize + tagBytes);
-    const encryptedPayloadOffset = getEncryptedPayloadOffset(this.record);
-    const encryptedStart = encryptedPayloadOffset + encryptedOffset;
-    const encryptedEnd = encryptedStart + plainLength + tagBytes;
-    const encryptedPayloadEnd = encryptedPayloadOffset + getEncryptedPayloadSize(this.record);
-
-    if (encryptedEnd > encryptedPayloadEnd) {
-      throw new Error("Encrypted document payload is incomplete.");
-    }
-
-    const encryptedBytes = new Uint8Array(await this.blob.slice(encryptedStart, encryptedEnd).arrayBuffer());
-    let bytes;
-
-    if (this.encryption.algorithm === AES_GCM_ALGORITHM) {
-      const decrypted = await window.crypto.subtle.decrypt(
-        {
-          name: AES_GCM_ALGORITHM,
-          iv: createChunkIv(this.encryption, chunkIndex),
-          additionalData: createChunkAad(this.record, this.encryption, chunkIndex),
-          tagLength: this.encryption.tagLength || AES_GCM_TAG_BYTES * 8,
-        },
-        this.key,
-        encryptedBytes,
-      );
-      bytes = new Uint8Array(decrypted);
-    } else {
-      const sodiumApi = await ensureSodiumReady();
-      bytes = sodiumApi.crypto_aead_xchacha20poly1305_ietf_decrypt(
-        null,
-        encryptedBytes,
-        createChunkAad(this.record, this.encryption, chunkIndex),
-        createChunkNonce(this.encryption, chunkIndex),
-        this.key,
-      );
-    }
-
-    this.chunkCache.set(chunkIndex, bytes);
-
-    if (this.chunkCache.size > ENCRYPTED_CHUNK_CACHE_LIMIT) {
-      const oldestKey = this.chunkCache.keys().next().value;
-      this.chunkCache.delete(oldestKey);
-    }
-
-    return bytes;
-  }
-
-  async readRange(begin, end) {
-    const safeBegin = clamp(Math.floor(begin), 0, this.length);
-    const safeEnd = clamp(Math.ceil(end), safeBegin, this.length);
-    const output = new Uint8Array(safeEnd - safeBegin);
-
-    if (!output.length) {
-      return output;
-    }
-
-    const firstChunk = Math.floor(safeBegin / this.chunkSize);
-    const lastChunk = Math.floor((safeEnd - 1) / this.chunkSize);
-    let outputOffset = 0;
-
-    for (let chunkIndex = firstChunk; chunkIndex <= lastChunk; chunkIndex += 1) {
-      const chunk = await this.readEncryptedChunk(chunkIndex);
-      const chunkPlainStart = chunkIndex * this.chunkSize;
-      const sliceStart = Math.max(0, safeBegin - chunkPlainStart);
-      const sliceEnd = Math.min(chunk.length, safeEnd - chunkPlainStart);
-      output.set(chunk.subarray(sliceStart, sliceEnd), outputOffset);
-      outputOffset += sliceEnd - sliceStart;
-    }
-
-    return output;
-  }
-}
-
-class PdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
-  constructor(source, initialData, fileName = "") {
-    super(source.length, initialData, true, fileName);
-    this.source = source;
-    this.aborted = false;
-  }
-
-  async requestDataRange(begin, end) {
-    if (this.aborted) {
-      return;
-    }
-
-    const safeBegin = clamp(Math.floor(begin), 0, this.length);
-    const safeEnd = clamp(Math.ceil(end), safeBegin, this.length);
-
-    try {
-      const chunk = await this.source.readRange(safeBegin, safeEnd);
-
-      if (this.aborted) {
-        return;
-      }
-
-      this.onDataRange(safeBegin, chunk);
-      this.onDataProgress(safeEnd, this.length);
-    } catch (error) {
-      if (!this.aborted) {
-        console.error(error);
-      }
-    }
-  }
-
-  abort() {
-    this.aborted = true;
-  }
+  return Promise.race(pending);
 }
 
 async function createDocumentSourceFromRecord(record) {
@@ -2414,7 +1692,7 @@ async function createDocumentSourceFromRecord(record) {
     throw new Error("Encrypted document is locked.");
   }
 
-  const payloadRecord = await withDetectedEncryptedPayloadLocation(record);
+  const payloadRecord = await normalizeEncryptedRecordPayload(record);
   const key = await getEncryptionKeyForRecord(payloadRecord);
   return new EncryptedDocumentSource(payloadRecord, key);
 }
@@ -2500,28 +1778,6 @@ async function encryptDocumentRecord(record, password, onProgress = () => {}) {
   };
 }
 
-async function createPdfLoadingTaskFromSource(source, meta = {}) {
-  const initialEnd = Math.min(PDF_RANGE_CHUNK_SIZE, source.length);
-  const initialData = initialEnd > 0 ? await source.readRange(0, initialEnd) : undefined;
-  const range = new PdfDataRangeTransport(source, initialData, meta.name || state.fileName || "");
-
-  return pdfjsLib.getDocument({
-    range,
-    length: source.length,
-    rangeChunkSize: PDF_RANGE_CHUNK_SIZE,
-    disableStream: true,
-    disableAutoFetch: true,
-    cMapPacked: true,
-    cMapUrl: `${PDFJS_ROOT}cmaps/`,
-    standardFontDataUrl: `${PDFJS_ROOT}standard_fonts/`,
-    wasmUrl: `${PDFJS_ROOT}image_decoders/`,
-  });
-}
-
-async function createPdfLoadingTaskFromBlob(blob, meta = {}) {
-  return createPdfLoadingTaskFromSource(new BlobDocumentSource(blob), meta);
-}
-
 async function renderPage(pageNumber, options = {}) {
   if (!pdfDoc) {
     return;
@@ -2543,7 +1799,10 @@ async function renderPage(pageNumber, options = {}) {
     await cancelCurrentRender();
     clearContinuousPages();
 
-    page = await pdfDoc.getPage(targetPage);
+    page = await waitForPdfOperation(pdfDoc.getPage(targetPage), {
+      label: `PDF page ${targetPage} load`,
+      timeoutMs: PDF_RENDER_TIMEOUT_MS,
+    });
 
     if (token !== renderToken || !pdfDoc) {
       return;
@@ -2559,7 +1818,10 @@ async function renderPage(pageNumber, options = {}) {
       viewport,
     });
 
-    await renderTask.promise;
+    await waitForPdfOperation(renderTask.promise, {
+      label: `PDF page ${targetPage} render`,
+      timeoutMs: PDF_RENDER_TIMEOUT_MS,
+    });
 
     if (token !== renderToken) {
       return;
@@ -2588,6 +1850,11 @@ async function renderPage(pageNumber, options = {}) {
     }
 
     console.error(error);
+    try {
+      renderTask?.cancel?.();
+    } catch {
+      // Best-effort cancellation after a timed-out render.
+    }
     showStatus("PDF 渲染失败。", true);
   } finally {
     try {
@@ -2607,7 +1874,11 @@ async function estimateContinuousPageSize() {
   let page = null;
 
   try {
-    page = await pdfDoc.getPage(clamp(state.page, 1, pdfDoc.numPages));
+    const targetPage = clamp(state.page, 1, pdfDoc.numPages);
+    page = await waitForPdfOperation(pdfDoc.getPage(targetPage), {
+      label: `PDF page ${targetPage} size`,
+      timeoutMs: PDF_RENDER_TIMEOUT_MS,
+    });
     const viewport = getScaledViewport(page);
     return {
       height: Math.max(420, Math.floor(viewport.height)),
@@ -3208,7 +2479,10 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, opt
   let task = null;
 
   try {
-    page = await pdfDoc.getPage(targetPage);
+    page = await waitForPdfOperation(pdfDoc.getPage(targetPage), {
+      label: `PDF page ${targetPage} load`,
+      timeoutMs: PDF_RENDER_TIMEOUT_MS,
+    });
 
     if (!isContinuousRenderCurrent(targetPage, shell, token, runId)) {
       return;
@@ -3229,7 +2503,10 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, opt
     });
 
     pageRenderTasks.set(targetPage, task);
-    await task.promise;
+    await waitForPdfOperation(task.promise, {
+      label: `PDF page ${targetPage} render`,
+      timeoutMs: PDF_RENDER_TIMEOUT_MS,
+    });
 
     if (!isContinuousRenderCurrent(targetPage, shell, token, runId)) {
       // A stale render can finish after a retry has reused the shell; leave the newer canvas alone.
@@ -3242,6 +2519,12 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, opt
   } catch (error) {
     if (error?.name !== "RenderingCancelledException") {
       console.error(error);
+    }
+
+    try {
+      task?.cancel?.();
+    } catch {
+      // Best-effort cancellation after a timed-out render.
     }
 
     if (isContinuousRenderCurrent(targetPage, shell, token, runId)) {
@@ -3333,16 +2616,6 @@ function setEpubLoading(loading, message = "正在排版...") {
 function getDocumentMaxScrollTop() {
   const scroller = document.scrollingElement || document.documentElement;
   return Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-}
-
-function waitForNextFrame() {
-  return new Promise((resolve) => {
-    window.requestAnimationFrame(() => resolve());
-  });
-}
-
-function wait(milliseconds) {
-  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 function getVisibleEpubIndex() {
@@ -5755,9 +5028,10 @@ async function loadPdfFromSource(source, meta = {}, requestedPage = 1, openToken
 
   showStatus("正在打开 PDF...", true);
   let loadingTask = null;
+  let loadedDoc = null;
 
   try {
-    loadingTask = await createPdfLoadingTaskFromSource(source, meta);
+    loadingTask = await createPdfLoadingTaskFromSource(source, meta, meta.name || state.fileName || "");
 
     if (!isDocumentOpenCurrent(openToken)) {
       await destroyPdfLoadingTask(loadingTask);
@@ -5765,7 +5039,11 @@ async function loadPdfFromSource(source, meta = {}, requestedPage = 1, openToken
     }
 
     activePdfLoadingTask = loadingTask;
-    const loadedDoc = await loadingTask.promise;
+    loadedDoc = await waitForPdfOperation(loadingTask.promise, {
+      failurePromise: loadingTask.rangeFailurePromise,
+      label: "PDF open",
+      timeoutMs: PDF_LOAD_TIMEOUT_MS,
+    });
 
     if (activePdfLoadingTask === loadingTask) {
       activePdfLoadingTask = null;
@@ -5784,6 +5062,7 @@ async function loadPdfFromSource(source, meta = {}, requestedPage = 1, openToken
     }
 
     pdfDoc = loadedDoc;
+    activePdfRangeFailurePromise = loadingTask.rangeFailurePromise || null;
     state.documentId = meta.id || state.documentId;
     state.fileName = meta.name || state.fileName || "未命名.pdf";
     state.page = clamp(requestedPage, 1, pdfDoc.numPages);
@@ -5798,6 +5077,10 @@ async function loadPdfFromSource(source, meta = {}, requestedPage = 1, openToken
   } catch (error) {
     if (activePdfLoadingTask === loadingTask) {
       activePdfLoadingTask = null;
+    }
+
+    if (!loadedDoc || pdfDoc !== loadedDoc) {
+      await destroyPdfLoadingTask(loadingTask);
     }
 
     if (!isDocumentOpenCurrent(openToken)) {
@@ -5836,7 +5119,7 @@ async function openDocumentRecord(record, options = {}) {
 
   const openToken = beginDocumentOpen();
   const previousState = { ...state };
-  record = await withDetectedEncryptedPayloadLocation(record);
+  record = await normalizeEncryptedRecordPayload(record);
 
   if (!isDocumentOpenCurrent(openToken)) {
     return;
@@ -6151,17 +5434,23 @@ async function restoreLastDocument() {
       return;
     }
 
-    record = await withDetectedEncryptedPayloadLocation(record);
+    record = await normalizeEncryptedRecordPayload(record);
 
     state.documentId = record.id;
     state.format = getDocumentFormat(record);
     state.fileName = await getRecordDisplayName(record);
     applyDocumentProgress(record.id, state.page || 1);
     showStatus("正在恢复上次阅读...", true);
+    let opened = true;
+
     if (state.format === DOCUMENT_FORMATS.EPUB) {
-      await loadEpubFromRecord(record, { id: record.id, name: state.fileName });
+      opened = await loadEpubFromRecord(record, { id: record.id, name: state.fileName }) !== false;
     } else {
-      await loadPdfFromRecord(record, { id: record.id, name: state.fileName }, state.page);
+      opened = await loadPdfFromRecord(record, { id: record.id, name: state.fileName }, state.page) !== false;
+    }
+
+    if (opened) {
+      await touchStoredDocument(record.id, record).catch(() => {});
     }
     renderLibraryList();
   } catch (error) {
@@ -7202,6 +6491,206 @@ function wireEvents() {
   );
 }
 
+function noteSelfTestMetric(name) {
+  if (!getSelfTestMode()) {
+    return;
+  }
+
+  window.__portableReaderSelfTestMetrics ||= {};
+  window.__portableReaderSelfTestMetrics[name] =
+    (window.__portableReaderSelfTestMetrics[name] || 0) + 1;
+}
+
+setPdfSourceMetricHandler(noteSelfTestMetric);
+
+function createSelfTestPdfBytes(label, pageCount = 3, fillerBytes = 0) {
+  const encoder = new TextEncoder();
+  const safeLabel = String(label).replace(/[()\\]/g, "\\$&");
+  const objects = [];
+  const fontObjectId = 3;
+  const pageObjectIds = [];
+
+  objects[1] = "<< /Type /Catalog /Pages 2 0 R >>";
+  objects[fontObjectId] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+
+  for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+    const pageObjectId = 4 + pageIndex * 2;
+    const contentObjectId = pageObjectId + 1;
+    const content = `BT /F1 22 Tf 36 120 Td (${safeLabel} page ${pageIndex + 1}) Tj ET`;
+
+    pageObjectIds.push(pageObjectId);
+    objects[pageObjectId] =
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 180] ` +
+      `/Resources << /Font << /F1 ${fontObjectId} 0 R >> >> /Contents ${contentObjectId} 0 R >>`;
+    objects[contentObjectId] = `<< /Length ${encoder.encode(content).length} >>\nstream\n${content}\nendstream`;
+  }
+
+  if (fillerBytes > 0) {
+    const filler = "0".repeat(Math.max(0, Math.floor(fillerBytes)));
+    objects[objects.length] = `<< /Length ${filler.length} >>\nstream\n${filler}\nendstream`;
+  }
+
+  objects[2] = `<< /Type /Pages /Kids [${pageObjectIds.map((id) => `${id} 0 R`).join(" ")}] /Count ${pageCount} >>`;
+
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+
+  for (let objectId = 1; objectId < objects.length; objectId += 1) {
+    offsets[objectId] = encoder.encode(pdf).length;
+    pdf += `${objectId} 0 obj\n${objects[objectId]}\nendobj\n`;
+  }
+
+  const xrefOffset = encoder.encode(pdf).length;
+  pdf += `xref\n0 ${objects.length}\n0000000000 65535 f \n`;
+
+  for (let objectId = 1; objectId < objects.length; objectId += 1) {
+    pdf += `${String(offsets[objectId]).padStart(10, "0")} 00000 n \n`;
+  }
+
+  pdf += `trailer\n<< /Size ${objects.length} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return encoder.encode(pdf);
+}
+
+function createSelfTestPdfRecord(id, name, pageCount = 3, fillerBytes = 0) {
+  const bytes = createSelfTestPdfBytes(name, pageCount, fillerBytes);
+  const blob = new Blob([bytes], { type: "application/pdf" });
+  const now = Date.now();
+
+  return {
+    id,
+    blob,
+    format: DOCUMENT_FORMATS.PDF,
+    lastOpenedAt: now,
+    name,
+    size: blob.size,
+    type: "application/pdf",
+    updatedAt: now,
+  };
+}
+
+function getSelfTestMode() {
+  try {
+    return new URLSearchParams(window.location.search).get("selftest") || "";
+  } catch {
+    return "";
+  }
+}
+
+function updateSelfTestResult(status, detail = "") {
+  window.__portableReaderSelfTestResult = {
+    detail,
+    metrics: window.__portableReaderSelfTestMetrics || {},
+    status,
+    updatedAt: Date.now(),
+  };
+}
+
+async function openSelfTestRecord(record, options, label) {
+  const timeoutMs = 20_000;
+  const timeout = wait(timeoutMs).then(() => {
+    throw new Error(`${label} timed out after ${timeoutMs}ms; status=${els.status.textContent || ""}`);
+  });
+
+  await Promise.race([openDocumentRecord(record, options), timeout]);
+  await waitForNextFrame();
+
+  if (!pdfDoc || !els.canvas.width || !els.canvas.height) {
+    throw new Error(`${label} did not render a PDF page; status=${els.status.textContent || ""}`);
+  }
+
+  if (/失败|打不开|不可用/.test(els.status.textContent || "")) {
+    throw new Error(`${label} ended with status=${els.status.textContent}`);
+  }
+}
+
+async function runEncryptedSwitchSelfTest() {
+  const password = "portable-reader-selftest";
+  const encryptedId = `${DOCUMENT_ID_PREFIX}selftest-encrypted-switch`;
+  const otherId = `${DOCUMENT_ID_PREFIX}selftest-other-switch`;
+
+  updateSelfTestResult("running", "prepare");
+  window.__portableReaderSelfTestMetrics = {};
+  setSessionPassword(password);
+  showStatus("自测：准备测试文件...", true);
+  await deleteStoredDocument(encryptedId).catch(() => {});
+  await deleteStoredDocument(otherId).catch(() => {});
+  deleteDocumentProgress(encryptedId);
+  deleteDocumentProgress(otherId);
+
+  const targetPlainRecord = createSelfTestPdfRecord(
+    encryptedId,
+    "selftest encrypted",
+    4,
+    PDF_RANGE_CHUNK_SIZE + 180_000,
+  );
+  const otherRecord = createSelfTestPdfRecord(otherId, "selftest other", 2);
+  const encryptedRecord = await encryptDocumentRecord(targetPlainRecord, password);
+  const backupBlob = await createEncryptedBackupBlob(encryptedRecord);
+  const backupFile =
+    typeof File === "undefined"
+      ? backupBlob
+      : new File([backupBlob], "selftest-target.pprenc", { type: "application/octet-stream" });
+
+  updateSelfTestResult("running", "import encrypted backup");
+  showStatus("自测：导入加密备份...", true);
+  const backupRecord = await parseEncryptedBackupFile(backupFile);
+  const importedRecord = await importEncryptedBackupRecordWithCurrentPassword(backupRecord);
+
+  updateSelfTestResult("running", "open imported encrypted PDF");
+  showStatus("自测：打开导入后的加密 PDF...", true);
+  await openSelfTestRecord(importedRecord, { resetProgress: true }, "open imported encrypted PDF");
+
+  await putStoredDocument(otherRecord);
+  updateSelfTestResult("running", "open other PDF");
+  showStatus("自测：切换到另一个 PDF...", true);
+  await openSelfTestRecord(otherRecord, { resetProgress: true }, "open other PDF");
+
+  const storedEncryptedRecord = await getStoredDocument(encryptedId);
+
+  if (!storedEncryptedRecord?.blob) {
+    throw new Error("Stored encrypted self-test record is missing.");
+  }
+
+  if (
+    getEncryptedPayloadOffset(storedEncryptedRecord) <= 0 ||
+    storedEncryptedRecord.blob.size <= getExpectedEncryptedPayloadSize(storedEncryptedRecord)
+  ) {
+    throw new Error("Imported encrypted self-test record did not preserve the backup container.");
+  }
+
+  updateSelfTestResult("running", "reopen encrypted PDF after switching");
+  showStatus("自测：从书架重新打开加密 PDF...", true);
+  await openSelfTestRecord(storedEncryptedRecord, {}, "reopen encrypted PDF after switching");
+  const metrics = window.__portableReaderSelfTestMetrics || {};
+
+  if ((metrics.pdfRangeRequests || 0) < 1) {
+    throw new Error("Self-test did not exercise PDF range requests.");
+  }
+
+  if ((metrics.encryptedChunkReads || 0) < 2) {
+    throw new Error("Self-test did not read multiple encrypted chunks.");
+  }
+
+  updateSelfTestResult("passed", "encrypted PDF reopened after switching");
+  showStatus("自测通过：加密 PDF 切换后可重新打开。");
+  console.info("Encrypted switch self-test passed.");
+}
+
+async function runSelfTest(mode) {
+  if (mode !== "encrypted-switch") {
+    showStatus(`未知自测：${mode}`, true);
+    return;
+  }
+
+  try {
+    await runEncryptedSwitchSelfTest();
+  } catch (error) {
+    console.error(error);
+    updateSelfTestResult("failed", error?.message || String(error));
+    showStatus(`自测失败：${error?.message || error}`, true);
+  }
+}
+
 async function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) {
     return;
@@ -7212,7 +6701,10 @@ async function registerServiceWorker() {
   }
 
   try {
-    await navigator.serviceWorker.register("./sw.js");
+    const registration = await navigator.serviceWorker.register("./sw.js", {
+      updateViaCache: "none",
+    });
+    registration.update?.().catch(() => {});
   } catch (error) {
     console.warn(error);
   }
@@ -7237,9 +6729,14 @@ wireEvents();
 setReaderVisible(false);
 updateViewerMode();
 updateControls();
-const startedLocked = initializeLock();
+const selfTestMode = getSelfTestMode();
 registerServiceWorker();
-if (startedLocked) {
+if (selfTestMode) {
+  runSelfTest(selfTestMode).catch((error) => {
+    console.error(error);
+    showStatus(`自测失败：${error?.message || error}`, true);
+  });
+} else if (initializeLock()) {
   renderLibraryList();
 } else {
   handleUnlockedSession().catch((error) => console.warn(error));

@@ -9,6 +9,7 @@ const entries = [
   "index.html",
   "styles.css",
   "app.js",
+  "src",
   "manifest.webmanifest",
   "sw.js",
   "icons",
