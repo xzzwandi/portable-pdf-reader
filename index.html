@@ -8,7 +8,7 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./icons/icon.svg" />
-    <link rel="stylesheet" href="./styles.css?v=59" />
+    <link rel="stylesheet" href="./styles.css?v=60" />
   </head>
   <body>
     <div class="app-shell">
@@ -18,14 +18,14 @@
           <div>
             <div class="brand-title">
               <h1>随身阅读</h1>
-              <span id="appVersion" class="version-badge">v59</span>
+              <span id="appVersion" class="version-badge">v60</span>
             </div>
             <p id="docName">未打开文件</p>
           </div>
         </div>
 
         <div class="actions">
-          <input id="fileInput" type="file" accept="application/pdf,.pdf,application/epub+zip,.epub,.pprenc" hidden />
+          <input id="fileInput" type="file" hidden />
           <button id="lockButton" type="button">锁</button>
           <button id="libraryButton" type="button">书架</button>
           <button id="openButton" class="primary" type="button">打开文件</button>
@@ -187,6 +187,6 @@
 
     <script src="./vendor/jszip/jszip.min.js?v=45"></script>
     <script src="./vendor/epubjs/epub.min.js?v=45"></script>
-    <script type="module" src="./app.js?v=59"></script>
+    <script type="module" src="./app.js?v=60"></script>
   </body>
 </html>
