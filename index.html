@@ -8,7 +8,7 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./icons/icon.svg" />
-    <link rel="stylesheet" href="./styles.css?v=60" />
+    <link rel="stylesheet" href="./styles.css?v=61" />
   </head>
   <body>
     <div class="app-shell">
@@ -18,7 +18,7 @@
           <div>
             <div class="brand-title">
               <h1>随身阅读</h1>
-              <span id="appVersion" class="version-badge">v60</span>
+              <span id="appVersion" class="version-badge">v61</span>
             </div>
             <p id="docName">未打开文件</p>
           </div>
@@ -134,6 +134,45 @@
         </section>
       </div>
 
+      <div id="backupOverlay" class="backup-overlay" hidden>
+        <section class="backup-panel" role="dialog" aria-modal="true" aria-labelledby="backupTitle">
+          <div class="lock-mark" aria-hidden="true">备</div>
+          <h2 id="backupTitle">加密备份</h2>
+          <p id="backupDescription">选择导出方式。</p>
+
+          <form id="backupForm" class="backup-form">
+            <button id="backupCurrentButton" class="primary" type="button">用当前密码导出</button>
+            <input
+              id="backupPasswordInput"
+              type="text"
+              autocomplete="off"
+              autocapitalize="none"
+              data-password-mask="true"
+              inputmode="text"
+              minlength="4"
+              placeholder="输入备份密码"
+              spellcheck="false"
+            />
+            <input
+              id="backupConfirmInput"
+              type="text"
+              autocomplete="off"
+              autocapitalize="none"
+              data-password-mask="true"
+              inputmode="text"
+              minlength="4"
+              placeholder="再次输入备份密码"
+              spellcheck="false"
+            />
+            <progress id="backupProgress" max="100" value="0" hidden></progress>
+            <p id="backupProgressText" class="backup-progress-text" hidden></p>
+            <button id="backupSubmitButton" type="submit">用备份密码导出</button>
+          </form>
+
+          <button id="backupCancelButton" type="button">取消</button>
+        </section>
+      </div>
+
       <div id="tocOverlay" class="toc-overlay" hidden>
         <section class="toc-panel" role="dialog" aria-modal="true" aria-labelledby="tocTitle">
           <header class="toc-header">
@@ -187,6 +226,6 @@
 
     <script src="./vendor/jszip/jszip.min.js?v=45"></script>
     <script src="./vendor/epubjs/epub.min.js?v=45"></script>
-    <script type="module" src="./app.js?v=60"></script>
+    <script type="module" src="./app.js?v=61"></script>
   </body>
 </html>

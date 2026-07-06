@@ -12,7 +12,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v60";
+const APP_VERSION = "v61";
 const ENCRYPTED_BACKUP_EXTENSION = ".pprenc";
 const ENCRYPTED_BACKUP_MAGIC = "PPRENC1\n";
 const ENCRYPTED_BACKUP_VERSION = 1;
@@ -68,6 +68,17 @@ const els = {
   continuousPages: document.querySelector("#continuousPages"),
   controls: document.querySelector("#controls"),
   appVersion: document.querySelector("#appVersion"),
+  backupCancelButton: document.querySelector("#backupCancelButton"),
+  backupConfirmInput: document.querySelector("#backupConfirmInput"),
+  backupCurrentButton: document.querySelector("#backupCurrentButton"),
+  backupDescription: document.querySelector("#backupDescription"),
+  backupForm: document.querySelector("#backupForm"),
+  backupOverlay: document.querySelector("#backupOverlay"),
+  backupPasswordInput: document.querySelector("#backupPasswordInput"),
+  backupProgress: document.querySelector("#backupProgress"),
+  backupProgressText: document.querySelector("#backupProgressText"),
+  backupSubmitButton: document.querySelector("#backupSubmitButton"),
+  backupTitle: document.querySelector("#backupTitle"),
   docName: document.querySelector("#docName"),
   edgeJumpGroup: document.querySelector("#edgeJumpGroup"),
   emptyOpenButton: document.querySelector("#emptyOpenButton"),
@@ -150,6 +161,8 @@ let sessionPassword = "";
 const encryptionKeyCache = new Map();
 let encryptionPromptDismissed = false;
 let encryptionMigrationInProgress = false;
+let backupOperationInProgress = false;
+let pendingBackupRequest = null;
 let restoreAttempted = false;
 let scrollTrackingSuppressionDepth = 0;
 let statusTimer = null;
@@ -587,6 +600,18 @@ async function getEncryptionKeyForRecord(record, password = sessionPassword) {
   const key = await deriveEncryptionKey(password, record.encryption);
   encryptionKeyCache.set(cacheId, key);
   return key;
+}
+
+async function deriveRecordEncryptionKey(record, password) {
+  if (!isRecordEncrypted(record)) {
+    return null;
+  }
+
+  if (!password) {
+    throw new Error("Encrypted document is locked.");
+  }
+
+  return deriveEncryptionKey(password, record.encryption);
 }
 
 async function encryptRecordName(record, key, encryption) {
@@ -1406,28 +1431,112 @@ function createRecordFromEncryptedBackup(header, blob) {
   return record;
 }
 
-async function verifyEncryptedBackupRecord(record) {
-  if (!sessionPassword) {
-    throw new Error("Import requires an unlocked password.");
-  }
-
-  const key = await getEncryptionKeyForRecord(record, sessionPassword);
-  await decryptRecordName(record, key);
+async function parseEncryptedBackupFile(file) {
+  const { header, blob } = await readEncryptedBackupFile(file);
+  return createRecordFromEncryptedBackup(header, blob);
 }
 
 async function importEncryptedBackupFile(file) {
-  const { header, blob } = await readEncryptedBackupFile(file);
-  const record = createRecordFromEncryptedBackup(header, blob);
-  await verifyEncryptedBackupRecord(record);
+  const record = await parseEncryptedBackupFile(file);
+  return importEncryptedBackupRecordWithCurrentPassword(record);
+}
 
-  const existing = await getStoredDocument(record.id).catch(() => null);
-  await putStoredDocument(record);
+async function verifyEncryptedBackupRecord(record, password) {
+  const key = await deriveRecordEncryptionKey(record, password);
+  await decryptRecordName(record, key);
+  return key;
+}
 
-  if (!existing) {
-    deleteDocumentProgress(record.id);
+function createEncryptionMetadata(originalSize) {
+  return {
+    algorithm: ENCRYPTION_ALGORITHM,
+    chunkSize: ENCRYPTION_CHUNK_SIZE,
+    encryptedAt: Date.now(),
+    keyAlgorithm: ENCRYPTION_KEY_ALGORITHM,
+    memLimit: sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE,
+    noncePrefix: bytesToHex(randomBytes(XCHACHA_NONCE_PREFIX_BYTES)),
+    opsLimit: sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE,
+    originalSize,
+    salt: bytesToHex(randomBytes(sodium.crypto_pwhash_SALTBYTES)),
+    tagLength: sodium.crypto_aead_xchacha20poly1305_ietf_ABYTES * 8,
+    version: ENCRYPTION_VERSION,
+  };
+}
+
+async function encryptDocumentFromSource(record, source, plainName, password, onProgress = () => {}) {
+  const sodiumApi = await ensureSodiumReady();
+  const originalSize = getEncryptionOriginalSize(record);
+  const encryption = createEncryptionMetadata(originalSize);
+  const key = await deriveEncryptionKey(password, encryption);
+  const nameRecord = { ...record, name: plainName, size: originalSize };
+  const encryptedName = await encryptRecordName(nameRecord, key, encryption);
+  const totalChunks = Math.max(1, Math.ceil(originalSize / encryption.chunkSize));
+  const encryptedParts = [];
+
+  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+    const begin = chunkIndex * encryption.chunkSize;
+    const end = Math.min(begin + encryption.chunkSize, originalSize);
+    const plainBytes = await source.readRange(begin, end);
+    const encryptedBytes = sodiumApi.crypto_aead_xchacha20poly1305_ietf_encrypt(
+      plainBytes,
+      createChunkAad(record, encryption, chunkIndex),
+      null,
+      createChunkNonce(encryption, chunkIndex),
+      key,
+    );
+
+    encryptedParts.push(encryptedBytes);
+    onProgress({
+      chunkIndex: chunkIndex + 1,
+      totalChunks,
+    });
   }
 
-  return record;
+  return {
+    ...withoutPlainRecordName(record),
+    blob: new Blob(encryptedParts, { type: "application/octet-stream" }),
+    encrypted: true,
+    encryptedName,
+    encryption,
+    size: originalSize,
+    updatedAt: Date.now(),
+  };
+}
+
+async function reencryptEncryptedRecord(record, oldPassword, newPassword, onProgress = () => {}) {
+  const oldKey = await verifyEncryptedBackupRecord(record, oldPassword);
+  const plainName = await decryptRecordName(record, oldKey);
+  const source = new EncryptedDocumentSource(record, oldKey);
+  return encryptDocumentFromSource(record, source, plainName, newPassword, onProgress);
+}
+
+async function saveImportedEncryptedBackupRecord(
+  record,
+  backupPassword,
+  targetPassword,
+  onProgress = () => {},
+) {
+  const existing = await getStoredDocument(record.id).catch(() => null);
+  let recordToSave = record;
+
+  if (backupPassword === targetPassword) {
+    await verifyEncryptedBackupRecord(record, backupPassword);
+  } else {
+    recordToSave = await reencryptEncryptedRecord(record, backupPassword, targetPassword, onProgress);
+  }
+
+  recordToSave = {
+    ...recordToSave,
+    lastOpenedAt: Date.now(),
+  };
+
+  await putStoredDocument(recordToSave);
+
+  if (!existing) {
+    deleteDocumentProgress(recordToSave.id);
+  }
+
+  return recordToSave;
 }
 
 async function exportEncryptedDocumentBackup(documentId) {
@@ -1452,6 +1561,226 @@ async function exportEncryptedDocumentBackup(documentId) {
   } catch (error) {
     console.error(error);
     showStatus("加密文件导出失败。", true);
+  }
+}
+
+function updateBackupPromptState({ busy = false, progress = 0, text = "" } = {}) {
+  backupOperationInProgress = busy;
+  els.backupCancelButton.disabled = busy;
+  els.backupCurrentButton.disabled = busy;
+  els.backupPasswordInput.disabled = busy;
+  els.backupConfirmInput.disabled = busy;
+  els.backupSubmitButton.disabled = busy;
+  els.backupProgress.hidden = !busy;
+  els.backupProgressText.hidden = !busy && !text;
+  els.backupProgress.value = clamp(progress, 0, 100);
+  els.backupProgressText.textContent = text;
+}
+
+function hideBackupPrompt(options = {}) {
+  if (backupOperationInProgress && !options.force) {
+    return;
+  }
+
+  pendingBackupRequest = null;
+  els.backupOverlay.hidden = true;
+  els.backupPasswordInput.value = "";
+  els.backupConfirmInput.value = "";
+  updateBackupPromptState();
+  updatePanelScrollLock();
+}
+
+function showBackupExportPrompt(record) {
+  if (!record?.blob) {
+    return;
+  }
+
+  if (!isRecordEncrypted(record) || !isRecordNameEncrypted(record)) {
+    showStatus("这个文件还没有加密，不能导出加密备份。", true);
+    return;
+  }
+
+  closeLibrary();
+  closeToc();
+  els.backupTitle.textContent = "导出加密文件";
+  els.backupDescription.textContent = "可以直接使用当前书架密码导出，也可以另设备份密码导出。";
+  els.backupCurrentButton.hidden = false;
+  els.backupConfirmInput.hidden = false;
+  els.backupConfirmInput.required = true;
+  els.backupPasswordInput.placeholder = "输入新的备份密码";
+  els.backupSubmitButton.textContent = "用备份密码导出";
+  els.backupPasswordInput.value = "";
+  els.backupConfirmInput.value = "";
+  pendingBackupRequest = {
+    mode: "export",
+    record,
+  };
+  updateBackupPromptState();
+  els.backupOverlay.hidden = false;
+  updatePanelScrollLock();
+}
+
+function showBackupImportPasswordPrompt(record) {
+  els.backupTitle.textContent = "输入备份密码";
+  els.backupDescription.textContent = "这个加密备份不是用当前书架密码导出的，请输入备份文件的密码。";
+  els.backupCurrentButton.hidden = true;
+  els.backupConfirmInput.hidden = true;
+  els.backupConfirmInput.required = false;
+  els.backupPasswordInput.placeholder = "输入备份密码";
+  els.backupSubmitButton.textContent = "导入并转换到当前密码";
+  els.backupPasswordInput.value = "";
+  els.backupConfirmInput.value = "";
+  pendingBackupRequest = {
+    mode: "import",
+    record,
+  };
+  updateBackupPromptState();
+  els.backupOverlay.hidden = false;
+  updatePanelScrollLock();
+  window.setTimeout(() => els.backupPasswordInput.focus(), 40);
+}
+
+async function exportEncryptedDocumentBackupWithCurrentPassword(record) {
+  try {
+    updateBackupPromptState({
+      busy: true,
+      progress: 100,
+      text: "正在准备导出...",
+    });
+    const backupBlob = await createEncryptedBackupBlob(record);
+    triggerDownload(backupBlob, createEncryptedBackupFileName(record));
+    hideBackupPrompt({ force: true });
+    showStatus("已开始导出加密文件。");
+  } catch (error) {
+    console.error(error);
+    updateBackupPromptState();
+    showStatus("加密文件导出失败。", true);
+  }
+}
+
+async function exportEncryptedDocumentBackupWithPassword(record, backupPassword) {
+  if (!sessionPassword) {
+    showStatus("请先解锁书架，再另设备份密码导出。", true);
+    return;
+  }
+
+  try {
+    updateBackupPromptState({
+      busy: true,
+      progress: 0,
+      text: "正在用备份密码重新加密...",
+    });
+    const backupRecord = await reencryptEncryptedRecord(
+      record,
+      sessionPassword,
+      backupPassword,
+      ({ chunkIndex, totalChunks }) => {
+        updateBackupPromptState({
+          busy: true,
+          progress: Math.round((chunkIndex / Math.max(1, totalChunks)) * 100),
+          text: `正在重新加密 ${chunkIndex}/${totalChunks}`,
+        });
+      },
+    );
+    const backupBlob = await createEncryptedBackupBlob(backupRecord);
+    triggerDownload(backupBlob, createEncryptedBackupFileName(record));
+    hideBackupPrompt({ force: true });
+    showStatus("已开始导出加密文件。");
+  } catch (error) {
+    console.error(error);
+    updateBackupPromptState();
+    showStatus("加密文件导出失败，请确认当前书架密码可用。", true);
+  }
+}
+
+async function importEncryptedBackupRecordWithCurrentPassword(record) {
+  if (!sessionPassword) {
+    showStatus("请先解锁书架，再导入加密备份。", true);
+    return null;
+  }
+
+  return saveImportedEncryptedBackupRecord(record, sessionPassword, sessionPassword);
+}
+
+async function importEncryptedBackupRecordWithBackupPassword(record, backupPassword) {
+  if (!sessionPassword) {
+    showStatus("请先解锁书架，再导入加密备份。", true);
+    return null;
+  }
+
+  updateBackupPromptState({
+    busy: true,
+    progress: 0,
+    text: "正在转换到当前书架密码...",
+  });
+  return saveImportedEncryptedBackupRecord(
+    record,
+    backupPassword,
+    sessionPassword,
+    ({ chunkIndex, totalChunks }) => {
+      updateBackupPromptState({
+        busy: true,
+        progress: Math.round((chunkIndex / Math.max(1, totalChunks)) * 100),
+        text: `正在转换 ${chunkIndex}/${totalChunks}`,
+      });
+    },
+  );
+}
+
+async function handleBackupCurrentExport() {
+  if (backupOperationInProgress || pendingBackupRequest?.mode !== "export") {
+    return;
+  }
+
+  await exportEncryptedDocumentBackupWithCurrentPassword(pendingBackupRequest.record);
+}
+
+async function handleBackupSubmit(event) {
+  event.preventDefault();
+
+  if (backupOperationInProgress || !pendingBackupRequest) {
+    return;
+  }
+
+  const password = els.backupPasswordInput.value;
+
+  if (password.length < 4) {
+    showStatus("密码至少 4 位。");
+    els.backupPasswordInput.select();
+    return;
+  }
+
+  if (pendingBackupRequest.mode === "export") {
+    if (password !== els.backupConfirmInput.value) {
+      showStatus("两次输入的密码不一致。");
+      els.backupConfirmInput.select();
+      return;
+    }
+
+    await exportEncryptedDocumentBackupWithPassword(pendingBackupRequest.record, password);
+    return;
+  }
+
+  try {
+    const record = await importEncryptedBackupRecordWithBackupPassword(
+      pendingBackupRequest.record,
+      password,
+    );
+
+    if (!record) {
+      updateBackupPromptState();
+      return;
+    }
+
+    hideBackupPrompt({ force: true });
+    await openDocumentRecord(record, { resetProgress: true });
+    await renderLibraryList();
+    showStatus("已导入加密文件。");
+  } catch (error) {
+    console.error(error);
+    updateBackupPromptState();
+    showStatus("备份密码不对，或文件已经损坏。", true);
+    els.backupPasswordInput.select();
   }
 }
 
@@ -5440,7 +5769,7 @@ async function handleEncryptionMigrationSubmit(event) {
 
 async function handleFileSelection(file) {
   if (isEncryptedBackupFile(file)) {
-    await handleEncryptedBackupSelection(file);
+    await handleEncryptedBackupSelectionV2(file);
     return;
   }
 
@@ -5471,7 +5800,43 @@ async function handleFileSelection(file) {
   }
 }
 
+async function handleEncryptedBackupSelectionV2(file) {
+  if (!sessionPassword) {
+    showStatus("请先解锁当前书架，再导入加密备份。", true);
+    return;
+  }
+
+  let backupRecord = null;
+
+  try {
+    showStatus("正在读取加密备份...", true);
+    backupRecord = await parseEncryptedBackupFile(file);
+  } catch (error) {
+    console.error(error);
+    showStatus("加密备份文件不可用。", true);
+    return;
+  }
+
+  try {
+    showStatus("正在导入加密备份...", true);
+    const record = await importEncryptedBackupRecordWithCurrentPassword(backupRecord);
+
+    if (!record) {
+      return;
+    }
+
+    await openDocumentRecord(record, { resetProgress: true });
+    await renderLibraryList();
+    showStatus("已导入加密文件。");
+  } catch (error) {
+    console.warn(error);
+    showBackupImportPasswordPrompt(backupRecord);
+  }
+}
+
 async function handleEncryptedBackupSelection(file) {
+  return handleEncryptedBackupSelectionV2(file);
+
   if (!sessionPassword) {
     showStatus("请先解锁同一个密码，再导入加密备份。", true);
     return;
@@ -5578,14 +5943,17 @@ function openToc() {
 
 function updatePanelScrollLock() {
   const panelOpen =
-    !els.libraryOverlay.hidden || !els.tocOverlay.hidden || !els.encryptionOverlay.hidden;
+    !els.libraryOverlay.hidden ||
+    !els.tocOverlay.hidden ||
+    !els.encryptionOverlay.hidden ||
+    !els.backupOverlay.hidden;
 
   document.documentElement.classList.toggle("is-panel-open", panelOpen);
   document.body.classList.toggle("is-panel-open", panelOpen);
 }
 
 function getScrollablePanelList(target) {
-  return target?.closest?.(".library-list, .toc-list, .encryption-panel") || null;
+  return target?.closest?.(".library-list, .toc-list, .encryption-panel, .backup-panel") || null;
 }
 
 function rememberPanelTouch(event) {
@@ -5593,7 +5961,12 @@ function rememberPanelTouch(event) {
 }
 
 function preventPanelScrollLeak(event) {
-  if (els.libraryOverlay.hidden && els.tocOverlay.hidden && els.encryptionOverlay.hidden) {
+  if (
+    els.libraryOverlay.hidden &&
+    els.tocOverlay.hidden &&
+    els.encryptionOverlay.hidden &&
+    els.backupOverlay.hidden
+  ) {
     return;
   }
 
@@ -6120,7 +6493,7 @@ async function renderLibraryList() {
 
       openButton.append(name, meta);
       openButton.addEventListener("click", () => openDocumentFromLibrary(record.id));
-      exportButton.addEventListener("click", () => exportEncryptedDocumentBackup(record.id));
+      exportButton.addEventListener("click", () => showBackupExportPrompt(record));
       deleteButton.addEventListener("click", () => deleteDocumentFromLibrary(record.id));
 
       actions.append(exportButton, deleteButton);
@@ -6175,7 +6548,12 @@ function restoreReaderPositionAfterResume() {
 }
 
 function openFilePicker() {
-  if (!els.lockOverlay.hidden || !els.encryptionOverlay.hidden || !els.imageOverlay.hidden) {
+  if (
+    !els.lockOverlay.hidden ||
+    !els.encryptionOverlay.hidden ||
+    !els.backupOverlay.hidden ||
+    !els.imageOverlay.hidden
+  ) {
     return;
   }
 
@@ -6219,6 +6597,17 @@ function wireEvents() {
   els.lockForm.addEventListener("submit", handleLockSubmit);
   els.lockOverlay.addEventListener("touchmove", preventLockScroll, { passive: false });
   els.lockOverlay.addEventListener("wheel", preventLockScroll, { passive: false });
+  els.backupCurrentButton.addEventListener("click", handleBackupCurrentExport);
+  els.backupCancelButton.addEventListener("click", hideBackupPrompt);
+  els.backupForm.addEventListener("submit", handleBackupSubmit);
+  els.backupOverlay.addEventListener("click", (event) => {
+    if (event.target === els.backupOverlay) {
+      hideBackupPrompt();
+    }
+  });
+  els.backupOverlay.addEventListener("touchstart", rememberPanelTouch, { passive: true });
+  els.backupOverlay.addEventListener("touchmove", preventPanelScrollLeak, { passive: false });
+  els.backupOverlay.addEventListener("wheel", preventPanelScrollLeak, { passive: false });
   els.encryptionForm.addEventListener("submit", handleEncryptionMigrationSubmit);
   els.encryptionLaterButton.addEventListener("click", () => {
     encryptionPromptDismissed = true;
@@ -6407,6 +6796,11 @@ function wireEvents() {
 
     if (event.key === "Escape" && !els.tocOverlay.hidden) {
       closeToc();
+      return;
+    }
+
+    if (event.key === "Escape" && !els.backupOverlay.hidden) {
+      hideBackupPrompt();
       return;
     }
 
