@@ -12,7 +12,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v62";
+const APP_VERSION = "v63";
 const ENCRYPTED_BACKUP_EXTENSION = ".pprenc";
 const ENCRYPTED_BACKUP_MAGIC = "PPRENC1\n";
 const ENCRYPTED_BACKUP_VERSION = 1;
@@ -34,6 +34,8 @@ const CONTINUOUS_HEALTH_CHECK_DELAY_MS = 700;
 const CONTINUOUS_HEALTH_CHECK_INTERVAL_MS = 1_500;
 const CONTINUOUS_BLANK_RETRY_LIMIT = 3;
 const CONTINUOUS_CLEANUP_IDLE_MS = 3_500;
+const PAGED_BLANK_RETRY_LIMIT = 2;
+const PAGED_BLANK_RETRY_DELAY_MS = 120;
 const PDF_RANGE_CHUNK_SIZE = 1_048_576;
 const MAX_PAGED_CANVAS_PIXELS = 18_000_000;
 const MAX_CONTINUOUS_CANVAS_PIXELS = 6_500_000;
@@ -185,6 +187,7 @@ const continuousRenderPromises = new Map();
 const pendingContinuousPages = new Map();
 const continuousRenderRuns = new Map();
 const continuousBlankRetries = new Map();
+const pagedBlankRetries = new Map();
 let continuousQueueRunning = false;
 let continuousRenderRunId = 0;
 let continuousHealthTimer = null;
@@ -2122,6 +2125,7 @@ function clearContinuousPages() {
   pendingContinuousPages.clear();
   continuousRenderRuns.clear();
   continuousBlankRetries.clear();
+  pagedBlankRetries.clear();
   els.continuousPages.replaceChildren();
 }
 
@@ -2138,6 +2142,7 @@ async function closeCurrentDocument() {
   els.canvas.removeAttribute("height");
   els.canvas.removeAttribute("style");
   els.epubViewer.replaceChildren();
+  pagedBlankRetries.clear();
   resetEpubTocCache();
   epubAtEnd = false;
   epubAtStart = false;
@@ -2208,6 +2213,22 @@ function prepareCanvas(canvas, viewport) {
   context.fillRect(0, 0, viewport.width, viewport.height);
 
   return context;
+}
+
+function commitRenderedCanvas(sourceCanvas, targetCanvas) {
+  targetCanvas.width = sourceCanvas.width;
+  targetCanvas.height = sourceCanvas.height;
+  targetCanvas.style.width = sourceCanvas.style.width;
+  targetCanvas.style.height = sourceCanvas.style.height;
+
+  const context = targetCanvas.getContext("2d", { alpha: false });
+
+  if (!context) {
+    return;
+  }
+
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.drawImage(sourceCanvas, 0, 0);
 }
 
 class BlobDocumentSource {
@@ -2470,13 +2491,14 @@ async function createPdfLoadingTaskFromBlob(blob, meta = {}) {
   return createPdfLoadingTaskFromSource(new BlobDocumentSource(blob), meta);
 }
 
-async function renderPage(pageNumber) {
+async function renderPage(pageNumber, options = {}) {
   if (!pdfDoc) {
     return;
   }
 
   const token = ++renderToken;
   const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
+  const blankRetryCount = Math.max(0, Math.floor(options.blankRetryCount || 0));
   state.page = targetPage;
   state.scrollPage = targetPage;
   state.scrollOffsetRatio = 0;
@@ -2498,7 +2520,8 @@ async function renderPage(pageNumber) {
 
     lastLayoutWidth = getAvailableCanvasWidth();
     const viewport = getScaledViewport(page);
-    const context = prepareCanvas(els.canvas, viewport);
+    const scratchCanvas = document.createElement("canvas");
+    const context = prepareCanvas(scratchCanvas, viewport);
 
     renderTask = page.render({
       canvasContext: context,
@@ -2511,6 +2534,20 @@ async function renderPage(pageNumber) {
       return;
     }
 
+    if (isCanvasLikelyBlank(scratchCanvas) && blankRetryCount < PAGED_BLANK_RETRY_LIMIT) {
+      pagedBlankRetries.set(targetPage, blankRetryCount + 1);
+      window.setTimeout(() => {
+        if (token === renderToken && pdfDoc && state.page === targetPage && !isScrollMode()) {
+          renderPage(targetPage, { blankRetryCount: blankRetryCount + 1 }).catch((error) => {
+            console.error(error);
+          });
+        }
+      }, PAGED_BLANK_RETRY_DELAY_MS);
+      return;
+    }
+
+    pagedBlankRetries.delete(targetPage);
+    commitRenderedCanvas(scratchCanvas, els.canvas);
     els.canvasWrap.scrollTop = 0;
     saveReaderState();
     hideStatus();
