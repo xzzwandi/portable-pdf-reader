@@ -12,7 +12,11 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v58";
+const APP_VERSION = "v59";
+const ENCRYPTED_BACKUP_EXTENSION = ".pprenc";
+const ENCRYPTED_BACKUP_MAGIC = "PPRENC1\n";
+const ENCRYPTED_BACKUP_VERSION = 1;
+const ENCRYPTED_BACKUP_MAX_HEADER_BYTES = 262_144;
 const DOCUMENT_FORMATS = {
   PDF: "pdf",
   EPUB: "epub",
@@ -1050,6 +1054,10 @@ function getDocumentFormatFromName(name = "") {
 }
 
 function getDocumentFormatFromFile(file) {
+  if (isEncryptedBackupFile(file)) {
+    return "encrypted-backup";
+  }
+
   if (file?.type === "application/epub+zip" || file?.name?.toLowerCase().endsWith(".epub")) {
     return DOCUMENT_FORMATS.EPUB;
   }
@@ -1255,6 +1263,196 @@ async function touchStoredDocument(documentId) {
 
 function isSupportedDocumentFile(file) {
   return Boolean(getDocumentFormatFromFile(file));
+}
+
+function isEncryptedBackupFile(file) {
+  return Boolean(file?.name?.toLowerCase().endsWith(ENCRYPTED_BACKUP_EXTENSION));
+}
+
+function createUint32Bytes(value) {
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, value, false);
+  return bytes;
+}
+
+function readUint32Bytes(bytes, offset = 0) {
+  return new DataView(bytes.buffer, bytes.byteOffset + offset, 4).getUint32(0, false);
+}
+
+function createEncryptedBackupFileName(record = {}) {
+  return `portable-reader-${hashString(record.id || String(Date.now()))}${ENCRYPTED_BACKUP_EXTENSION}`;
+}
+
+function triggerDownload(blob, fileName) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.rel = "noopener";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
+function createEncryptedBackupHeader(record) {
+  const format = getDocumentFormat(record);
+  const type = format === DOCUMENT_FORMATS.EPUB ? "application/epub+zip" : "application/pdf";
+
+  return {
+    app: "portable-pdf-reader",
+    kind: "encrypted-document",
+    version: ENCRYPTED_BACKUP_VERSION,
+    exportedAt: Date.now(),
+    record: {
+      encrypted: true,
+      encryptedName: record.encryptedName,
+      encryption: record.encryption,
+      format,
+      id: record.id,
+      size: getEncryptionOriginalSize(record),
+      type: record.type || type,
+      updatedAt: record.updatedAt || Date.now(),
+    },
+    blob: {
+      size: record.blob?.size || 0,
+      type: "application/octet-stream",
+    },
+  };
+}
+
+async function createEncryptedBackupBlob(record) {
+  const headerBytes = new TextEncoder().encode(JSON.stringify(createEncryptedBackupHeader(record)));
+
+  if (headerBytes.length > ENCRYPTED_BACKUP_MAX_HEADER_BYTES) {
+    throw new Error("Encrypted backup metadata is too large.");
+  }
+
+  return new Blob(
+    [
+      new TextEncoder().encode(ENCRYPTED_BACKUP_MAGIC),
+      createUint32Bytes(headerBytes.length),
+      headerBytes,
+      record.blob,
+    ],
+    { type: "application/octet-stream" },
+  );
+}
+
+async function readEncryptedBackupFile(file) {
+  const magicBytes = new TextEncoder().encode(ENCRYPTED_BACKUP_MAGIC);
+  const prefixLength = magicBytes.length + 4;
+  const prefix = new Uint8Array(await file.slice(0, prefixLength).arrayBuffer());
+
+  if (prefix.length !== prefixLength) {
+    throw new Error("Invalid encrypted backup.");
+  }
+
+  for (let index = 0; index < magicBytes.length; index += 1) {
+    if (prefix[index] !== magicBytes[index]) {
+      throw new Error("Invalid encrypted backup.");
+    }
+  }
+
+  const headerLength = readUint32Bytes(prefix, magicBytes.length);
+  const dataOffset = prefixLength + headerLength;
+
+  if (
+    headerLength <= 0 ||
+    headerLength > ENCRYPTED_BACKUP_MAX_HEADER_BYTES ||
+    dataOffset > file.size
+  ) {
+    throw new Error("Invalid encrypted backup.");
+  }
+
+  const headerBytes = await file.slice(prefixLength, dataOffset).arrayBuffer();
+  const header = JSON.parse(new TextDecoder().decode(headerBytes));
+  const blob = file.slice(dataOffset, file.size, "application/octet-stream");
+
+  return { header, blob };
+}
+
+function createRecordFromEncryptedBackup(header, blob) {
+  const payload = header?.record || {};
+  const format = payload.format === DOCUMENT_FORMATS.EPUB ? DOCUMENT_FORMATS.EPUB : DOCUMENT_FORMATS.PDF;
+  const type = format === DOCUMENT_FORMATS.EPUB ? "application/epub+zip" : "application/pdf";
+  const now = Date.now();
+  const expectedBlobSize = header?.blob?.size;
+  const record = withoutPlainRecordName({
+    blob,
+    encrypted: true,
+    encryptedName: payload.encryptedName,
+    encryption: payload.encryption,
+    format,
+    id: payload.id,
+    lastOpenedAt: now,
+    size: Number.isFinite(payload.size) ? payload.size : payload.encryption?.originalSize || blob.size,
+    type: payload.type || type,
+    updatedAt: Number.isFinite(payload.updatedAt) ? payload.updatedAt : now,
+  });
+
+  if (
+    header?.app !== "portable-pdf-reader" ||
+    header?.kind !== "encrypted-document" ||
+    header?.version !== ENCRYPTED_BACKUP_VERSION ||
+    (Number.isFinite(expectedBlobSize) && expectedBlobSize !== blob.size) ||
+    !isLibraryDocument(record) ||
+    !isRecordEncrypted(record) ||
+    !isRecordNameEncrypted(record)
+  ) {
+    throw new Error("Invalid encrypted backup.");
+  }
+
+  return record;
+}
+
+async function verifyEncryptedBackupRecord(record) {
+  if (!sessionPassword) {
+    throw new Error("Import requires an unlocked password.");
+  }
+
+  const key = await getEncryptionKeyForRecord(record, sessionPassword);
+  await decryptRecordName(record, key);
+}
+
+async function importEncryptedBackupFile(file) {
+  const { header, blob } = await readEncryptedBackupFile(file);
+  const record = createRecordFromEncryptedBackup(header, blob);
+  await verifyEncryptedBackupRecord(record);
+
+  const existing = await getStoredDocument(record.id).catch(() => null);
+  await putStoredDocument(record);
+
+  if (!existing) {
+    deleteDocumentProgress(record.id);
+  }
+
+  return record;
+}
+
+async function exportEncryptedDocumentBackup(documentId) {
+  const record = await getStoredDocument(documentId).catch(() => null);
+
+  if (!record?.blob) {
+    showStatus("这个文件已经不在本机存储里。");
+    await renderLibraryList();
+    return;
+  }
+
+  if (!isRecordEncrypted(record) || !isRecordNameEncrypted(record)) {
+    showStatus("这个文件还没有加密，不能导出加密备份。", true);
+    return;
+  }
+
+  try {
+    showStatus("正在准备导出加密文件...", true);
+    const backupBlob = await createEncryptedBackupBlob(record);
+    triggerDownload(backupBlob, createEncryptedBackupFileName(record));
+    showStatus("已开始导出加密文件。");
+  } catch (error) {
+    console.error(error);
+    showStatus("加密文件导出失败。", true);
+  }
 }
 
 function setReaderVisible(visible) {
@@ -5241,8 +5439,13 @@ async function handleEncryptionMigrationSubmit(event) {
 }
 
 async function handleFileSelection(file) {
+  if (isEncryptedBackupFile(file)) {
+    await handleEncryptedBackupSelection(file);
+    return;
+  }
+
   if (!isSupportedDocumentFile(file)) {
-    showStatus("请选择 PDF 或 EPUB 文件。");
+    showStatus("请选择 PDF、EPUB 或加密备份文件。");
     return;
   }
 
@@ -5265,6 +5468,24 @@ async function handleFileSelection(file) {
     } else {
       await loadPdfFromBlob(file, { name: file.name || "未命名.pdf" }, 1);
     }
+  }
+}
+
+async function handleEncryptedBackupSelection(file) {
+  if (!sessionPassword) {
+    showStatus("请先解锁同一个密码，再导入加密备份。", true);
+    return;
+  }
+
+  try {
+    showStatus("正在导入加密备份...", true);
+    const record = await importEncryptedBackupFile(file);
+    await openDocumentRecord(record, { resetProgress: true });
+    await renderLibraryList();
+    showStatus("已导入加密文件。");
+  } catch (error) {
+    console.error(error);
+    showStatus("加密备份导入失败，请确认密码和文件是否匹配。", true);
   }
 }
 
@@ -5864,6 +6085,8 @@ async function renderLibraryList() {
       const openButton = document.createElement("button");
       const name = document.createElement("span");
       const meta = document.createElement("span");
+      const actions = document.createElement("div");
+      const exportButton = document.createElement("button");
       const deleteButton = document.createElement("button");
       const format = getDocumentFormat(record);
       const page = progress?.page || 1;
@@ -5885,15 +6108,23 @@ async function renderLibraryList() {
       meta.className = "library-meta";
       meta.textContent = `${isActive ? "正在阅读 · " : ""}${format.toUpperCase()} · ${progressLabel} · ${formatFileSize(record.size || record.blob?.size || 0)}${isRecordEncrypted(record) ? " · 已加密" : ""}`;
 
+      actions.className = "library-actions";
+
+      exportButton.className = "library-export";
+      exportButton.type = "button";
+      exportButton.textContent = "导出";
+
       deleteButton.className = "library-delete";
       deleteButton.type = "button";
       deleteButton.textContent = "删除";
 
       openButton.append(name, meta);
       openButton.addEventListener("click", () => openDocumentFromLibrary(record.id));
+      exportButton.addEventListener("click", () => exportEncryptedDocumentBackup(record.id));
       deleteButton.addEventListener("click", () => deleteDocumentFromLibrary(record.id));
 
-      item.append(openButton, deleteButton);
+      actions.append(exportButton, deleteButton);
+      item.append(openButton, actions);
       fragment.append(item);
     }
 

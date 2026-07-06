@@ -780,11 +780,24 @@ body.is-app-fullscreen .floating-fullscreen:not([hidden]) {
   line-height: 1.45;
 }
 
+.library-actions {
+  display: grid;
+  gap: 6px;
+}
+
+.library-export,
 .library-delete {
   min-height: 36px;
+  padding: 0 10px;
+}
+
+.library-export {
+  border-color: rgba(36, 33, 29, 0.18);
+}
+
+.library-delete {
   border-color: rgba(151, 64, 44, 0.36);
   color: #97402c;
-  padding: 0 10px;
 }
 
 .library-empty {
