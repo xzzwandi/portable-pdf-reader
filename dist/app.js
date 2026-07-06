@@ -12,7 +12,7 @@ const LAST_DOCUMENT_ID = "last-document";
 const LOCK_KEY = "portable-pdf-reader-lock";
 const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 const STATE_KEY = "portable-pdf-reader-state";
-const APP_VERSION = "v63";
+const APP_VERSION = "v64";
 const ENCRYPTED_BACKUP_EXTENSION = ".pprenc";
 const ENCRYPTED_BACKUP_MAGIC = "PPRENC1\n";
 const ENCRYPTED_BACKUP_VERSION = 1;
@@ -165,6 +165,8 @@ let encryptionPromptDismissed = false;
 let encryptionMigrationInProgress = false;
 let backupOperationInProgress = false;
 let pendingBackupRequest = null;
+let documentOpenToken = 0;
+let activePdfLoadingTask = null;
 let restoreAttempted = false;
 let scrollTrackingSuppressionDepth = 0;
 let statusTimer = null;
@@ -221,6 +223,29 @@ function isPdfDocument() {
 
 function isEpubDocument() {
   return state.format === DOCUMENT_FORMATS.EPUB;
+}
+
+function isDocumentOpenCurrent(openToken) {
+  return openToken === documentOpenToken;
+}
+
+async function destroyPdfLoadingTask(loadingTask) {
+  try {
+    await loadingTask?.destroy?.();
+  } catch {
+    // Best-effort cancellation for stale PDF.js loading tasks.
+  }
+}
+
+function beginDocumentOpen() {
+  documentOpenToken += 1;
+
+  if (activePdfLoadingTask) {
+    destroyPdfLoadingTask(activePdfLoadingTask);
+    activePdfLoadingTask = null;
+  }
+
+  return documentOpenToken;
 }
 
 function getEpubChapterTotal() {
@@ -2135,6 +2160,12 @@ async function closeCurrentDocument() {
   closeImagePreview();
   closeToc();
   setAppFullscreen(false, { syncLayout: false });
+
+  if (activePdfLoadingTask) {
+    destroyPdfLoadingTask(activePdfLoadingTask);
+    activePdfLoadingTask = null;
+  }
+
   await cancelCurrentRender();
   clearContinuousPages();
 
@@ -5711,18 +5742,46 @@ function handleEdgeJump(edge) {
   handleContinuousEdgeJump(edge);
 }
 
-async function loadPdfFromSource(source, meta = {}, requestedPage = 1) {
-  await closeCurrentDocument();
+async function loadPdfFromSource(source, meta = {}, requestedPage = 1, openToken = beginDocumentOpen()) {
   state.format = DOCUMENT_FORMATS.PDF;
   state.epubCfi = "";
   state.epubProgress = 0;
-  setReaderVisible(true);
-  updateViewerMode();
+
+  if (!pdfDoc && !epubBook) {
+    setReaderVisible(true);
+    updateViewerMode();
+    updateControls();
+  }
+
   showStatus("正在打开 PDF...", true);
+  let loadingTask = null;
 
   try {
-    const loadingTask = await createPdfLoadingTaskFromSource(source, meta);
+    loadingTask = await createPdfLoadingTaskFromSource(source, meta);
+
+    if (!isDocumentOpenCurrent(openToken)) {
+      await destroyPdfLoadingTask(loadingTask);
+      return false;
+    }
+
+    activePdfLoadingTask = loadingTask;
     const loadedDoc = await loadingTask.promise;
+
+    if (activePdfLoadingTask === loadingTask) {
+      activePdfLoadingTask = null;
+    }
+
+    if (!isDocumentOpenCurrent(openToken)) {
+      await loadedDoc.destroy().catch(() => {});
+      return false;
+    }
+
+    await closeCurrentDocument();
+
+    if (!isDocumentOpenCurrent(openToken)) {
+      await loadedDoc.destroy().catch(() => {});
+      return false;
+    }
 
     pdfDoc = loadedDoc;
     state.documentId = meta.id || state.documentId;
@@ -5732,22 +5791,41 @@ async function loadPdfFromSource(source, meta = {}, requestedPage = 1) {
     state.zoom = clamp(state.zoom || 1, 0.6, 2.6);
 
     updateControls();
+    setReaderVisible(true);
+    updateViewerMode();
     await renderCurrentView(state.page, { behavior: "auto", restoreScroll: true });
+    return true;
   } catch (error) {
+    if (activePdfLoadingTask === loadingTask) {
+      activePdfLoadingTask = null;
+    }
+
+    if (!isDocumentOpenCurrent(openToken)) {
+      return false;
+    }
+
     console.error(error);
-    await closeCurrentDocument();
-    setReaderVisible(false);
+    if (!pdfDoc && !epubBook) {
+      setReaderVisible(false);
+      updateViewerMode();
+    }
     showStatus("这个 PDF 暂时打不开。", true);
+    return false;
   }
 }
 
-async function loadPdfFromBlob(blob, meta = {}, requestedPage = 1) {
-  return loadPdfFromSource(new BlobDocumentSource(blob), meta, requestedPage);
+async function loadPdfFromBlob(blob, meta = {}, requestedPage = 1, openToken = beginDocumentOpen()) {
+  return loadPdfFromSource(new BlobDocumentSource(blob), meta, requestedPage, openToken);
 }
 
-async function loadPdfFromRecord(record, meta = {}, requestedPage = 1) {
+async function loadPdfFromRecord(record, meta = {}, requestedPage = 1, openToken = beginDocumentOpen()) {
   const source = await createDocumentSourceFromRecord(record);
-  return loadPdfFromSource(source, meta, requestedPage);
+
+  if (!isDocumentOpenCurrent(openToken)) {
+    return false;
+  }
+
+  return loadPdfFromSource(source, meta, requestedPage, openToken);
 }
 
 async function openDocumentRecord(record, options = {}) {
@@ -5756,7 +5834,13 @@ async function openDocumentRecord(record, options = {}) {
     return;
   }
 
+  const openToken = beginDocumentOpen();
+  const previousState = { ...state };
   record = await withDetectedEncryptedPayloadLocation(record);
+
+  if (!isDocumentOpenCurrent(openToken)) {
+    return;
+  }
 
   if (pdfDoc || epubBook) {
     persistReaderPositionNow();
@@ -5766,6 +5850,10 @@ async function openDocumentRecord(record, options = {}) {
   state.documentId = record.id;
   state.format = format;
   state.fileName = await getRecordDisplayName(record);
+
+  if (!isDocumentOpenCurrent(openToken)) {
+    return;
+  }
 
   if (options.resetProgress) {
     state.page = 1;
@@ -5779,10 +5867,25 @@ async function openDocumentRecord(record, options = {}) {
     applyDocumentProgress(record.id, options.fallbackPage || 1);
   }
 
+  let opened = true;
+
   if (format === DOCUMENT_FORMATS.EPUB) {
-    await loadEpubFromRecord(record, { id: record.id, name: state.fileName });
+    opened = await loadEpubFromRecord(record, { id: record.id, name: state.fileName }) !== false;
   } else {
-    await loadPdfFromRecord(record, { id: record.id, name: state.fileName }, state.page);
+    opened = await loadPdfFromRecord(record, { id: record.id, name: state.fileName }, state.page, openToken);
+  }
+
+  if (!isDocumentOpenCurrent(openToken)) {
+    return;
+  }
+
+  if (!opened) {
+    if (pdfDoc || epubBook) {
+      Object.assign(state, previousState);
+      updateViewerMode();
+      updateControls();
+    }
+    return;
   }
 
   await touchStoredDocument(record.id, record).catch(() => {});
