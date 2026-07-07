@@ -1,12 +1,13 @@
 import * as pdfjsLib from "../vendor/pdfjs/pdf.min.mjs";
 import {
+  APP_VERSION,
   AES_GCM_ALGORITHM,
   ENCRYPTED_CHUNK_CACHE_LIMIT,
   ENCRYPTION_CHUNK_SIZE,
   PDF_RANGE_CHUNK_SIZE,
   PDF_SOURCE_READ_RETRY_DELAY_MS,
   PDF_SOURCE_READ_RETRY_LIMIT,
-} from "./constants.js?v=91";
+} from "./constants.js?v=98";
 import {
   createChunkAad,
   createChunkIv,
@@ -16,11 +17,12 @@ import {
   getEncryptedPayloadSize,
   getEncryptionOriginalSize,
   getEncryptionTagBytes,
-} from "./encryption.js?v=91";
-import { clamp, wait } from "./utils.js?v=91";
+} from "./encryption.js?v=98";
+import { clamp, wait } from "./utils.js?v=98";
 
 const PDFJS_ROOT = new URL("../vendor/pdfjs/", import.meta.url).href;
-pdfjsLib.GlobalWorkerOptions.workerSrc = `${PDFJS_ROOT}pdf.worker.min.mjs`;
+const PDFJS_WORKER_VERSION = APP_VERSION.replace(/^v/, "");
+pdfjsLib.GlobalWorkerOptions.workerSrc = `${PDFJS_ROOT}pdf.worker.mjs?v=${PDFJS_WORKER_VERSION}`;
 
 let metricHandler = () => {};
 let diagnosticHandler = () => {};
@@ -93,13 +95,16 @@ export class BlobDocumentSource {
 }
 
 export class EncryptedDocumentSource {
-  constructor(record, key) {
+  constructor(record, key, options = {}) {
     this.record = record;
     this.blob = record.blob;
     this.encryption = record.encryption;
     this.key = key;
     this.length = getEncryptionOriginalSize(record);
     this.chunkCache = new Map();
+    this.readEncryptedBytes = typeof options.readEncryptedBytes === "function"
+      ? options.readEncryptedBytes
+      : null;
   }
 
   get chunkSize() {
@@ -145,7 +150,15 @@ export class EncryptedDocumentSource {
       throw new Error("Encrypted document payload is incomplete.");
     }
 
-    const encryptedBytes = new Uint8Array(await this.blob.slice(encryptedStart, encryptedEnd).arrayBuffer());
+    const encryptedBytes = this.readEncryptedBytes
+      ? new Uint8Array(await this.readEncryptedBytes({
+          chunkIndex,
+          encryptedEnd,
+          encryptedPayloadOffset,
+          encryptedStart,
+          expectedLength: encryptedEnd - encryptedStart,
+        }))
+      : new Uint8Array(await this.blob.slice(encryptedStart, encryptedEnd).arrayBuffer());
     let bytes;
 
     if (this.encryption.algorithm === AES_GCM_ALGORITHM) {
@@ -215,6 +228,7 @@ class PdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
     this.aborted = false;
     this.failed = false;
     this.loadingTask = null;
+    this.rangeReadQueue = Promise.resolve();
     this.failurePromise = new Promise((_, reject) => {
       this.rejectFailure = reject;
     });
@@ -250,7 +264,17 @@ class PdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
     this.loadingTask?.destroy?.().catch(() => {});
   }
 
-  async requestDataRange(begin, end) {
+  requestDataRange(begin, end) {
+    if (this.aborted) {
+      return;
+    }
+
+    const readRange = () => this.readRequestedDataRange(begin, end);
+    this.rangeReadQueue = this.rangeReadQueue.then(readRange, readRange);
+    this.rangeReadQueue.catch(() => {});
+  }
+
+  async readRequestedDataRange(begin, end) {
     if (this.aborted) {
       return;
     }

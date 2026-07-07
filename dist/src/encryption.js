@@ -19,8 +19,8 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./constants.js?v=91";
-import { readUint32Bytes } from "./utils.js?v=91";
+} from "./constants.js?v=98";
+import { readUint32Bytes } from "./utils.js?v=98";
 
 export async function ensureSodiumReady() {
   await sodium.ready;
@@ -230,6 +230,10 @@ export function getEncryptedPayloadSize(record = {}) {
 
   if (Number.isFinite(record.encryptedPayloadSize)) {
     return Math.max(0, Math.floor(record.encryptedPayloadSize));
+  }
+
+  if (Number.isFinite(record.encryptedChunkStorage?.payloadSize)) {
+    return Math.max(0, Math.floor(record.encryptedChunkStorage.payloadSize));
   }
 
   return Math.max(0, (record.blob?.size || 0) - offset);

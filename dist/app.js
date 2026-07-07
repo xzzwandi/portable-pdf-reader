@@ -14,6 +14,7 @@ import {
   CONTINUOUS_OBSERVER_MARGIN,
   CONTINUOUS_RENDER_TIMEOUT_MS,
   CONTINUOUS_RENDER_VIEWPORTS,
+  CHUNK_STORE_NAME,
   DB_NAME,
   DB_VERSION,
   DOCUMENT_FORMATS,
@@ -50,7 +51,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=91";
+} from "./src/constants.js?v=98";
 import {
   bytesToHex,
   createChunkAad,
@@ -80,23 +81,23 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=91";
+} from "./src/encryption.js?v=98";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=91";
+} from "./src/utils.js?v=98";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=91";
+} from "./src/encrypted-backups.js?v=98";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=91";
+} from "./src/pdf-sources.js?v=98";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -164,6 +165,7 @@ const els = {
   pageTotal: document.querySelector("#pageTotal"),
   pagedModeButton: document.querySelector("#pagedModeButton"),
   prevButton: document.querySelector("#prevButton"),
+  runtimeLogButton: document.querySelector("#runtimeLogButton"),
   scrollModeButton: document.querySelector("#scrollModeButton"),
   status: document.querySelector("#status"),
   statusDiagnosticsButton: document.querySelector("#statusDiagnosticsButton"),
@@ -213,7 +215,16 @@ let restoreAttempted = false;
 let scrollTrackingSuppressionDepth = 0;
 let statusTimer = null;
 const RECENT_DIAGNOSTIC_EVENT_LIMIT = 120;
+const DIAGNOSTIC_STRING_LIMIT = 4000;
+const RUNTIME_LOG_KEY = "portable-pdf-reader-runtime-log";
+const RUNTIME_LOG_LIMIT = 500;
+const RUNTIME_LOG_FLUSH_DELAY_MS = 650;
 const recentDiagnosticEvents = [];
+const runtimeLogSessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+let runtimeLogEntries = [];
+let runtimeLogLoadError = null;
+let runtimeLogSequence = 0;
+let runtimeLogFlushTimer = null;
 let diagnosticsBuildPromise = null;
 let latestDiagnosticsText = "";
 let latestOpenDiagnostic = null;
@@ -620,7 +631,19 @@ function summarizeError(error, depth = 0) {
 }
 
 function sanitizeDiagnosticValue(value, depth = 0, seen = new WeakSet()) {
-  if (value == null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
+  if (typeof value === "string") {
+    if (value.length > DIAGNOSTIC_STRING_LIMIT) {
+      return {
+        length: value.length,
+        truncated: true,
+        value: value.slice(0, DIAGNOSTIC_STRING_LIMIT),
+      };
+    }
+
+    return value;
+  }
+
+  if (value == null || typeof value === "boolean" || typeof value === "number") {
     return value;
   }
 
@@ -687,17 +710,134 @@ function sanitizeDiagnosticValue(value, depth = 0, seen = new WeakSet()) {
   return String(value);
 }
 
-function recordDiagnosticEvent(type, detail = {}) {
+function summarizeRuntimeReaderState() {
+  return {
+    activePdfLoadingTask: Boolean(activePdfLoadingTask),
+    continuous: {
+      pending: pendingContinuousPages.size,
+      renderPromises: continuousRenderPromises.size,
+      renderTasks: pageRenderTasks.size,
+    },
+    documentId: state.documentId || "",
+    documentOpenToken,
+    epubOpen: Boolean(epubBook),
+    format: state.format,
+    mode: state.mode,
+    page: state.page,
+    pdfOpen: Boolean(pdfDoc),
+    renderToken,
+    scrollPage: state.scrollPage,
+    zoom: state.zoom,
+  };
+}
+
+function summarizeRuntimeMemory() {
+  const memory = performance?.memory;
+
+  if (!memory) {
+    return null;
+  }
+
+  return {
+    jsHeapSizeLimit: memory.jsHeapSizeLimit || 0,
+    totalJSHeapSize: memory.totalJSHeapSize || 0,
+    usedJSHeapSize: memory.usedJSHeapSize || 0,
+  };
+}
+
+function normalizeRuntimeLogEntries(value) {
+  const entries = Array.isArray(value?.entries)
+    ? value.entries
+    : Array.isArray(value)
+      ? value
+      : [];
+
+  return entries.slice(-RUNTIME_LOG_LIMIT);
+}
+
+function loadRuntimeLogEntries() {
   try {
-    recentDiagnosticEvents.push({
+    const raw = window.localStorage.getItem(RUNTIME_LOG_KEY);
+    runtimeLogEntries = raw ? normalizeRuntimeLogEntries(JSON.parse(raw)) : [];
+    runtimeLogSequence = runtimeLogEntries.reduce(
+      (max, entry) => Math.max(max, Number.isFinite(entry?.seq) ? entry.seq : 0),
+      0,
+    );
+  } catch (error) {
+    runtimeLogEntries = [];
+    runtimeLogLoadError = summarizeError(error);
+  }
+}
+
+function flushRuntimeLogEntries() {
+  window.clearTimeout(runtimeLogFlushTimer);
+  runtimeLogFlushTimer = null;
+
+  try {
+    window.localStorage.setItem(
+      RUNTIME_LOG_KEY,
+      JSON.stringify({
+        appVersion: APP_VERSION,
+        entries: runtimeLogEntries.slice(-RUNTIME_LOG_LIMIT),
+        flushedAt: new Date().toISOString(),
+        kind: "portable-pdf-reader-runtime-log",
+        sessionId: runtimeLogSessionId,
+      }),
+    );
+  } catch (error) {
+    runtimeLogLoadError = summarizeError(error);
+  }
+}
+
+function scheduleRuntimeLogFlush() {
+  if (runtimeLogFlushTimer) {
+    return;
+  }
+
+  runtimeLogFlushTimer = window.setTimeout(flushRuntimeLogEntries, RUNTIME_LOG_FLUSH_DELAY_MS);
+}
+
+function appendRuntimeLogEvent(type, detail = {}) {
+  try {
+    runtimeLogSequence += 1;
+    runtimeLogEntries.push({
+      appVersion: APP_VERSION,
       at: new Date().toISOString(),
       detail: sanitizeDiagnosticValue(detail),
+      memory: summarizeRuntimeMemory(),
+      reader: summarizeRuntimeReaderState(),
+      seq: runtimeLogSequence,
+      sessionId: runtimeLogSessionId,
+      t: Math.round(performance?.now?.() || 0),
+      type,
+      visibilityState: document.visibilityState,
+    });
+
+    if (runtimeLogEntries.length > RUNTIME_LOG_LIMIT) {
+      runtimeLogEntries.splice(0, runtimeLogEntries.length - RUNTIME_LOG_LIMIT);
+    }
+
+    scheduleRuntimeLogFlush();
+  } catch {
+    // Runtime logging must never affect reading.
+  }
+}
+
+function recordDiagnosticEvent(type, detail = {}) {
+  try {
+    const sanitizedDetail = sanitizeDiagnosticValue(detail);
+
+    recentDiagnosticEvents.push({
+      at: new Date().toISOString(),
+      detail: sanitizedDetail,
       type,
     });
 
     if (recentDiagnosticEvents.length > RECENT_DIAGNOSTIC_EVENT_LIMIT) {
       recentDiagnosticEvents.splice(0, recentDiagnosticEvents.length - RECENT_DIAGNOSTIC_EVENT_LIMIT);
     }
+
+    appendRuntimeLogEvent(type, sanitizedDetail);
   } catch {
     // Diagnostics must never break normal reader behavior.
   }
@@ -778,12 +918,22 @@ function summarizeRecordForDiagnostics(record = {}) {
   const encryptedPayloadOffset = encrypted ? getEncryptedPayloadOffset(record) : null;
   const encryptedPayloadSize = encrypted ? getEncryptedPayloadSize(record) : null;
   const expectedEncryptedPayloadSize = encrypted ? getExpectedEncryptedPayloadSize(record) : null;
-  const blobSize = record.blob?.size || 0;
+  const chunkedStorage = isEncryptedRecordStoredInChunks(record) ? record.encryptedChunkStorage : null;
+  const blobSize = getStoredPayloadSize(record);
 
   return {
-    blob: summarizeBlob(record.blob),
+    blob: summarizeBlob(record.blob) || (chunkedStorage
+      ? {
+          constructor: "IndexedDBChunks",
+          size: chunkedStorage.payloadSize,
+          type: record.blobType || record.type || "application/octet-stream",
+        }
+      : null),
     blobBytesLength: getStoredBlobBytesLength(record.blobBytes),
-    blobStorage: getStoredBlobBytesLength(record.blobBytes) > 0 ? "array-buffer" : "blob",
+    blobStorage: chunkedStorage
+      ? "chunks"
+      : getStoredBlobBytesLength(record.blobBytes) > 0 ? "array-buffer" : "blob",
+    chunkedStorage,
     encrypted,
     encryptedName: summarizeEncryptedNameForDiagnostics(record.encryptedName),
     encryptedPayloadOffset,
@@ -835,9 +985,39 @@ async function readBlobSample(blob, offset = 0, length = 32) {
   }
 }
 
+function createBytesSample(bytes, offset = 0, length = 32) {
+  const safeOffset = clamp(Math.floor(offset), 0, bytes.byteLength || 0);
+  const safeEnd = clamp(Math.ceil(safeOffset + length), safeOffset, bytes.byteLength || 0);
+  const sample = bytes.subarray(safeOffset, safeEnd);
+
+  return {
+    ascii: bytesToDiagnosticAscii(sample),
+    hex: bytesToHex(sample),
+    length: sample.byteLength,
+    offset: safeOffset,
+  };
+}
+
 async function readRecordBlobSamples(record = {}) {
   if (!record?.blob) {
-    return null;
+    if (!isEncryptedRecordStoredInChunks(record)) {
+      return null;
+    }
+
+    try {
+      const firstChunk = new Uint8Array(await readStoredDocumentChunkBytes(record, 0));
+      const lastChunkIndex = Math.max(0, Math.floor(record.encryptedChunkStorage.chunkCount) - 1);
+      const lastChunk = new Uint8Array(await readStoredDocumentChunkBytes(record, lastChunkIndex));
+      return {
+        chunkPrefix: createBytesSample(firstChunk, 0, 32),
+        chunkTail: createBytesSample(lastChunk, Math.max(0, lastChunk.byteLength - 32), 32),
+      };
+    } catch (error) {
+      return {
+        error: summarizeError(error),
+        storage: record.encryptedChunkStorage,
+      };
+    }
   }
 
   const samples = {
@@ -925,6 +1105,7 @@ function summarizeReaderForDiagnostics() {
 }
 
 async function buildDiagnosticsReport() {
+  flushRuntimeLogEntries();
   const documentId = latestOpenDiagnostic?.documentId || state.documentId || "";
   let record = null;
   let storedRecordError = null;
@@ -971,6 +1152,13 @@ async function buildDiagnosticsReport() {
     },
     reader: summarizeReaderForDiagnostics(),
     recentEvents: [...recentDiagnosticEvents],
+    runtimeLog: {
+      entries: runtimeLogEntries.slice(-RUNTIME_LOG_LIMIT),
+      loadError: runtimeLogLoadError,
+      limit: RUNTIME_LOG_LIMIT,
+      sessionId: runtimeLogSessionId,
+      storageKey: RUNTIME_LOG_KEY,
+    },
     selectedDocumentId: documentId,
     status: getStatusText(),
   };
@@ -1039,12 +1227,20 @@ function copyTextUsingExecCommand(text) {
 }
 
 async function writeTextToClipboard(text) {
-  if (copyTextUsingExecCommand(text)) {
-    return;
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch (error) {
+      if (copyTextUsingExecCommand(text)) {
+        return;
+      }
+
+      throw error;
+    }
   }
 
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
+  if (copyTextUsingExecCommand(text)) {
     return;
   }
 
@@ -1120,11 +1316,79 @@ async function copyDiagnosticsToClipboard() {
   }
 }
 
+async function copyRuntimeLogToClipboard() {
+  const documentId = latestOpenDiagnostic?.documentId || state.documentId || "";
+
+  try {
+    recordDiagnosticEvent("runtime-log-copy-start", {
+      documentId,
+      runtimeLogEntries: runtimeLogEntries.length,
+      trigger: "button",
+    });
+    const text = await prepareDiagnosticsText({
+      documentId,
+      runtimeLogEntries: runtimeLogEntries.length,
+      trigger: "runtime-log-button",
+    });
+    await writeTextToClipboard(text);
+    recordDiagnosticEvent("runtime-log-copy-success", {
+      bytes: text.length,
+      documentId,
+    });
+    showStatus("运行日志已复制到剪切板。", true);
+  } catch (error) {
+    console.error(error);
+    recordDiagnosticEvent("runtime-log-copy-error", {
+      documentId,
+      error: summarizeError(error),
+    });
+    const text = latestDiagnosticsText || await prepareDiagnosticsText({
+      documentId,
+      error: summarizeError(error),
+      trigger: "runtime-log-copy-error",
+    });
+    showDiagnosticsManualCopy(text);
+    showStatus("自动复制失败，已展开运行日志。", true, { diagnostics: true });
+  }
+}
+
 function getStatusText() {
   return els.statusText?.textContent || els.status?.textContent || "";
 }
 
+function installRuntimeLogHooks() {
+  loadRuntimeLogEntries();
+  recordDiagnosticEvent("app-session-start", {
+    href: window.location.href,
+    sessionId: runtimeLogSessionId,
+    userAgent: navigator.userAgent,
+  });
+
+  window.addEventListener("error", (event) => {
+    recordDiagnosticEvent("window-error", {
+      colno: event.colno,
+      error: summarizeError(event.error),
+      filename: event.filename,
+      lineno: event.lineno,
+      message: event.message,
+    });
+    flushRuntimeLogEntries();
+  });
+
+  window.addEventListener("unhandledrejection", (event) => {
+    recordDiagnosticEvent("window-unhandledrejection", {
+      reason: summarizeError(event.reason),
+    });
+    flushRuntimeLogEntries();
+  });
+}
+
 function showStatus(message, sticky = false, options = {}) {
+  recordDiagnosticEvent("status", {
+    diagnostics: options.diagnostics === true,
+    message,
+    sticky,
+  });
   window.clearTimeout(statusTimer);
   const showDiagnostics = options.diagnostics === true;
 
@@ -1299,6 +1563,12 @@ function openDatabase() {
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: "id" });
       }
+      if (!db.objectStoreNames.contains(CHUNK_STORE_NAME)) {
+        const chunkStore = db.createObjectStore(CHUNK_STORE_NAME, {
+          keyPath: ["storageId", "chunkIndex"],
+        });
+        chunkStore.createIndex("documentId", "documentId", { unique: false });
+      }
     };
 
     request.onsuccess = () => resolve(request.result);
@@ -1324,6 +1594,24 @@ async function withStore(mode, callback) {
   }
 }
 
+async function withChunkStore(mode, callback) {
+  const db = await openDatabase();
+
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(CHUNK_STORE_NAME, mode);
+      const store = tx.objectStore(CHUNK_STORE_NAME);
+      const result = callback(store);
+
+      tx.oncomplete = () => resolve(result);
+      tx.onerror = () => reject(tx.error || new Error("Chunk store operation failed."));
+      tx.onabort = () => reject(tx.error || new Error("Chunk store operation was aborted."));
+    });
+  } finally {
+    db.close();
+  }
+}
+
 function requestToPromise(request) {
   return new Promise((resolve, reject) => {
     request.onsuccess = () => resolve(request.result);
@@ -1343,35 +1631,360 @@ function getStoredBlobBytesLength(blobBytes) {
   return 0;
 }
 
-function reviveStoredDocumentRecord(record) {
-  if (!record || typeof record !== "object" || record.blob instanceof Blob) {
+function isEncryptedRecordStoredInChunks(record = {}) {
+  return (
+    isRecordEncrypted(record) &&
+    record.encryptedChunkStorage?.version === 1 &&
+    typeof record.encryptedChunkStorage?.storageId === "string" &&
+    record.encryptedChunkStorage.storageId.length > 0 &&
+    Number.isFinite(record.encryptedChunkStorage?.payloadSize) &&
+    Number.isFinite(record.encryptedChunkStorage?.chunkCount)
+  );
+}
+
+function getStoredPayloadSize(record = {}) {
+  if (isEncryptedRecordStoredInChunks(record)) {
+    return Math.max(0, Math.floor(record.encryptedChunkStorage.payloadSize));
+  }
+
+  return record.blob?.size || getStoredBlobBytesLength(record.blobBytes) || record.blobSize || 0;
+}
+
+function hasStoredDocumentPayload(record = {}) {
+  return Boolean(record?.blob || getStoredBlobBytesLength(record?.blobBytes) || isEncryptedRecordStoredInChunks(record));
+}
+
+function getEncryptedStorageChunkBytes(record = {}) {
+  const plainChunkSize = Math.max(1, Math.floor(record.encryption?.chunkSize || ENCRYPTION_CHUNK_SIZE));
+  return plainChunkSize + getEncryptionTagBytes(record.encryption);
+}
+
+function createDocumentChunkStorageId(documentId = "") {
+  return `${documentId}|${Date.now().toString(36)}|${Math.random().toString(36).slice(2)}`;
+}
+
+async function deleteDocumentChunksFromStore(chunksStore, documentId) {
+  if (!documentId) {
+    return;
+  }
+
+  const index = chunksStore.index("documentId");
+  await new Promise((resolve, reject) => {
+    const request = index.openKeyCursor(IDBKeyRange.only(documentId));
+
+    request.onerror = () => reject(request.error || new Error("Chunk store request failed."));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) {
+        resolve();
+        return;
+      }
+
+      chunksStore.delete(cursor.primaryKey);
+      cursor.continue();
+    };
+  });
+}
+
+async function deleteStoredDocumentChunks(documentId) {
+  return withChunkStore("readwrite", (chunksStore) =>
+    deleteDocumentChunksFromStore(chunksStore, documentId),
+  );
+}
+
+async function deleteStoredDocumentChunksExcept(documentId, keptStorageId) {
+  if (!documentId) {
+    return;
+  }
+
+  return withChunkStore("readwrite", (chunksStore) => {
+    const index = chunksStore.index("documentId");
+    const request = index.openKeyCursor(IDBKeyRange.only(documentId));
+
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) {
+        return;
+      }
+
+      const primaryKey = Array.isArray(cursor.primaryKey) ? cursor.primaryKey : [];
+      if (!keptStorageId || primaryKey[0] !== keptStorageId) {
+        chunksStore.delete(cursor.primaryKey);
+      }
+      cursor.continue();
+    };
+  });
+}
+
+async function putStoredDocumentChunks(chunks) {
+  if (!chunks?.length) {
+    return;
+  }
+
+  return withChunkStore("readwrite", (chunksStore) => {
+    for (const chunk of chunks) {
+      chunksStore.put(chunk);
+    }
+  });
+}
+
+async function putStoredDocumentChunksFromBlob(source) {
+  if (!source?.blob || !source.chunkCount) {
+    return;
+  }
+
+  recordDiagnosticEvent("chunk-storage-write-start", {
+    chunkCount: source.chunkCount,
+    documentId: source.documentId,
+    payloadSize: source.payloadSize,
+    storageChunkBytes: source.storageChunkBytes,
+    storageId: source.storageId,
+  });
+
+  for (let chunkIndex = 0; chunkIndex < source.chunkCount; chunkIndex += 1) {
+    const chunkStart = source.payloadOffset + chunkIndex * source.storageChunkBytes;
+    const chunkEnd = Math.min(source.payloadOffset + source.payloadSize, chunkStart + source.storageChunkBytes);
+    const bytes = await source.blob.slice(chunkStart, chunkEnd).arrayBuffer();
+
+    await putStoredDocumentChunks([{
+      byteLength: bytes.byteLength,
+      bytes,
+      chunkIndex,
+      documentId: source.documentId,
+      storageId: source.storageId,
+      updatedAt: source.updatedAt,
+    }]);
+
+    recordDiagnosticEvent("chunk-storage-write-chunk", {
+      byteLength: bytes.byteLength,
+      chunkIndex,
+      chunkCount: source.chunkCount,
+      documentId: source.documentId,
+      storageId: source.storageId,
+    });
+  }
+
+  recordDiagnosticEvent("chunk-storage-write-success", {
+    chunkCount: source.chunkCount,
+    documentId: source.documentId,
+    payloadSize: source.payloadSize,
+    storageId: source.storageId,
+  });
+}
+
+async function readStoredDocumentChunkBytes(record, chunkIndex) {
+  const storageId = record?.encryptedChunkStorage?.storageId;
+
+  if (!storageId) {
+    throw new Error("Encrypted document chunk storage is unavailable.");
+  }
+
+  const chunk = await withChunkStore("readonly", (chunksStore) =>
+    requestToPromise(chunksStore.get([storageId, chunkIndex])),
+  );
+  const length = getStoredBlobBytesLength(chunk?.bytes);
+
+  if (!length) {
+    recordDiagnosticEvent("chunk-storage-read-missing", {
+      chunkIndex,
+      documentId: record?.id,
+      storageId,
+    });
+    throw new Error(`Encrypted document chunk ${chunkIndex} is missing.`);
+  }
+
+  recordDiagnosticEvent("chunk-storage-read-success", {
+    byteLength: length,
+    chunkIndex,
+    documentId: record?.id,
+    storageId,
+  });
+  return chunk.bytes;
+}
+
+async function countStoredDocumentChunks(record = {}) {
+  if (!isEncryptedRecordStoredInChunks(record)) {
+    return 0;
+  }
+
+  const storageId = record.encryptedChunkStorage.storageId;
+
+  return withChunkStore("readonly", (chunksStore) => {
+    const index = chunksStore.index("documentId");
+
+    return new Promise((resolve, reject) => {
+      let count = 0;
+      const request = index.openKeyCursor(IDBKeyRange.only(record.id));
+
+      request.onerror = () => reject(request.error || new Error("Chunk store request failed."));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) {
+          resolve(count);
+          return;
+        }
+
+        const primaryKey = Array.isArray(cursor.primaryKey) ? cursor.primaryKey : [];
+        if (primaryKey[0] === storageId) {
+          count += 1;
+        }
+        cursor.continue();
+      };
+    });
+  });
+}
+
+async function materializeStoredRecordBlob(record = {}) {
+  if (record.blob instanceof Blob) {
     return record;
   }
 
-  if (!getStoredBlobBytesLength(record.blobBytes)) {
+  if (!isEncryptedRecordStoredInChunks(record)) {
     return record;
+  }
+
+  const parts = [];
+  const chunkCount = Math.max(0, Math.floor(record.encryptedChunkStorage.chunkCount));
+
+  for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+    parts.push(await readStoredDocumentChunkBytes(record, chunkIndex));
   }
 
   return {
     ...record,
-    blob: new Blob([record.blobBytes], {
+    blob: new Blob(parts, {
       type: record.blobType || record.type || "application/octet-stream",
     }),
   };
 }
 
-async function prepareDocumentRecordForStorage(record) {
-  if (!record || typeof record !== "object" || !(record.blob instanceof Blob) || !isRecordEncrypted(record)) {
+function reviveStoredDocumentRecord(record) {
+  if (!record || typeof record !== "object") {
     return record;
   }
 
+  const blobBytesLength = getStoredBlobBytesLength(record.blobBytes);
+
+  if (!blobBytesLength) {
+    return record;
+  }
+
+  const { blobBytes, ...rest } = record;
+
+  return {
+    ...rest,
+    blob: new Blob([blobBytes], {
+      type: record.blobType || record.type || "application/octet-stream",
+    }),
+  };
+}
+
+async function ensureEncryptedRecordStoredInChunks(record, reason = "open") {
+  if (!isRecordEncrypted(record) || isEncryptedRecordStoredInChunks(record)) {
+    return record;
+  }
+
+  const normalizedRecord = await normalizeEncryptedRecordPayload(record);
+
+  if (isEncryptedRecordStoredInChunks(normalizedRecord) || !(normalizedRecord.blob instanceof Blob)) {
+    return normalizedRecord;
+  }
+
+  if (!normalizedRecord.id) {
+    return normalizedRecord;
+  }
+
+  recordDiagnosticEvent("encrypted-chunk-migration-start", {
+    documentId: normalizedRecord.id,
+    reason,
+    record: summarizeRecordForDiagnostics(normalizedRecord),
+  });
+
+  try {
+    await putStoredDocument(normalizedRecord);
+
+    const storedRecord = await getStoredDocument(normalizedRecord.id).catch(() => null);
+
+    if (isEncryptedRecordStoredInChunks(storedRecord)) {
+      recordDiagnosticEvent("encrypted-chunk-migration-success", {
+        documentId: normalizedRecord.id,
+        reason,
+        record: summarizeRecordForDiagnostics(storedRecord),
+      });
+      return storedRecord;
+    }
+
+    recordDiagnosticEvent("encrypted-chunk-migration-unavailable", {
+      documentId: normalizedRecord.id,
+      reason,
+      record: summarizeRecordForDiagnostics(storedRecord || normalizedRecord),
+    });
+  } catch (error) {
+    console.warn(error);
+    recordDiagnosticEvent("encrypted-chunk-migration-error", {
+      documentId: normalizedRecord.id,
+      error: summarizeError(error),
+      reason,
+    });
+  }
+
+  return normalizedRecord;
+}
+
+async function prepareDocumentRecordForStorage(record) {
+  if (!record || typeof record !== "object") {
+    return { chunkSource: null, replaceChunks: false, storageRecord: record };
+  }
+
+  if (!isRecordEncrypted(record)) {
+    return { chunkSource: null, replaceChunks: true, storageRecord: record };
+  }
+
+  if (isEncryptedRecordStoredInChunks(record) && !(record.blob instanceof Blob)) {
+    return { chunkSource: null, replaceChunks: false, storageRecord: record };
+  }
+
+  if (!(record.blob instanceof Blob)) {
+    return { chunkSource: null, replaceChunks: false, storageRecord: record };
+  }
+
+  const payloadOffset = getEncryptedPayloadOffset(record);
+  const payloadSize = getEncryptedPayloadSize(record);
+  const storageChunkBytes = getEncryptedStorageChunkBytes(record);
+  const chunkCount = Math.max(1, Math.ceil(payloadSize / storageChunkBytes));
+  const storageId = createDocumentChunkStorageId(record.id || "");
+  const now = Date.now();
+
   const storageRecord = {
     ...record,
-    blobSize: record.blob.size,
+    blobSize: payloadSize,
     blobType: record.blob.type || "application/octet-stream",
+    encryptedChunkStorage: {
+      chunkCount,
+      chunkSize: storageChunkBytes,
+      payloadSize,
+      storageId,
+      version: 1,
+    },
   };
+  delete storageRecord.blob;
   delete storageRecord.blobBytes;
-  return storageRecord;
+  delete storageRecord.encryptedPayloadOffset;
+  delete storageRecord.encryptedPayloadSize;
+  return {
+    chunkSource: {
+      blob: record.blob,
+      chunkCount,
+      documentId: record.id,
+      payloadOffset,
+      payloadSize,
+      storageChunkBytes,
+      storageId,
+      updatedAt: now,
+    },
+    replaceChunks: true,
+    storageRecord,
+  };
 }
 
 function hashString(input) {
@@ -1390,7 +2003,7 @@ function createDocumentId(name, size, lastModified = 0) {
 }
 
 function isLibraryDocument(record) {
-  return Boolean(record?.blob && typeof record.id === "string" && record.id.startsWith(DOCUMENT_ID_PREFIX));
+  return Boolean(hasStoredDocumentPayload(record) && typeof record.id === "string" && record.id.startsWith(DOCUMENT_ID_PREFIX));
 }
 
 function getDocumentFormatFromName(name = "") {
@@ -1499,12 +2112,28 @@ async function getStoredDocument(documentId) {
 }
 
 async function putStoredDocument(record) {
-  const storageRecord = await prepareDocumentRecordForStorage(record);
-  return withStore("readwrite", (store) => requestToPromise(store.put(storageRecord)));
+  const { chunkSource, replaceChunks, storageRecord } = await prepareDocumentRecordForStorage(record);
+
+  if (chunkSource) {
+    await putStoredDocumentChunksFromBlob(chunkSource);
+  }
+
+  const result = await withStore("readwrite", (store) => requestToPromise(store.put(storageRecord)));
+
+  if (replaceChunks) {
+    await deleteStoredDocumentChunksExcept(
+      storageRecord.id,
+      storageRecord.encryptedChunkStorage?.storageId || "",
+    ).catch((error) => console.warn(error));
+  }
+
+  return result;
 }
 
 async function deleteStoredDocument(documentId) {
-  return withStore("readwrite", (store) => requestToPromise(store.delete(documentId)));
+  const result = await withStore("readwrite", (store) => requestToPromise(store.delete(documentId)));
+  await deleteStoredDocumentChunks(documentId).catch((error) => console.warn(error));
+  return result;
 }
 
 async function getAllStoredRecords() {
@@ -1522,7 +2151,7 @@ async function migrateLegacyDocument() {
   const id = createDocumentId(legacy.name || "未命名.pdf", legacy.size || legacy.blob.size || 0, 0);
   const existing = await getStoredDocument(id).catch(() => null);
 
-  if (existing?.blob) {
+  if (hasStoredDocumentPayload(existing)) {
     await deleteStoredDocument(LAST_DOCUMENT_ID).catch(() => {});
     return existing;
   }
@@ -1589,7 +2218,7 @@ async function touchStoredDocument(documentId, replacementRecord = null) {
       ? replacementRecord
       : await getStoredDocument(documentId).catch(() => null);
 
-  if (!record?.blob) {
+  if (!hasStoredDocumentPayload(record)) {
     return;
   }
 
@@ -1695,7 +2324,7 @@ async function encryptDocumentFromSource(record, source, plainName, password, on
 async function reencryptEncryptedRecord(record, oldPassword, newPassword, onProgress = () => {}) {
   const oldKey = await verifyEncryptedBackupRecord(record, oldPassword);
   const plainName = await decryptRecordName(record, oldKey);
-  const source = new EncryptedDocumentSource(record, oldKey);
+  const source = createEncryptedDocumentSourceWithKey(record, oldKey);
   return encryptDocumentFromSource(record, source, plainName, newPassword, onProgress);
 }
 
@@ -1707,6 +2336,11 @@ async function saveImportedEncryptedBackupRecord(
 ) {
   const existing = await getStoredDocument(record.id).catch(() => null);
   let recordToSave = record;
+  recordDiagnosticEvent("encrypted-backup-save-start", {
+    backupPasswordMatchesTarget: backupPassword === targetPassword,
+    existing: hasStoredDocumentPayload(existing),
+    record: summarizeRecordForDiagnostics(record),
+  });
 
   if (backupPassword === targetPassword) {
     await verifyEncryptedBackupRecord(record, backupPassword);
@@ -1721,6 +2355,9 @@ async function saveImportedEncryptedBackupRecord(
   };
 
   await putStoredDocument(recordToSave);
+  recordDiagnosticEvent("encrypted-backup-save-success", {
+    record: summarizeRecordForDiagnostics(recordToSave),
+  });
 
   if (!existing) {
     deleteDocumentProgress(recordToSave.id);
@@ -1730,9 +2367,9 @@ async function saveImportedEncryptedBackupRecord(
 }
 
 async function exportEncryptedDocumentBackup(documentId) {
-  const record = await getStoredDocument(documentId).catch(() => null);
+  let record = await getStoredDocument(documentId).catch(() => null);
 
-  if (!record?.blob) {
+  if (!hasStoredDocumentPayload(record)) {
     showStatus("这个文件已经不在本机存储里。");
     await renderLibraryList();
     return;
@@ -1745,6 +2382,7 @@ async function exportEncryptedDocumentBackup(documentId) {
 
   try {
     showStatus("正在准备导出加密文件...", true);
+    record = await materializeStoredRecordBlob(record);
     const backupBlob = await createEncryptedBackupBlob(record);
     triggerDownload(backupBlob, createEncryptedBackupFileName(record));
     showStatus("已开始导出加密文件。");
@@ -1781,7 +2419,7 @@ function hideBackupPrompt(options = {}) {
 }
 
 function showBackupExportPrompt(record) {
-  if (!record?.blob) {
+  if (!hasStoredDocumentPayload(record)) {
     return;
   }
 
@@ -2397,6 +3035,26 @@ async function waitForPdfOperation(promise, {
   return Promise.race(pending);
 }
 
+function createEncryptedDocumentSourceWithKey(record, key) {
+  const options = isEncryptedRecordStoredInChunks(record)
+    ? {
+        readEncryptedBytes: async ({ chunkIndex, expectedLength }) => {
+          const bytes = await readStoredDocumentChunkBytes(record, chunkIndex);
+          const byteLength = getStoredBlobBytesLength(bytes);
+
+          if (byteLength !== expectedLength) {
+            throw new Error(
+              `Encrypted document chunk ${chunkIndex} has ${byteLength} bytes; expected ${expectedLength}.`,
+            );
+          }
+
+          return bytes;
+        },
+      }
+    : {};
+  return new EncryptedDocumentSource(record, key, options);
+}
+
 async function createDocumentSourceFromRecord(record) {
   if (!isRecordEncrypted(record)) {
     return new BlobDocumentSource(record.blob);
@@ -2406,9 +3064,9 @@ async function createDocumentSourceFromRecord(record) {
     throw new Error("Encrypted document is locked.");
   }
 
-  const payloadRecord = await normalizeEncryptedRecordPayload(record);
+  const payloadRecord = await ensureEncryptedRecordStoredInChunks(record, "source");
   const key = await getEncryptionKeyForRecord(payloadRecord);
-  return new EncryptedDocumentSource(payloadRecord, key);
+  return createEncryptedDocumentSourceWithKey(payloadRecord, key);
 }
 
 async function encryptDocumentRecord(record, password, onProgress = () => {}) {
@@ -4358,7 +5016,8 @@ async function restoreDeferredPdfScrollMode(documentId, openToken, restoreState)
     const rendered = await renderContinuousDocument(targetPage, {
       behavior: "auto",
       restoreScroll: true,
-      throwOnError: true,
+      suppressFailureStatus: true,
+      throwOnError: false,
     });
 
     if (!isDocumentOpenCurrent(openToken) || state.documentId !== documentId) {
@@ -4369,9 +5028,19 @@ async function restoreDeferredPdfScrollMode(documentId, openToken, restoreState)
       throw new Error(`Deferred continuous PDF page ${targetPage} did not render.`);
     }
 
+    const targetRendered = await waitForDeferredContinuousTargetRender(documentId, openToken, targetPage);
+    if (!isDocumentOpenCurrent(openToken) || state.documentId !== documentId) {
+      return;
+    }
+
+    if (targetRendered !== true) {
+      throw new Error(`Deferred continuous PDF page ${targetPage} did not finish rendering.`);
+    }
+
     saveReaderState();
     recordDiagnosticEvent("pdf-deferred-scroll-restore-success", {
       documentId,
+      targetRendered,
       targetPage,
     });
   } catch (error) {
@@ -4407,6 +5076,34 @@ async function restoreDeferredPdfScrollMode(documentId, openToken, restoreState)
   }
 }
 
+async function waitForDeferredContinuousTargetRender(documentId, openToken, targetPage) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (!isDocumentOpenCurrent(openToken) || state.documentId !== documentId || !pdfDoc || !isScrollMode()) {
+      return false;
+    }
+
+    const shell = els.continuousPages.querySelector(`[data-page="${targetPage}"]`);
+
+    if (shell?.dataset.rendered === "true") {
+      return true;
+    }
+
+    if (
+      shell &&
+      shell.dataset.rendering !== "true" &&
+      !pendingContinuousPages.has(targetPage) &&
+      !continuousRenderPromises.has(targetPage) &&
+      !pageRenderTasks.has(targetPage)
+    ) {
+      scheduleContinuousPageRender(targetPage, renderToken);
+    }
+
+    await wait(120);
+  }
+
+  return false;
+}
+
 async function renderContinuousDocument(pageNumber = state.page, options = {}) {
   if (!pdfDoc) {
     return false;
@@ -4428,6 +5125,12 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
     1,
     pdfDoc.numPages,
   );
+  recordDiagnosticEvent("render-continuous-start", {
+    options,
+    pageNumber,
+    shouldRestoreScroll,
+    targetPage,
+  });
   state.page = targetPage;
   updateViewerMode();
   updateControls();
@@ -4501,6 +5204,10 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
     releaseScrollTracking();
     saveReaderState();
     hideStatus();
+    recordDiagnosticEvent("render-continuous-success", {
+      page: targetPage,
+      renderedTargetPage,
+    });
     return true;
   } catch (error) {
     if (documentToken !== documentOpenToken) {
@@ -4514,18 +5221,20 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
     if (options.throwOnError) {
       throw error;
     }
-    recordDiagnosticEvent("pdf-continuous-render-error", {
-      documentId: state.documentId,
-      error: summarizeError(error),
-      page: targetPage,
-    });
-    console.error(error);
-    showDiagnosticFailureStatus("连续滚动模式准备失败。", {
-      documentId: state.documentId,
-      error: summarizeError(error),
-      page: targetPage,
-      phase: "render-continuous-error",
-    });
+    if (!options.suppressFailureStatus) {
+      recordDiagnosticEvent("pdf-continuous-render-error", {
+        documentId: state.documentId,
+        error: summarizeError(error),
+        page: targetPage,
+      });
+      console.error(error);
+      showDiagnosticFailureStatus("连续滚动模式准备失败。", {
+        documentId: state.documentId,
+        error: summarizeError(error),
+        page: targetPage,
+        phase: "render-continuous-error",
+      });
+    }
     return false;
   } finally {
     releaseScrollTracking();
@@ -4554,6 +5263,11 @@ async function goToPage(pageNumber) {
   }
 
   const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
+  recordDiagnosticEvent("go-to-page", {
+    mode: state.mode,
+    requestedPage: pageNumber,
+    targetPage,
+  });
 
   if (isScrollMode()) {
     state.page = targetPage;
@@ -4584,9 +5298,17 @@ async function setReadMode(mode) {
   }
 
   if (state.mode === mode) {
+    recordDiagnosticEvent("set-read-mode-same", {
+      mode,
+    });
     return;
   }
 
+  recordDiagnosticEvent("set-read-mode", {
+    from: state.mode,
+    page: state.page,
+    to: mode,
+  });
   state.mode = mode;
   if (mode === READ_MODES.SCROLL) {
     state.scrollPage = state.page;
@@ -6204,6 +6926,13 @@ async function loadPdfFromSource(
     setReaderVisible(true);
     updateViewerMode();
     await renderInitialPdfViewWithFallback(openToken, options);
+    recordDiagnosticEvent("load-pdf-from-source-success", {
+      documentId: state.documentId,
+      fileName: state.fileName,
+      numPages: pdfDoc.numPages,
+      requestedPage,
+      sourceLength: source.length,
+    });
     return true;
   } catch (error) {
     if (activePdfLoadingTask === loadingTask) {
@@ -6270,7 +6999,7 @@ async function loadPdfFromRecord(
 }
 
 async function openDocumentRecord(record, options = {}) {
-  if (!record?.blob) {
+  if (!hasStoredDocumentPayload(record)) {
     showStatus("这个文件记录不可用。");
     return false;
   }
@@ -6287,7 +7016,7 @@ async function openDocumentRecord(record, options = {}) {
   showStatus(`正在打开 ${openingLabel}...`, true);
 
   try {
-    record = await normalizeEncryptedRecordPayload(record);
+    record = await ensureEncryptedRecordStoredInChunks(record, "open");
     rememberOpenDiagnostic({
       documentId: record.id || "",
       phase: "open-document-record-normalized",
@@ -6410,7 +7139,7 @@ async function openDocumentFromLibrary(documentId) {
       return false;
     }
 
-    if (!record?.blob) {
+    if (!hasStoredDocumentPayload(record)) {
       showStatus("这个文件已经不在本机存储里。");
       renderLibraryList();
       return false;
@@ -6434,7 +7163,7 @@ async function openDocumentFromLibrary(documentId) {
 
 async function readDocumentsNeedingEncryptionMigration() {
   const records = await readLibraryDocuments();
-  return records.filter((record) => record?.blob && recordNeedsEncryptionMigration(record));
+  return records.filter((record) => hasStoredDocumentPayload(record) && recordNeedsEncryptionMigration(record));
 }
 
 function updateEncryptionPromptState({ busy = false, progress = 0, text = "" } = {}) {
@@ -6573,6 +7302,12 @@ async function handleEncryptionMigrationSubmit(event) {
 }
 
 async function handleFileSelection(file) {
+  recordDiagnosticEvent("handle-file-selection-start", {
+    encryptedBackup: isEncryptedBackupFile(file),
+    file: summarizeFile(file),
+    supportedDocument: isSupportedDocumentFile(file),
+  });
+
   if (isEncryptedBackupFile(file)) {
     await handleEncryptedBackupSelectionV2(file);
     return;
@@ -6591,9 +7326,17 @@ async function handleFileSelection(file) {
     const record = await saveDocumentFile(file);
     deleteDocumentProgress(record.id);
     await openDocumentRecord(record, { resetProgress: true });
+    recordDiagnosticEvent("handle-file-selection-success", {
+      file: summarizeFile(file),
+      record: summarizeRecordForDiagnostics(record),
+    });
     showStatus("已加入书架。");
   } catch (error) {
     console.error(error);
+    recordDiagnosticEvent("handle-file-selection-error", {
+      error: summarizeError(error),
+      file: summarizeFile(file),
+    });
     const format = getDocumentFormatFromFile(file);
     showStatus("文件已选择，但保存到书架失败。", true);
 
@@ -6699,17 +7442,17 @@ async function restoreLastDocument() {
   try {
     let record = state.documentId ? await getStoredDocument(state.documentId) : null;
 
-    if (!record?.blob) {
+    if (!hasStoredDocumentPayload(record)) {
       const documents = await readLibraryDocuments();
       record = documents[0] || null;
     }
 
-    if (!record?.blob) {
+    if (!hasStoredDocumentPayload(record)) {
       renderLibraryList();
       return;
     }
 
-    record = await normalizeEncryptedRecordPayload(record);
+    record = await ensureEncryptedRecordStoredInChunks(record, "restore");
 
     state.documentId = record.id;
     state.format = getDocumentFormat(record);
@@ -7344,7 +8087,7 @@ async function renderLibraryList() {
       name.textContent = await getRecordDisplayName(record);
 
       meta.className = "library-meta";
-      meta.textContent = `${isActive ? "正在阅读 · " : ""}${format.toUpperCase()} · ${progressLabel} · ${formatFileSize(record.size || record.blob?.size || 0)}${isRecordEncrypted(record) ? " · 已加密" : ""}`;
+      meta.textContent = `${isActive ? "正在阅读 · " : ""}${format.toUpperCase()} · ${progressLabel} · ${formatFileSize(record.size || getStoredPayloadSize(record))}${isRecordEncrypted(record) ? " · 已加密" : ""}`;
 
       actions.className = "library-actions";
 
@@ -7463,6 +8206,15 @@ function restoreReaderPositionAfterResume() {
 }
 
 function openFilePicker() {
+  recordDiagnosticEvent("open-file-picker", {
+    blocked:
+      !els.lockOverlay.hidden ||
+      !els.encryptionOverlay.hidden ||
+      !els.backupOverlay.hidden ||
+      !els.imageOverlay.hidden ||
+      !els.diagnosticsOverlay.hidden,
+  });
+
   if (
     !els.lockOverlay.hidden ||
     !els.encryptionOverlay.hidden ||
@@ -7486,6 +8238,7 @@ function preventLockScroll(event) {
 function wireEvents() {
   els.openButton.addEventListener("click", openFilePicker);
   els.emptyOpenButton.addEventListener("click", openFilePicker);
+  els.runtimeLogButton?.addEventListener("click", copyRuntimeLogToClipboard);
   els.statusDiagnosticsButton?.addEventListener("click", copyDiagnosticsToClipboard);
   els.fullscreenButton.addEventListener("click", () => {
     toggleAppFullscreen();
@@ -7569,6 +8322,10 @@ function wireEvents() {
 
   els.fileInput.addEventListener("change", () => {
     const file = els.fileInput.files?.[0];
+    recordDiagnosticEvent("file-input-change", {
+      file: summarizeFile(file),
+      hasFile: Boolean(file),
+    });
     if (file) {
       handleFileSelection(file);
     }
@@ -7651,8 +8408,12 @@ function wireEvents() {
   });
 
   document.addEventListener("visibilitychange", () => {
+    recordDiagnosticEvent("visibility-change", {
+      visibilityState: document.visibilityState,
+    });
     if (document.visibilityState === "hidden") {
       persistReaderPositionNow();
+      flushRuntimeLogEntries();
       return;
     }
 
@@ -7661,20 +8422,36 @@ function wireEvents() {
     scheduleContinuousHealthCheck(300);
   });
 
-  window.addEventListener("pagehide", persistReaderPositionNow);
-  window.addEventListener("beforeunload", persistReaderPositionNow);
+  window.addEventListener("pagehide", () => {
+    recordDiagnosticEvent("pagehide");
+    persistReaderPositionNow();
+    flushRuntimeLogEntries();
+  });
+  window.addEventListener("beforeunload", () => {
+    recordDiagnosticEvent("beforeunload");
+    persistReaderPositionNow();
+    flushRuntimeLogEntries();
+  });
   window.addEventListener("pageshow", () => {
+    recordDiagnosticEvent("pageshow", {
+      persisted: performance?.getEntriesByType?.("navigation")?.[0]?.type || "",
+    });
     lastViewportChangeAt = Date.now();
     restoreReaderPositionAfterResume();
     scheduleContinuousHealthCheck(300);
   });
   window.addEventListener("focus", () => {
+    recordDiagnosticEvent("window-focus");
     lastViewportChangeAt = Date.now();
     restoreReaderPositionAfterResume();
     scheduleContinuousHealthCheck(300);
   });
 
   window.addEventListener("resize", () => {
+    recordDiagnosticEvent("window-resize", {
+      height: window.innerHeight,
+      width: window.innerWidth,
+    });
     lastViewportChangeAt = Date.now();
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
@@ -8116,28 +8893,50 @@ async function runEncryptedSwitchSelfTest() {
     (store) => requestToPromise(store.get(encryptedId)),
   );
 
-  if (!storedEncryptedRecord?.blob) {
+  if (!hasStoredDocumentPayload(storedEncryptedRecord)) {
     throw new Error("Stored encrypted self-test record is missing.");
   }
 
-  if (!(rawStoredEncryptedRecord?.blob instanceof Blob)) {
-    throw new Error("Imported encrypted self-test record was not stored as a Blob.");
+  if (rawStoredEncryptedRecord?.blob instanceof Blob) {
+    throw new Error("Imported encrypted self-test record was stored as a live Blob.");
   }
 
-  if (getStoredBlobBytesLength(rawStoredEncryptedRecord?.blobBytes)) {
-    throw new Error("Imported encrypted self-test record still uses legacy array-buffer storage.");
+  const storedBlobBytesLength = getStoredBlobBytesLength(rawStoredEncryptedRecord?.blobBytes);
+
+  if (storedBlobBytesLength) {
+    throw new Error("Imported encrypted self-test record still uses whole-file byte storage.");
+  }
+
+  if (
+    !isEncryptedRecordStoredInChunks(storedEncryptedRecord) ||
+    !isEncryptedRecordStoredInChunks(rawStoredEncryptedRecord)
+  ) {
+    throw new Error("Imported encrypted self-test record is missing chunked storage metadata.");
+  }
+
+  const expectedEncryptedPayloadSize = getExpectedEncryptedPayloadSize(storedEncryptedRecord);
+  const storedChunkCount = await countStoredDocumentChunks(storedEncryptedRecord);
+
+  if (storedChunkCount !== storedEncryptedRecord.encryptedChunkStorage.chunkCount) {
+    throw new Error("Imported encrypted self-test chunk count does not match metadata.");
+  }
+
+  if (storedChunkCount < 2) {
+    throw new Error("Imported encrypted self-test did not create multiple storage chunks.");
   }
 
   if (
     getEncryptedPayloadOffset(storedEncryptedRecord) !== 0 ||
     Number.isFinite(storedEncryptedRecord.encryptedPayloadSize) ||
-    storedEncryptedRecord.blob.size !== getExpectedEncryptedPayloadSize(storedEncryptedRecord)
+    getEncryptedPayloadSize(storedEncryptedRecord) !== expectedEncryptedPayloadSize ||
+    storedEncryptedRecord.encryptedChunkStorage.payloadSize !== expectedEncryptedPayloadSize
   ) {
     throw new Error("Imported encrypted self-test record was not saved as a payload-only library record.");
   }
 
+  const firstStoredChunk = new Uint8Array(await readStoredDocumentChunkBytes(storedEncryptedRecord, 0));
   const storedPrefix = new TextDecoder().decode(
-    await storedEncryptedRecord.blob.slice(0, ENCRYPTED_BACKUP_MAGIC.length).arrayBuffer(),
+    firstStoredChunk.subarray(0, ENCRYPTED_BACKUP_MAGIC.length),
   );
 
   if (storedPrefix === ENCRYPTED_BACKUP_MAGIC) {
@@ -8303,6 +9102,7 @@ function initializeVersionBadge() {
 }
 
 initializeVersionBadge();
+installRuntimeLogHooks();
 wireEvents();
 setReaderVisible(false);
 updateViewerMode();
