@@ -228,6 +228,7 @@ let runtimeLogFlushTimer = null;
 let diagnosticsBuildPromise = null;
 let latestDiagnosticsText = "";
 let latestOpenDiagnostic = null;
+let deferredPdfProgressSaveGuard = null;
 let resizeTimer = null;
 let scrollStateTimer = null;
 let touchStart = null;
@@ -245,6 +246,7 @@ let tocWindowEnd = 0;
 const pageRenderTasks = new Map();
 const continuousRenderPromises = new Map();
 const pendingContinuousPages = new Map();
+const continuousPinnedPages = new Set();
 const continuousRenderRuns = new Map();
 const continuousBlankRetries = new Map();
 const pagedBlankRetries = new Map();
@@ -295,6 +297,7 @@ async function destroyPdfLoadingTask(loadingTask) {
 function beginDocumentOpen() {
   documentOpenToken += 1;
   activePdfRangeFailurePromise = null;
+  deferredPdfProgressSaveGuard = null;
   interruptCurrentRender();
 
   if (activePdfLoadingTask) {
@@ -303,6 +306,24 @@ function beginDocumentOpen() {
   }
 
   return documentOpenToken;
+}
+
+function isDeferredPdfProgressSaveGuardActive() {
+  return Boolean(
+    deferredPdfProgressSaveGuard &&
+      deferredPdfProgressSaveGuard.openToken === documentOpenToken &&
+      deferredPdfProgressSaveGuard.documentId === state.documentId,
+  );
+}
+
+function clearDeferredPdfProgressSaveGuard(documentId, openToken) {
+  if (
+    deferredPdfProgressSaveGuard &&
+    deferredPdfProgressSaveGuard.documentId === documentId &&
+    deferredPdfProgressSaveGuard.openToken === openToken
+  ) {
+    deferredPdfProgressSaveGuard = null;
+  }
 }
 
 function getEpubChapterTotal() {
@@ -1491,11 +1512,14 @@ function readSavedState() {
   }
 }
 
-function saveReaderState() {
+function saveReaderState(options = {}) {
   try {
     if (isScrollMode()) {
       captureContinuousScrollPosition();
     }
+
+    const commitProgress =
+      options.commitProgress !== false && !isDeferredPdfProgressSaveGuardActive();
 
     window.localStorage.setItem(
       STATE_KEY,
@@ -1513,7 +1537,10 @@ function saveReaderState() {
         savedAt: Date.now(),
       }),
     );
-    saveDocumentProgress();
+
+    if (commitProgress) {
+      saveDocumentProgress();
+    }
   } catch {
     // Some private browsing modes disable persistent storage.
   }
@@ -2843,6 +2870,7 @@ function clearContinuousPages() {
   pageRenderTasks.clear();
   continuousRenderPromises.clear();
   pendingContinuousPages.clear();
+  continuousPinnedPages.clear();
   continuousRenderRuns.clear();
   continuousBlankRetries.clear();
   pagedBlankRetries.clear();
@@ -3210,7 +3238,10 @@ async function renderPage(pageNumber, options = {}) {
           state.page === targetPage &&
           !isScrollMode()
         ) {
-          renderPage(targetPage, { blankRetryCount: blankRetryCount + 1 }).catch((error) => {
+          renderPage(targetPage, {
+            blankRetryCount: blankRetryCount + 1,
+            commitProgress: options.commitProgress !== false,
+          }).catch((error) => {
             console.error(error);
           });
         }
@@ -3223,7 +3254,9 @@ async function renderPage(pageNumber, options = {}) {
     commitRenderedCanvas(scratchCanvas, els.canvas);
     releaseCanvasBitmap(scratchCanvas, { removeStyle: true });
     els.canvasWrap.scrollTop = 0;
-    saveReaderState();
+    saveReaderState({
+      commitProgress: options.commitProgress !== false,
+    });
     hideStatus();
     return true;
   } catch (error) {
@@ -3449,7 +3482,11 @@ function getContinuousViewportWindow(extraViewports = getContinuousKeepViewports
 }
 
 function isPinnedContinuousPage(pageNumber) {
-  return pageNumber === state.page || pageNumber === state.scrollPage;
+  return (
+    continuousPinnedPages.has(pageNumber) ||
+    pageNumber === state.page ||
+    pageNumber === state.scrollPage
+  );
 }
 
 function isContinuousShellNearViewport(shell, extraViewports = getContinuousKeepViewports()) {
@@ -3636,7 +3673,11 @@ function pruneContinuousPages() {
   for (const [pageNumber, task] of pageRenderTasks) {
     const shell = els.continuousPages.querySelector(`[data-page="${pageNumber}"]`);
 
-    if (!shell || !isContinuousShellNearViewport(shell, getContinuousRenderViewports())) {
+    if (
+      !shell ||
+      (!isPinnedContinuousPage(pageNumber) &&
+        !isContinuousShellNearViewport(shell, getContinuousRenderViewports()))
+    ) {
       task.cancel();
       pageRenderTasks.delete(pageNumber);
     }
@@ -3648,7 +3689,10 @@ function pruneContinuousPages() {
   const keptShells = [];
 
   for (const shell of renderedShells) {
-    if (isContinuousShellNearViewport(shell)) {
+    if (
+      isPinnedContinuousPage(getContinuousShellPageNumber(shell)) ||
+      isContinuousShellNearViewport(shell)
+    ) {
       keptShells.push(shell);
     } else {
       releaseContinuousCanvas(shell);
@@ -3702,7 +3746,10 @@ function getNextQueuedContinuousPage() {
       continue;
     }
 
-    if (!isContinuousShellNearViewport(shell, getContinuousRenderViewports())) {
+    if (
+      !isPinnedContinuousPage(pageNumber) &&
+      !isContinuousShellNearViewport(shell, getContinuousRenderViewports())
+    ) {
       pendingContinuousPages.delete(pageNumber);
       continue;
     }
@@ -4870,6 +4917,7 @@ function handleContinuousEdgeJump(edge) {
 async function renderInitialPdfView(openToken, options = {}) {
   const rendered = await renderCurrentView(state.page, {
     behavior: "auto",
+    commitProgress: options.commitProgress !== false,
     restoreScroll: true,
     throwOnError: true,
   });
@@ -4926,6 +4974,7 @@ async function renderInitialPdfViewWithFallback(openToken, options = {}) {
 
     const fallbackRendered = await renderCurrentView(1, {
       behavior: "auto",
+      commitProgress: options.commitProgress !== false,
       restoreScroll: false,
       throwOnError: true,
     });
@@ -4984,6 +5033,7 @@ function scheduleDeferredPdfScrollRestore(documentId, openToken, restoreState) {
 
 async function restoreDeferredPdfScrollMode(documentId, openToken, restoreState) {
   if (!restoreState || !isDocumentOpenCurrent(openToken) || state.documentId !== documentId || !pdfDoc) {
+    clearDeferredPdfProgressSaveGuard(documentId, openToken);
     return;
   }
 
@@ -4993,6 +5043,7 @@ async function restoreDeferredPdfScrollMode(documentId, openToken, restoreState)
     pdfDoc.numPages,
   );
   const fallbackPage = clamp(Math.round(state.page || targetPage), 1, pdfDoc.numPages);
+  continuousPinnedPages.add(targetPage);
 
   recordDiagnosticEvent("pdf-deferred-scroll-restore-start", {
     documentId,
@@ -5015,12 +5066,14 @@ async function restoreDeferredPdfScrollMode(documentId, openToken, restoreState)
 
     const rendered = await renderContinuousDocument(targetPage, {
       behavior: "auto",
+      commitProgress: false,
       restoreScroll: true,
       suppressFailureStatus: true,
       throwOnError: false,
     });
 
     if (!isDocumentOpenCurrent(openToken) || state.documentId !== documentId) {
+      clearDeferredPdfProgressSaveGuard(documentId, openToken);
       return;
     }
 
@@ -5030,6 +5083,7 @@ async function restoreDeferredPdfScrollMode(documentId, openToken, restoreState)
 
     const targetRendered = await waitForDeferredContinuousTargetRender(documentId, openToken, targetPage);
     if (!isDocumentOpenCurrent(openToken) || state.documentId !== documentId) {
+      clearDeferredPdfProgressSaveGuard(documentId, openToken);
       return;
     }
 
@@ -5037,6 +5091,8 @@ async function restoreDeferredPdfScrollMode(documentId, openToken, restoreState)
       throw new Error(`Deferred continuous PDF page ${targetPage} did not finish rendering.`);
     }
 
+    captureContinuousScrollPosition();
+    clearDeferredPdfProgressSaveGuard(documentId, openToken);
     saveReaderState();
     recordDiagnosticEvent("pdf-deferred-scroll-restore-success", {
       documentId,
@@ -5045,6 +5101,7 @@ async function restoreDeferredPdfScrollMode(documentId, openToken, restoreState)
     });
   } catch (error) {
     if (!isDocumentOpenCurrent(openToken) || state.documentId !== documentId || !pdfDoc) {
+      clearDeferredPdfProgressSaveGuard(documentId, openToken);
       return;
     }
 
@@ -5063,16 +5120,21 @@ async function restoreDeferredPdfScrollMode(documentId, openToken, restoreState)
     updateViewerMode();
     updateControls();
 
-    await renderPage(fallbackPage).catch((renderError) => {
+    await renderPage(fallbackPage, { commitProgress: false }).catch((renderError) => {
       console.error(renderError);
     });
-    saveReaderState();
+    window.clearTimeout(scrollStateTimer);
+    scrollStateTimer = null;
+    saveReaderState({ commitProgress: false });
+    clearDeferredPdfProgressSaveGuard(documentId, openToken);
     showDiagnosticFailureStatus("已用分页模式打开，连续滚动恢复失败。", {
       documentId,
       error: summarizeError(error),
       page: targetPage,
       phase: "deferred-scroll-restore-error",
     });
+  } finally {
+    continuousPinnedPages.delete(targetPage);
   }
 }
 
@@ -5160,7 +5222,9 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
       });
     }
 
-    releaseScrollTracking();
+    if (!shouldRestoreScroll) {
+      releaseScrollTracking();
+    }
     const scrollTopAfterInitialPosition = els.canvasWrap.scrollTop;
     let renderedTargetPage = await renderContinuousPage(targetPage, token, {
       force: true,
@@ -5195,6 +5259,11 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
       }
     }
 
+    if (shouldRestoreScroll) {
+      await waitForNextFrame();
+      await waitForNextFrame();
+    }
+
     if (shouldPrefetchContinuousNeighborPages()) {
       scheduleContinuousPageRender(targetPage - 1, token);
       scheduleContinuousPageRender(targetPage + 1, token);
@@ -5202,7 +5271,9 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
     queueVisibleContinuousPages(token);
     pruneContinuousPages();
     releaseScrollTracking();
-    saveReaderState();
+    saveReaderState({
+      commitProgress: options.commitProgress !== false,
+    });
     hideStatus();
     recordDiagnosticEvent("render-continuous-success", {
       page: targetPage,
@@ -6946,6 +7017,7 @@ async function loadPdfFromSource(
     }
 
     if (!isDocumentOpenCurrent(openToken)) {
+      clearDeferredPdfProgressSaveGuard(meta.id || state.documentId || "", openToken);
       return false;
     }
 
@@ -7059,6 +7131,12 @@ async function openDocumentRecord(record, options = {}) {
       format === DOCUMENT_FORMATS.PDF && options.resetProgress !== true
         ? createDeferredPdfScrollRestoreState()
         : null;
+    if (deferredScrollRestore) {
+      deferredPdfProgressSaveGuard = {
+        documentId: record.id,
+        openToken,
+      };
+    }
     preparePagedPdfOpenForDeferredScrollRestore(deferredScrollRestore);
 
     let opened = false;
@@ -7071,11 +7149,15 @@ async function openDocumentRecord(record, options = {}) {
         { id: record.id, name: state.fileName },
         state.page,
         openToken,
-        { fallbackToFirstPageOnRenderError: options.resetProgress !== true },
+        {
+          commitProgress: !deferredScrollRestore,
+          fallbackToFirstPageOnRenderError: options.resetProgress !== true,
+        },
       ) === true;
     }
 
     if (!isDocumentOpenCurrent(openToken)) {
+      clearDeferredPdfProgressSaveGuard(record.id, openToken);
       return false;
     }
 
@@ -7088,6 +7170,7 @@ async function openDocumentRecord(record, options = {}) {
       Object.assign(state, previousState);
       updateViewerMode();
       updateControls();
+      clearDeferredPdfProgressSaveGuard(record.id, openToken);
       return false;
     }
 
@@ -7113,6 +7196,7 @@ async function openDocumentRecord(record, options = {}) {
       record: summarizeRecordForDiagnostics(record),
     });
 
+    clearDeferredPdfProgressSaveGuard(record.id || previousState.documentId || "", openToken);
     Object.assign(state, previousState);
     updateViewerMode();
     updateControls();
