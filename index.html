@@ -8,7 +8,7 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./icons/icon.svg" />
-    <link rel="stylesheet" href="./styles.css?v=64" />
+    <link rel="stylesheet" href="./styles.css?v=100" />
   </head>
   <body>
     <div class="app-shell">
@@ -18,7 +18,7 @@
           <div>
             <div class="brand-title">
               <h1>随身阅读</h1>
-              <span id="appVersion" class="version-badge">v64</span>
+              <span id="appVersion" class="version-badge">v100</span>
             </div>
             <p id="docName">未打开文件</p>
           </div>
@@ -27,6 +27,7 @@
         <div class="actions">
           <input id="fileInput" type="file" hidden />
           <button id="lockButton" type="button">锁</button>
+          <button id="runtimeLogButton" type="button">日志</button>
           <button id="libraryButton" type="button">书架</button>
           <button id="openButton" class="primary" type="button">打开文件</button>
         </div>
@@ -87,7 +88,25 @@
         目录
       </button>
 
-      <div id="status" class="status" role="status" aria-live="polite"></div>
+      <div id="status" class="status" role="status" aria-live="polite">
+        <span id="statusText" class="status-text"></span>
+        <button id="statusDiagnosticsButton" class="status-diagnostics" type="button" hidden>
+          复制诊断信息
+        </button>
+      </div>
+
+      <div id="diagnosticsOverlay" class="diagnostics-overlay" hidden>
+        <section class="diagnostics-panel" role="dialog" aria-modal="true" aria-labelledby="diagnosticsTitle">
+          <header class="diagnostics-header">
+            <h2 id="diagnosticsTitle">诊断信息</h2>
+            <button id="diagnosticsCloseButton" type="button" aria-label="关闭诊断信息">关闭</button>
+          </header>
+          <textarea id="diagnosticsText" class="diagnostics-text" readonly spellcheck="false"></textarea>
+          <footer class="diagnostics-actions">
+            <button id="diagnosticsSelectButton" type="button">全选</button>
+          </footer>
+        </section>
+      </div>
 
       <div id="imageOverlay" class="image-overlay" hidden>
         <button id="imageCloseButton" class="image-close" type="button" aria-label="关闭图片">×</button>
@@ -226,6 +245,6 @@
 
     <script src="./vendor/jszip/jszip.min.js?v=45"></script>
     <script src="./vendor/epubjs/epub.min.js?v=45"></script>
-    <script type="module" src="./app.js?v=64"></script>
+    <script type="module" src="./app.js?v=100"></script>
   </body>
 </html>

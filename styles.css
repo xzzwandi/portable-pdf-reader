@@ -581,7 +581,10 @@ body.is-app-fullscreen .floating-fullscreen:not([hidden]) {
   position: fixed;
   right: max(16px, env(safe-area-inset-right));
   bottom: calc(72px + env(safe-area-inset-bottom));
-  max-width: min(320px, calc(100vw - 32px));
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(380px, calc(100vw - 32px));
   border: 1px solid rgba(36, 33, 29, 0.12);
   border-radius: 8px;
   background: rgba(36, 33, 29, 0.92);
@@ -600,6 +603,99 @@ body.is-app-fullscreen .floating-fullscreen:not([hidden]) {
 .status.show {
   opacity: 1;
   transform: translateY(0);
+}
+
+.status.has-action {
+  pointer-events: auto;
+}
+
+.status-text {
+  min-width: 0;
+}
+
+.status-diagnostics {
+  flex: 0 0 auto;
+  min-height: 30px;
+  border-color: rgba(255, 255, 255, 0.26);
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  font-size: 12px;
+  padding: 5px 8px;
+}
+
+.status-diagnostics:hover,
+.status-diagnostics:focus-visible {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.diagnostics-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 34;
+  display: grid;
+  place-items: center;
+  background: rgba(18, 16, 14, 0.42);
+  padding:
+    max(18px, env(safe-area-inset-top))
+    max(18px, env(safe-area-inset-right))
+    max(18px, env(safe-area-inset-bottom))
+    max(18px, env(safe-area-inset-left));
+}
+
+.diagnostics-overlay[hidden] {
+  display: none;
+}
+
+.diagnostics-panel {
+  display: grid;
+  grid-template-rows: auto minmax(220px, 1fr) auto;
+  width: min(760px, 100%);
+  max-height: min(720px, calc(100vh - 36px));
+  border: 1px solid rgba(36, 33, 29, 0.16);
+  border-radius: 8px;
+  background: #fffdf8;
+  box-shadow: 0 24px 70px rgba(36, 33, 29, 0.26);
+  overflow: hidden;
+}
+
+.diagnostics-header,
+.diagnostics-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+}
+
+.diagnostics-header {
+  border-bottom: 1px solid rgba(36, 33, 29, 0.1);
+}
+
+.diagnostics-header h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.diagnostics-text {
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  resize: none;
+  background: #f7f3eb;
+  color: #24211d;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  padding: 12px;
+  white-space: pre;
+}
+
+.diagnostics-text:focus {
+  outline: 2px solid rgba(110, 91, 59, 0.38);
+  outline-offset: -2px;
+}
+
+.diagnostics-actions {
+  justify-content: flex-end;
+  border-top: 1px solid rgba(36, 33, 29, 0.1);
 }
 
 .image-overlay {
