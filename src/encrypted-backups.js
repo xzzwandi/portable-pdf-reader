@@ -4,18 +4,19 @@ import {
   ENCRYPTED_BACKUP_MAGIC,
   ENCRYPTED_BACKUP_MAX_HEADER_BYTES,
   ENCRYPTED_BACKUP_VERSION,
-} from "./constants.js?v=76";
+} from "./constants.js?v=91";
 import {
   getDocumentFormat,
   getEncryptedPayloadBlob,
   getEncryptedPayloadSize,
   getEncryptionOriginalSize,
+  getExpectedEncryptedPayloadSize,
   isRecordEncrypted,
   isRecordNameEncrypted,
   withDetectedEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./encryption.js?v=76";
-import { createUint32Bytes, readUint32Bytes } from "./utils.js?v=76";
+} from "./encryption.js?v=91";
+import { createUint32Bytes, readUint32Bytes } from "./utils.js?v=91";
 
 function isLibraryDocument(record) {
   return Boolean(record?.blob && typeof record.id === "string" && record.id.startsWith(DOCUMENT_ID_PREFIX));
@@ -89,7 +90,7 @@ async function readEncryptedBackupFile(file) {
   if (
     headerLength <= 0 ||
     headerLength > ENCRYPTED_BACKUP_MAX_HEADER_BYTES ||
-    dataOffset > file.size
+    dataOffset >= file.size
   ) {
     throw new Error("Invalid encrypted backup.");
   }
@@ -133,12 +134,14 @@ function createRecordFromEncryptedBackup(header, blob, payloadLocation = {}) {
     type: payload.type || type,
     updatedAt: Number.isFinite(payload.updatedAt) ? payload.updatedAt : now,
   });
+  const expectedPayloadSize = getExpectedEncryptedPayloadSize(record);
 
   if (
     header?.app !== "portable-pdf-reader" ||
     header?.kind !== "encrypted-document" ||
     header?.version !== ENCRYPTED_BACKUP_VERSION ||
     (Number.isFinite(expectedBlobSize) && expectedBlobSize !== encryptedPayloadSize) ||
+    (expectedPayloadSize > 0 && expectedPayloadSize !== encryptedPayloadSize) ||
     !isLibraryDocument(record) ||
     !isRecordEncrypted(record) ||
     !isRecordNameEncrypted(record)

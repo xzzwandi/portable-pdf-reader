@@ -6,7 +6,7 @@ import {
   PDF_RANGE_CHUNK_SIZE,
   PDF_SOURCE_READ_RETRY_DELAY_MS,
   PDF_SOURCE_READ_RETRY_LIMIT,
-} from "./constants.js?v=76";
+} from "./constants.js?v=91";
 import {
   createChunkAad,
   createChunkIv,
@@ -16,20 +16,67 @@ import {
   getEncryptedPayloadSize,
   getEncryptionOriginalSize,
   getEncryptionTagBytes,
-} from "./encryption.js?v=76";
-import { clamp, wait } from "./utils.js?v=76";
+} from "./encryption.js?v=91";
+import { clamp, wait } from "./utils.js?v=91";
 
 const PDFJS_ROOT = new URL("../vendor/pdfjs/", import.meta.url).href;
 pdfjsLib.GlobalWorkerOptions.workerSrc = `${PDFJS_ROOT}pdf.worker.min.mjs`;
 
 let metricHandler = () => {};
+let diagnosticHandler = () => {};
+let rangeTransportSequence = 0;
 
 export function setPdfSourceMetricHandler(handler) {
   metricHandler = typeof handler === "function" ? handler : () => {};
 }
 
+export function setPdfSourceDiagnosticHandler(handler) {
+  diagnosticHandler = typeof handler === "function" ? handler : () => {};
+}
+
 function noteMetric(name) {
   metricHandler(name);
+}
+
+function summarizeSourceError(error) {
+  if (!error) {
+    return null;
+  }
+
+  const summary = {
+    message: typeof error.message === "string" ? error.message : String(error),
+    name: typeof error.name === "string" ? error.name : error.constructor?.name || "Error",
+  };
+
+  if (error.cause) {
+    summary.cause = summarizeSourceError(error.cause);
+  }
+
+  return summary;
+}
+
+function noteDiagnostic(type, detail = {}) {
+  try {
+    diagnosticHandler(type, detail);
+  } catch {
+    // Diagnostics are best-effort and should not affect PDF reads.
+  }
+}
+
+function summarizeSource(source) {
+  const summary = {
+    blobSize: source.blob?.size || null,
+    kind: source instanceof EncryptedDocumentSource ? "encrypted" : "blob",
+    length: source.length,
+  };
+
+  if (source instanceof EncryptedDocumentSource) {
+    summary.encryptedPayloadOffset = getEncryptedPayloadOffset(source.record);
+    summary.encryptedPayloadSize = getEncryptedPayloadSize(source.record);
+    summary.originalSize = getEncryptionOriginalSize(source.record);
+  }
+
+  return summary;
 }
 
 export class BlobDocumentSource {
@@ -73,8 +120,28 @@ export class EncryptedDocumentSource {
     const encryptedStart = encryptedPayloadOffset + encryptedOffset;
     const encryptedEnd = encryptedStart + plainLength + tagBytes;
     const encryptedPayloadEnd = encryptedPayloadOffset + getEncryptedPayloadSize(this.record);
+    noteDiagnostic("encrypted-chunk-read", {
+      chunkIndex,
+      encryptedEnd,
+      encryptedPayloadEnd,
+      encryptedPayloadOffset,
+      encryptedStart,
+      plainLength,
+      plainStart,
+      tagBytes,
+    });
 
     if (encryptedEnd > encryptedPayloadEnd) {
+      noteDiagnostic("encrypted-chunk-incomplete", {
+        chunkIndex,
+        encryptedEnd,
+        encryptedPayloadEnd,
+        encryptedPayloadOffset,
+        encryptedStart,
+        plainLength,
+        plainStart,
+        tagBytes,
+      });
       throw new Error("Encrypted document payload is incomplete.");
     }
 
@@ -143,6 +210,7 @@ export class EncryptedDocumentSource {
 class PdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
   constructor(source, initialData, fileName = "") {
     super(source.length, initialData, true, fileName);
+    this.transportId = ++rangeTransportSequence;
     this.source = source;
     this.aborted = false;
     this.failed = false;
@@ -151,10 +219,19 @@ class PdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
       this.rejectFailure = reject;
     });
     this.failurePromise.catch(() => {});
+    noteDiagnostic("transport-created", {
+      fileName,
+      initialDataBytes: initialData?.byteLength || 0,
+      source: summarizeSource(source),
+      transportId: this.transportId,
+    });
   }
 
   attachLoadingTask(loadingTask) {
     this.loadingTask = loadingTask;
+    noteDiagnostic("transport-attached", {
+      transportId: this.transportId,
+    });
   }
 
   fail(error) {
@@ -164,6 +241,11 @@ class PdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
 
     this.failed = true;
     this.aborted = true;
+    noteDiagnostic("transport-failed", {
+      error: summarizeSourceError(error),
+      source: summarizeSource(this.source),
+      transportId: this.transportId,
+    });
     this.rejectFailure?.(error);
     this.loadingTask?.destroy?.().catch(() => {});
   }
@@ -176,6 +258,14 @@ class PdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
     noteMetric("pdfRangeRequests");
     const safeBegin = clamp(Math.floor(begin), 0, this.length);
     const safeEnd = clamp(Math.ceil(end), safeBegin, this.length);
+    noteDiagnostic("range-request", {
+      begin,
+      end,
+      safeBegin,
+      safeEnd,
+      source: summarizeSource(this.source),
+      transportId: this.transportId,
+    });
 
     try {
       const chunk = await readPdfSourceRange(this.source, safeBegin, safeEnd);
@@ -190,6 +280,12 @@ class PdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
         );
       }
 
+      noteDiagnostic("range-response", {
+        bytes: chunk.byteLength,
+        safeBegin,
+        safeEnd,
+        transportId: this.transportId,
+      });
       this.onDataRange(safeBegin, chunk);
       this.onDataProgress(safeEnd, this.length);
     } catch (error) {
@@ -203,6 +299,13 @@ class PdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
           length: this.length,
           error,
         });
+        noteDiagnostic("range-error", {
+          error: summarizeSourceError(rangeError),
+          safeBegin,
+          safeEnd,
+          source: summarizeSource(this.source),
+          transportId: this.transportId,
+        });
         this.fail(rangeError);
       }
     }
@@ -210,6 +313,9 @@ class PdfDataRangeTransport extends pdfjsLib.PDFDataRangeTransport {
 
   abort() {
     this.aborted = true;
+    noteDiagnostic("transport-aborted", {
+      transportId: this.transportId,
+    });
   }
 }
 

@@ -19,8 +19,8 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./constants.js?v=76";
-import { readUint32Bytes } from "./utils.js?v=76";
+} from "./constants.js?v=91";
+import { readUint32Bytes } from "./utils.js?v=91";
 
 export async function ensureSodiumReady() {
   await sodium.ready;
@@ -304,7 +304,30 @@ export function withStableEncryptedBackupBlob(record = {}) {
   };
 }
 
-export async function detectEmbeddedEncryptedBackupPayload(record = {}) {
+function createEmbeddedEncryptedBackupRecord(header, blob, payloadLocation, fallbackRecord = {}) {
+  const payload = header?.record || {};
+  const format = payload.format === DOCUMENT_FORMATS.EPUB ? DOCUMENT_FORMATS.EPUB : DOCUMENT_FORMATS.PDF;
+  const type = format === DOCUMENT_FORMATS.EPUB ? "application/epub+zip" : "application/pdf";
+
+  return withoutPlainRecordName({
+    ...fallbackRecord,
+    blob,
+    encrypted: true,
+    encryptedName: payload.encryptedName,
+    encryptedPayloadOffset: payloadLocation.encryptedPayloadOffset,
+    encryptedPayloadSize: payloadLocation.encryptedPayloadSize,
+    encryption: payload.encryption,
+    format,
+    id: typeof payload.id === "string" && payload.id ? payload.id : fallbackRecord.id,
+    size: Number.isFinite(payload.size)
+      ? payload.size
+      : payload.encryption?.originalSize || fallbackRecord.size || blob.size,
+    type: payload.type || fallbackRecord.type || type,
+    updatedAt: Number.isFinite(payload.updatedAt) ? payload.updatedAt : fallbackRecord.updatedAt,
+  });
+}
+
+async function readEmbeddedEncryptedBackupRecord(record = {}) {
   const blob = record.blob;
 
   if (!blob?.size) {
@@ -334,34 +357,58 @@ export async function detectEmbeddedEncryptedBackupPayload(record = {}) {
     headerLength > ENCRYPTED_BACKUP_MAX_HEADER_BYTES ||
     dataOffset >= blob.size
   ) {
-    return null;
+    throw new Error("Embedded encrypted backup header is invalid.");
   }
 
   try {
     const headerBytes = await blob.slice(prefixLength, dataOffset).arrayBuffer();
     const header = JSON.parse(new TextDecoder().decode(headerBytes));
-    const payload = header?.record || {};
     const encryptedPayloadSize = blob.size - dataOffset;
+    const embeddedRecord = createEmbeddedEncryptedBackupRecord(
+      header,
+      blob,
+      {
+        encryptedPayloadOffset: dataOffset,
+        encryptedPayloadSize,
+      },
+      record,
+    );
+    const expectedPayloadSize = getExpectedEncryptedPayloadSize(embeddedRecord);
 
     if (
       header?.app !== "portable-pdf-reader" ||
       header?.kind !== "encrypted-document" ||
       header?.version !== ENCRYPTED_BACKUP_VERSION ||
-      payload.id !== record.id ||
-      payload.encryption?.salt !== record.encryption?.salt ||
-      payload.encryption?.algorithm !== record.encryption?.algorithm ||
-      (Number.isFinite(header?.blob?.size) && header.blob.size !== encryptedPayloadSize)
+      !embeddedRecord.id ||
+      !isRecordEncrypted(embeddedRecord) ||
+      !isRecordNameEncrypted(embeddedRecord) ||
+      (Number.isFinite(header?.blob?.size) && header.blob.size !== encryptedPayloadSize) ||
+      (expectedPayloadSize > 0 && expectedPayloadSize !== encryptedPayloadSize)
     ) {
-      return null;
+      throw new Error("Embedded encrypted backup payload is invalid or incomplete.");
     }
 
-    return {
-      encryptedPayloadOffset: dataOffset,
-      encryptedPayloadSize,
-    };
-  } catch {
+    return embeddedRecord;
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error("Embedded encrypted backup header is invalid.", { cause: error });
+    }
+
+    throw error;
+  }
+}
+
+export async function detectEmbeddedEncryptedBackupPayload(record = {}) {
+  const embeddedRecord = await readEmbeddedEncryptedBackupRecord(record);
+
+  if (!embeddedRecord) {
     return null;
   }
+
+  return {
+    encryptedPayloadOffset: getEncryptedPayloadOffset(embeddedRecord),
+    encryptedPayloadSize: getEncryptedPayloadSize(embeddedRecord),
+  };
 }
 
 export async function withDetectedEncryptedPayloadLocation(record = {}) {
@@ -370,10 +417,10 @@ export async function withDetectedEncryptedPayloadLocation(record = {}) {
   }
 
   const stableRecord = withStableEncryptedBackupBlob(record);
-  const detected = await detectEmbeddedEncryptedBackupPayload(stableRecord);
+  const embeddedRecord = await readEmbeddedEncryptedBackupRecord(stableRecord);
 
-  if (detected) {
-    return { ...stableRecord, ...detected };
+  if (embeddedRecord) {
+    return embeddedRecord;
   }
 
   const blobSize = stableRecord.blob?.size || 0;
@@ -405,7 +452,21 @@ export async function normalizeEncryptedRecordPayload(record = {}) {
     return record;
   }
 
-  return withPayloadOnlyEncryptedBlob(await withDetectedEncryptedPayloadLocation(record));
+  let normalizedRecord = record;
+
+  for (let unwrapCount = 0; unwrapCount < 4; unwrapCount += 1) {
+    normalizedRecord = await withPayloadOnlyEncryptedBlob(
+      await withDetectedEncryptedPayloadLocation(normalizedRecord),
+    );
+
+    const nestedRecord = await readEmbeddedEncryptedBackupRecord(normalizedRecord);
+
+    if (!nestedRecord) {
+      return normalizedRecord;
+    }
+  }
+
+  throw new Error("Encrypted backup nesting is too deep.");
 }
 
 export function createChunkAad(record, encryption, chunkIndex) {
