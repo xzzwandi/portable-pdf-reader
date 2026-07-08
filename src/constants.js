@@ -1,13 +1,14 @@
 export const DB_NAME = "portable-pdf-reader";
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 export const STORE_NAME = "documents";
 export const CHUNK_STORE_NAME = "document-chunks";
+export const METADATA_STORE_NAME = "document-metadata";
 export const DOCUMENT_ID_PREFIX = "doc:";
 export const LAST_DOCUMENT_ID = "last-document";
 export const LOCK_KEY = "portable-pdf-reader-lock";
 export const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 export const STATE_KEY = "portable-pdf-reader-state";
-export const APP_VERSION = "v100";
+export const APP_VERSION = "v105";
 
 export const ENCRYPTED_BACKUP_EXTENSION = ".pprenc";
 export const ENCRYPTED_BACKUP_MAGIC = "PPRENC1\n";

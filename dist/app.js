@@ -34,6 +34,7 @@ import {
   MAX_CANVAS_DIMENSION,
   MAX_CONTINUOUS_CANVAS_PIXELS,
   MAX_PAGED_CANVAS_PIXELS,
+  METADATA_STORE_NAME,
   PAGED_BLANK_RETRY_DELAY_MS,
   PAGED_BLANK_RETRY_LIMIT,
   PBKDF2_KEY_ALGORITHM,
@@ -51,7 +52,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=98";
+} from "./src/constants.js?v=105";
 import {
   bytesToHex,
   createChunkAad,
@@ -81,23 +82,23 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=98";
+} from "./src/encryption.js?v=105";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=98";
+} from "./src/utils.js?v=105";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=98";
+} from "./src/encrypted-backups.js?v=105";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=98";
+} from "./src/pdf-sources.js?v=105";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -251,6 +252,8 @@ const continuousRenderRuns = new Map();
 const continuousBlankRetries = new Map();
 const pagedBlankRetries = new Map();
 const libraryRecordCache = new Map();
+let libraryListDirty = true;
+let libraryRenderRequestId = 0;
 let continuousQueueRunning = false;
 let continuousRenderRunId = 0;
 let continuousHealthTimer = null;
@@ -1596,6 +1599,9 @@ function openDatabase() {
         });
         chunkStore.createIndex("documentId", "documentId", { unique: false });
       }
+      if (!db.objectStoreNames.contains(METADATA_STORE_NAME)) {
+        db.createObjectStore(METADATA_STORE_NAME, { keyPath: "id" });
+      }
     };
 
     request.onsuccess = () => resolve(request.result);
@@ -1639,6 +1645,24 @@ async function withChunkStore(mode, callback) {
   }
 }
 
+async function withMetadataStore(mode, callback) {
+  const db = await openDatabase();
+
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(METADATA_STORE_NAME, mode);
+      const store = tx.objectStore(METADATA_STORE_NAME);
+      const result = callback(store);
+
+      tx.oncomplete = () => resolve(result);
+      tx.onerror = () => reject(tx.error || new Error("Metadata store operation failed."));
+      tx.onabort = () => reject(tx.error || new Error("Metadata store operation was aborted."));
+    });
+  } finally {
+    db.close();
+  }
+}
+
 function requestToPromise(request) {
   return new Promise((resolve, reject) => {
     request.onsuccess = () => resolve(request.result);
@@ -1659,6 +1683,10 @@ function getStoredBlobBytesLength(blobBytes) {
 }
 
 function isEncryptedRecordStoredInChunks(record = {}) {
+  if (!record || typeof record !== "object") {
+    return false;
+  }
+
   return (
     isRecordEncrypted(record) &&
     record.encryptedChunkStorage?.version === 1 &&
@@ -1678,6 +1706,10 @@ function getStoredPayloadSize(record = {}) {
 }
 
 function hasStoredDocumentPayload(record = {}) {
+  if (!record || typeof record !== "object") {
+    return false;
+  }
+
   return Boolean(record?.blob || getStoredBlobBytesLength(record?.blobBytes) || isEncryptedRecordStoredInChunks(record));
 }
 
@@ -2033,6 +2065,75 @@ function isLibraryDocument(record) {
   return Boolean(hasStoredDocumentPayload(record) && typeof record.id === "string" && record.id.startsWith(DOCUMENT_ID_PREFIX));
 }
 
+function isLibraryMetadataRecord(record) {
+  return Boolean(
+    record?.metadataVersion === 1 &&
+    record.hasPayload !== false &&
+    typeof record.id === "string" &&
+    record.id.startsWith(DOCUMENT_ID_PREFIX),
+  );
+}
+
+function cloneJsonValue(value) {
+  if (!value || typeof value !== "object") {
+    return value || null;
+  }
+
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return null;
+  }
+}
+
+function createLibraryMetadataRecord(record = {}) {
+  if (!record || typeof record !== "object" || typeof record.id !== "string") {
+    return null;
+  }
+
+  if (!record.id.startsWith(DOCUMENT_ID_PREFIX) || !hasStoredDocumentPayload(record)) {
+    return null;
+  }
+
+  const encrypted = isRecordEncrypted(record);
+  const metadata = {
+    blobSize: getStoredPayloadSize(record),
+    blobType: record.blobType || record.blob?.type || record.type || "application/octet-stream",
+    encrypted,
+    encryptedChunkStorage: cloneJsonValue(record.encryptedChunkStorage),
+    encryptedName: cloneJsonValue(record.encryptedName),
+    encryption: encrypted ? cloneJsonValue(record.encryption) : null,
+    format: getDocumentFormat(record),
+    hasPayload: true,
+    id: record.id,
+    lastOpenedAt: record.lastOpenedAt || record.updatedAt || 0,
+    metadataVersion: 1,
+    plainNameStored: encrypted && typeof record.name === "string" && record.name.length > 0,
+    recordNameEncrypted: isRecordNameEncrypted(record),
+    size: record.size || getStoredPayloadSize(record),
+    type: record.type || record.blobType || record.blob?.type || "application/octet-stream",
+    updatedAt: record.updatedAt || 0,
+  };
+
+  if (!encrypted) {
+    metadata.name = getPlainRecordName(record);
+  }
+
+  return metadata;
+}
+
+function recordNeedsEncryptionMigrationSummary(record = {}) {
+  if (!isRecordEncrypted(record)) {
+    return true;
+  }
+
+  if (!isCurrentRecordEncryption(record)) {
+    return false;
+  }
+
+  return !isRecordNameEncrypted(record) || Boolean(record.name) || Boolean(record.plainNameStored);
+}
+
 function getDocumentFormatFromName(name = "") {
   return name.toLowerCase().endsWith(".epub") ? DOCUMENT_FORMATS.EPUB : DOCUMENT_FORMATS.PDF;
 }
@@ -2146,6 +2247,13 @@ async function putStoredDocument(record) {
   }
 
   const result = await withStore("readwrite", (store) => requestToPromise(store.put(storageRecord)));
+  await putLibraryMetadataForRecord(storageRecord).catch((error) => {
+    console.warn(error);
+    recordDiagnosticEvent("library-metadata-write-error", {
+      documentId: storageRecord?.id || "",
+      error: summarizeError(error),
+    });
+  });
 
   if (replaceChunks) {
     await deleteStoredDocumentChunksExcept(
@@ -2160,12 +2268,120 @@ async function putStoredDocument(record) {
 async function deleteStoredDocument(documentId) {
   const result = await withStore("readwrite", (store) => requestToPromise(store.delete(documentId)));
   await deleteStoredDocumentChunks(documentId).catch((error) => console.warn(error));
+  await deleteLibraryMetadata(documentId).catch((error) => console.warn(error));
   return result;
 }
 
 async function getAllStoredRecords() {
-  const records = await withStore("readonly", (store) => requestToPromise(store.getAll()));
-  return Array.isArray(records) ? records.map(reviveStoredDocumentRecord) : records;
+  return withStore("readonly", (store) => {
+    const records = [];
+
+    return new Promise((resolve, reject) => {
+      const request = store.openCursor();
+
+      request.onerror = () => reject(request.error || new Error("Database cursor request failed."));
+      request.onsuccess = () => {
+        const cursor = request.result;
+
+        if (!cursor) {
+          resolve(records);
+          return;
+        }
+
+        records.push(reviveStoredDocumentRecord(cursor.value));
+        cursor.continue();
+      };
+    });
+  });
+}
+
+async function countLibraryDocumentKeys() {
+  return withStore("readonly", (store) =>
+    new Promise((resolve, reject) => {
+      let count = 0;
+      const request = store.openKeyCursor();
+
+      request.onerror = () => reject(request.error || new Error("Document key cursor request failed."));
+      request.onsuccess = () => {
+        const cursor = request.result;
+
+        if (!cursor) {
+          resolve(count);
+          return;
+        }
+
+        if (typeof cursor.key === "string" && cursor.key.startsWith(DOCUMENT_ID_PREFIX)) {
+          count += 1;
+        }
+        cursor.continue();
+      };
+    }),
+  );
+}
+
+async function readLibraryMetadataRecords() {
+  const records = await withMetadataStore("readonly", (store) => {
+    const results = [];
+
+    return new Promise((resolve, reject) => {
+      const request = store.openCursor();
+
+      request.onerror = () => reject(request.error || new Error("Metadata cursor request failed."));
+      request.onsuccess = () => {
+        const cursor = request.result;
+
+        if (!cursor) {
+          resolve(results);
+          return;
+        }
+
+        if (isLibraryMetadataRecord(cursor.value)) {
+          results.push(cursor.value);
+        }
+        cursor.continue();
+      };
+    });
+  });
+
+  return records.sort((a, b) => (b.lastOpenedAt || b.updatedAt || 0) - (a.lastOpenedAt || a.updatedAt || 0));
+}
+
+async function putLibraryMetadataRecords(records = []) {
+  const metadataRecords = records.map(createLibraryMetadataRecord).filter(Boolean);
+
+  if (!metadataRecords.length) {
+    return [];
+  }
+
+  return withMetadataStore("readwrite", (store) =>
+    Promise.all(metadataRecords.map((metadata) => requestToPromise(store.put(metadata)))),
+  );
+}
+
+async function replaceLibraryMetadataRecords(records = []) {
+  const metadataRecords = records.map(createLibraryMetadataRecord).filter(Boolean);
+
+  return withMetadataStore("readwrite", (store) => {
+    const requests = [requestToPromise(store.clear())];
+
+    for (const metadata of metadataRecords) {
+      requests.push(requestToPromise(store.put(metadata)));
+    }
+
+    return Promise.all(requests);
+  });
+}
+
+async function putLibraryMetadataForRecord(record = {}) {
+  return putLibraryMetadataRecords([record]);
+}
+
+async function deleteLibraryMetadata(documentId) {
+  if (!documentId) {
+    return;
+  }
+
+  return withMetadataStore("readwrite", (store) => requestToPromise(store.delete(documentId)));
 }
 
 async function migrateLegacyDocument() {
@@ -2199,12 +2415,45 @@ async function migrateLegacyDocument() {
 }
 
 async function readLibraryDocuments() {
+  const startedAt = performance.now();
   await migrateLegacyDocument();
-  const records = await getAllStoredRecords();
+  const metadataRecords = await readLibraryMetadataRecords();
+  const documentKeyCount = await countLibraryDocumentKeys();
 
-  return records
+  if (metadataRecords.length > 0 && metadataRecords.length === documentKeyCount) {
+    recordDiagnosticEvent("library-metadata-read", {
+      documentCount: metadataRecords.length,
+      documentKeyCount,
+      elapsedMs: Math.round(performance.now() - startedAt),
+      encryptedCount: metadataRecords.filter(isRecordEncrypted).length,
+    });
+    return metadataRecords;
+  }
+
+  const records = await getAllStoredRecords();
+  const documents = records
     .filter(isLibraryDocument)
     .sort((a, b) => (b.lastOpenedAt || b.updatedAt || 0) - (a.lastOpenedAt || a.updatedAt || 0));
+  const metadataDocuments = documents.map(createLibraryMetadataRecord).filter(Boolean);
+
+  await replaceLibraryMetadataRecords(documents).catch((error) => {
+    console.warn(error);
+    recordDiagnosticEvent("library-metadata-rebuild-error", {
+      error: summarizeError(error),
+    });
+  });
+
+  recordDiagnosticEvent("library-documents-read", {
+    documentCount: documents.length,
+    documentKeyCount,
+    elapsedMs: Math.round(performance.now() - startedAt),
+    encryptedCount: documents.filter(isRecordEncrypted).length,
+    fromFallback: true,
+    legacyByteRecordCount: documents.filter((record) => getStoredBlobBytesLength(record.blobBytes) > 0).length,
+    recordCount: records.length,
+  });
+
+  return metadataDocuments.length ? metadataDocuments : documents;
 }
 
 async function saveDocumentFile(file) {
@@ -2249,7 +2498,7 @@ async function touchStoredDocument(documentId, replacementRecord = null) {
     return;
   }
 
-  await putStoredDocument({
+  await putLibraryMetadataForRecord({
     ...record,
     lastOpenedAt: Date.now(),
   });
@@ -2945,19 +3194,19 @@ function isConstrainedContinuousRendering() {
 }
 
 function getContinuousRenderViewports() {
-  return isConstrainedContinuousRendering() ? 0.6 : CONTINUOUS_RENDER_VIEWPORTS;
+  return isConstrainedContinuousRendering() ? 0.9 : CONTINUOUS_RENDER_VIEWPORTS;
 }
 
 function getContinuousKeepViewports() {
-  return isConstrainedContinuousRendering() ? 0.8 : CONTINUOUS_KEEP_VIEWPORTS;
+  return isConstrainedContinuousRendering() ? 1.3 : CONTINUOUS_KEEP_VIEWPORTS;
 }
 
 function getContinuousMaxRenderedPages() {
-  return isConstrainedContinuousRendering() ? 2 : CONTINUOUS_MAX_RENDERED_PAGES;
+  return isConstrainedContinuousRendering() ? 3 : CONTINUOUS_MAX_RENDERED_PAGES;
 }
 
 function getContinuousObserverMargin() {
-  return isConstrainedContinuousRendering() ? "180px 0px" : CONTINUOUS_OBSERVER_MARGIN;
+  return isConstrainedContinuousRendering() ? "360px 0px" : CONTINUOUS_OBSERVER_MARGIN;
 }
 
 function getContinuousBlankRetryLimit() {
@@ -7246,8 +7495,27 @@ async function openDocumentFromLibrary(documentId) {
 }
 
 async function readDocumentsNeedingEncryptionMigration() {
+  const summaries = await readLibraryDocuments();
+  const records = [];
+
+  for (const summary of summaries) {
+    if (!recordNeedsEncryptionMigrationSummary(summary)) {
+      continue;
+    }
+
+    const record = await getStoredDocument(summary.id).catch(() => null);
+
+    if (hasStoredDocumentPayload(record) && recordNeedsEncryptionMigration(record)) {
+      records.push(record);
+    }
+  }
+
+  return records;
+}
+
+async function countDocumentsNeedingEncryptionMigration() {
   const records = await readLibraryDocuments();
-  return records.filter((record) => hasStoredDocumentPayload(record) && recordNeedsEncryptionMigration(record));
+  return records.filter(recordNeedsEncryptionMigrationSummary).length;
 }
 
 function updateEncryptionPromptState({ busy = false, progress = 0, text = "" } = {}) {
@@ -7288,6 +7556,10 @@ function hideEncryptionMigrationPrompt() {
 }
 
 async function maybePromptLibraryEncryption() {
+  if (getSelfTestMode()) {
+    return;
+  }
+
   if (!getLockConfig() || encryptionPromptDismissed || encryptionMigrationInProgress) {
     return;
   }
@@ -7298,10 +7570,10 @@ async function maybePromptLibraryEncryption() {
   }
 
   try {
-    const documents = await readDocumentsNeedingEncryptionMigration();
+    const count = await countDocumentsNeedingEncryptionMigration();
 
-    if (documents.length > 0) {
-      showEncryptionMigrationPrompt(documents.length);
+    if (count > 0) {
+      showEncryptionMigrationPrompt(count);
     }
   } catch (error) {
     console.warn(error);
@@ -7586,6 +7858,7 @@ async function handleUnlockedSession() {
 }
 
 function closeLibrary() {
+  libraryRenderRequestId += 1;
   els.libraryOverlay.hidden = true;
   updatePanelScrollLock();
 }
@@ -7596,9 +7869,12 @@ async function openLibrary() {
   }
 
   closeToc();
-  await renderLibraryList();
   els.libraryOverlay.hidden = false;
   updatePanelScrollLock();
+
+  if (libraryListDirty) {
+    await renderLibraryList({ force: true });
+  }
 }
 
 function closeToc() {
@@ -8132,15 +8408,39 @@ async function deleteDocumentFromLibrary(documentId) {
   showStatus("已从书架删除。");
 }
 
-async function renderLibraryList() {
+async function renderLibraryList(options = {}) {
+  if (els.libraryOverlay.hidden && options.force !== true) {
+    libraryListDirty = true;
+    recordDiagnosticEvent("library-render-deferred", {
+      reason: "overlay-hidden",
+    });
+    return;
+  }
+
+  const renderId = (libraryRenderRequestId += 1);
+  const startedAt = performance.now();
+  libraryListDirty = false;
+
   try {
+    els.libraryList.replaceChildren();
+    els.libraryEmptyState.hidden = false;
+    els.libraryEmptyState.textContent = "正在读取书架...";
+    await waitForNextFrame();
+
     const documents = await readLibraryDocuments();
+
+    if (renderId !== libraryRenderRequestId) {
+      libraryListDirty = true;
+      return;
+    }
+
     const fragment = document.createDocumentFragment();
     libraryRecordCache.clear();
-
     els.libraryEmptyState.hidden = documents.length > 0;
+    els.libraryEmptyState.textContent = documents.length > 0 ? "" : "还没有保存过 PDF。";
 
-    for (const record of documents) {
+    for (let index = 0; index < documents.length; index += 1) {
+      const record = documents[index];
       libraryRecordCache.set(record.id, record);
 
       const progress = readDocumentProgress(record.id);
@@ -8170,6 +8470,11 @@ async function renderLibraryList() {
       name.className = "library-name";
       name.textContent = await getRecordDisplayName(record);
 
+      if (renderId !== libraryRenderRequestId) {
+        libraryListDirty = true;
+        return;
+      }
+
       meta.className = "library-meta";
       meta.textContent = `${isActive ? "正在阅读 · " : ""}${format.toUpperCase()} · ${progressLabel} · ${formatFileSize(record.size || getStoredPayloadSize(record))}${isRecordEncrypted(record) ? " · 已加密" : ""}`;
 
@@ -8192,18 +8497,36 @@ async function renderLibraryList() {
       actions.append(exportButton, deleteButton);
       item.append(openButton, actions);
       fragment.append(item);
+
+      if ((index + 1) % 8 === 0) {
+        await waitForNextFrame();
+      }
+    }
+
+    if (renderId !== libraryRenderRequestId) {
+      libraryListDirty = true;
+      return;
     }
 
     els.libraryList.replaceChildren(fragment);
+    recordDiagnosticEvent("library-render-success", {
+      documentCount: documents.length,
+      elapsedMs: Math.round(performance.now() - startedAt),
+    });
   } catch (error) {
     console.warn(error);
+    libraryListDirty = true;
     els.libraryList.replaceChildren();
     els.libraryEmptyState.hidden = false;
     els.libraryEmptyState.textContent = "书架暂时打不开。";
+    recordDiagnosticEvent("library-render-error", {
+      elapsedMs: Math.round(performance.now() - startedAt),
+      error: summarizeError(error),
+    });
   }
 }
 
-function handleLibraryListClick(event) {
+async function handleLibraryListClick(event) {
   const button = event.target?.closest?.("button[data-library-action]");
 
   if (!button || !els.libraryList.contains(button)) {
@@ -8232,9 +8555,11 @@ function handleLibraryListClick(event) {
   }
 
   if (action === "export") {
-    const record = libraryRecordCache.get(documentId);
+    const cachedRecord = libraryRecordCache.get(documentId);
+    showStatus(`正在准备导出 ${getRecordOpeningLabel(cachedRecord)}...`, true);
+    const record = await getStoredDocument(documentId).catch(() => null);
 
-    if (!record) {
+    if (!hasStoredDocumentPayload(record)) {
       showStatus("这个文件已经不在本机存储里。");
       renderLibraryList();
       return;
