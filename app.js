@@ -52,7 +52,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=105";
+} from "./src/constants.js?v=106";
 import {
   bytesToHex,
   createChunkAad,
@@ -82,23 +82,23 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=105";
+} from "./src/encryption.js?v=106";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=105";
+} from "./src/utils.js?v=106";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=105";
+} from "./src/encrypted-backups.js?v=106";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=105";
+} from "./src/pdf-sources.js?v=106";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),

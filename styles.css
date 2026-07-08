@@ -568,12 +568,12 @@ body.is-app-fullscreen .edge-jumps {
 
 body.is-app-fullscreen .floating-lock:not([hidden]) {
   display: grid;
-  bottom: calc(128px + env(safe-area-inset-bottom));
   place-items: center;
 }
 
 body.is-app-fullscreen .floating-fullscreen:not([hidden]) {
   display: grid;
+  bottom: calc(128px + env(safe-area-inset-bottom));
   place-items: center;
 }
 
