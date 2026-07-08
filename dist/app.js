@@ -52,7 +52,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=106";
+} from "./src/constants.js?v=107";
 import {
   bytesToHex,
   createChunkAad,
@@ -82,23 +82,23 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=106";
+} from "./src/encryption.js?v=107";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=106";
+} from "./src/utils.js?v=107";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=106";
+} from "./src/encrypted-backups.js?v=107";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=106";
+} from "./src/pdf-sources.js?v=107";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -258,6 +258,8 @@ let continuousQueueRunning = false;
 let continuousRenderRunId = 0;
 let continuousHealthTimer = null;
 let continuousCleanupTimer = null;
+let continuousScrollFrame = 0;
+const CONTINUOUS_VISIBLE_RANGE_BUFFER = 2;
 
 const state = {
   documentId: "",
@@ -3107,6 +3109,7 @@ function interruptCurrentRender() {
 function clearContinuousPages() {
   clearContinuousHealthTimer();
   clearContinuousCleanupTimer();
+  clearContinuousScrollUpdate();
 
   if (pageObserver) {
     pageObserver.disconnect();
@@ -3622,6 +3625,63 @@ function getContinuousShellPageNumber(shell) {
   return Number.parseInt(shell?.dataset?.page || "", 10);
 }
 
+function getContinuousShellByPageNumber(pageNumber) {
+  const targetPage = Math.round(pageNumber);
+
+  if (!Number.isFinite(targetPage) || targetPage < 1) {
+    return null;
+  }
+
+  const shell = els.continuousPages.children[targetPage - 1];
+
+  if (getContinuousShellPageNumber(shell) === targetPage) {
+    return shell;
+  }
+
+  return els.continuousPages.querySelector(`[data-page="${targetPage}"]`);
+}
+
+function getContinuousShellTop(shell) {
+  return Math.max(0, shell.offsetTop - els.continuousPages.offsetTop);
+}
+
+function getContinuousShellIndexAtOffset(offset) {
+  const children = els.continuousPages.children;
+  const count = children.length;
+
+  if (!count) {
+    return -1;
+  }
+
+  const targetOffset = Math.max(0, offset);
+  let low = 0;
+  let high = count - 1;
+  let nearestIndex = 0;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const shell = children[mid];
+    const top = getContinuousShellTop(shell);
+    const bottom = top + Math.max(shell.offsetHeight, 1);
+
+    if (targetOffset < top) {
+      high = mid - 1;
+    } else if (targetOffset >= bottom) {
+      nearestIndex = mid;
+      low = mid + 1;
+    } else {
+      return mid;
+    }
+  }
+
+  return clamp(nearestIndex, 0, count - 1);
+}
+
+function getContinuousShellAtOffset(offset) {
+  const index = getContinuousShellIndexAtOffset(offset);
+  return index >= 0 ? els.continuousPages.children[index] : null;
+}
+
 function getContinuousShellSize(shell) {
   return {
     width: Number.parseInt(shell.dataset.pageWidth || "", 10) || getAvailableCanvasWidth(),
@@ -3690,6 +3750,15 @@ function clearContinuousCleanupTimer() {
   continuousCleanupTimer = null;
 }
 
+function clearContinuousScrollUpdate() {
+  if (!continuousScrollFrame) {
+    return;
+  }
+
+  window.cancelAnimationFrame(continuousScrollFrame);
+  continuousScrollFrame = 0;
+}
+
 function scheduleContinuousPdfCleanup() {
   if (!pdfDoc || !isScrollMode()) {
     return;
@@ -3738,28 +3807,53 @@ function isPinnedContinuousPage(pageNumber) {
   );
 }
 
-function isContinuousShellNearViewport(shell, extraViewports = getContinuousKeepViewports()) {
-  const windowBounds = getContinuousViewportWindow(extraViewports);
-  const top = shell.offsetTop - els.continuousPages.offsetTop;
+function isContinuousShellNearViewport(
+  shell,
+  extraViewports = getContinuousKeepViewports(),
+  windowBounds = getContinuousViewportWindow(extraViewports),
+) {
+  const top = getContinuousShellTop(shell);
   const bottom = top + Math.max(shell.offsetHeight, 1);
   return bottom >= windowBounds.top && top <= windowBounds.bottom;
 }
 
-function getContinuousShellDistance(shell) {
-  const { center } = getContinuousViewportWindow(0);
-  const top = shell.offsetTop - els.continuousPages.offsetTop;
+function getContinuousShellDistance(shell, center = getContinuousViewportWindow(0).center) {
+  const top = getContinuousShellTop(shell);
   const shellCenter = top + Math.max(shell.offsetHeight, 1) / 2;
   return Math.abs(shellCenter - center);
 }
 
 function getVisibleContinuousShells(extraViewports = 0.35) {
-  if (!els.continuousPages.childElementCount) {
+  const children = els.continuousPages.children;
+  const count = children.length;
+
+  if (!count) {
     return [];
   }
 
-  return Array.from(els.continuousPages.querySelectorAll(".page-shell"))
-    .filter((shell) => isContinuousShellNearViewport(shell, extraViewports))
-    .sort((a, b) => getContinuousShellDistance(a) - getContinuousShellDistance(b));
+  const windowBounds = getContinuousViewportWindow(extraViewports);
+  const startIndex = Math.max(
+    0,
+    getContinuousShellIndexAtOffset(windowBounds.top) - CONTINUOUS_VISIBLE_RANGE_BUFFER,
+  );
+  const endIndex = Math.min(
+    count - 1,
+    getContinuousShellIndexAtOffset(windowBounds.bottom) + CONTINUOUS_VISIBLE_RANGE_BUFFER,
+  );
+  const shells = [];
+
+  for (let index = startIndex; index <= endIndex; index += 1) {
+    const shell = children[index];
+
+    if (isContinuousShellNearViewport(shell, extraViewports, windowBounds)) {
+      shells.push(shell);
+    }
+  }
+
+  const { center } = getContinuousViewportWindow(0);
+  return shells.sort(
+    (a, b) => getContinuousShellDistance(a, center) - getContinuousShellDistance(b, center),
+  );
 }
 
 function isCanvasLikelyBlank(canvas) {
@@ -3920,7 +4014,7 @@ function pruneContinuousPages() {
   }
 
   for (const [pageNumber, task] of pageRenderTasks) {
-    const shell = els.continuousPages.querySelector(`[data-page="${pageNumber}"]`);
+    const shell = getContinuousShellByPageNumber(pageNumber);
 
     if (
       !shell ||
@@ -3981,7 +4075,7 @@ function getNextQueuedContinuousPage() {
   const candidates = [];
 
   for (const [pageNumber, token] of pendingContinuousPages) {
-    const shell = els.continuousPages.querySelector(`[data-page="${pageNumber}"]`);
+    const shell = getContinuousShellByPageNumber(pageNumber);
 
     if (
       token !== renderToken ||
@@ -4064,7 +4158,7 @@ async function renderContinuousPageWithTimeout(pageNumber, token) {
     return;
   }
 
-  const shell = els.continuousPages.querySelector(`[data-page="${pageNumber}"]`);
+  const shell = getContinuousShellByPageNumber(pageNumber);
 
   if (shell) {
     recoverContinuousPageRender(pageNumber, shell, token);
@@ -4082,7 +4176,7 @@ function scheduleContinuousPageRender(pageNumber, token = renderToken) {
     return;
   }
 
-  const shell = els.continuousPages.querySelector(`[data-page="${targetPage}"]`);
+  const shell = getContinuousShellByPageNumber(targetPage);
 
   if (
     !shell ||
@@ -4106,9 +4200,7 @@ function queueVisibleContinuousPages(token = renderToken) {
     return;
   }
 
-  const shells = Array.from(els.continuousPages.querySelectorAll(".page-shell"))
-    .filter((shell) => isContinuousShellNearViewport(shell, getContinuousRenderViewports()))
-    .sort((a, b) => getContinuousShellDistance(a) - getContinuousShellDistance(b));
+  const shells = getVisibleContinuousShells(getContinuousRenderViewports());
 
   for (const shell of shells.slice(0, getContinuousMaxRenderedPages())) {
     scheduleContinuousPageRender(getContinuousShellPageNumber(shell), token);
@@ -4123,7 +4215,7 @@ async function renderContinuousPage(pageNumber, token = renderToken, options = {
   }
 
   const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
-  const shell = els.continuousPages.querySelector(`[data-page="${targetPage}"]`);
+  const shell = getContinuousShellByPageNumber(targetPage);
 
   if (!shell || (!options.force && shell.dataset.rendered === "true")) {
     return shell?.dataset.rendered === "true";
@@ -4182,7 +4274,7 @@ async function retryInitialContinuousTargetRender(targetPage, token, documentTok
       return false;
     }
 
-    const shell = els.continuousPages.querySelector(`[data-page="${targetPage}"]`);
+    const shell = getContinuousShellByPageNumber(targetPage);
 
     if (!shell) {
       return false;
@@ -4386,7 +4478,7 @@ function setupContinuousObserver(token) {
 }
 
 function getContinuousPageTop(shell) {
-  return Math.max(0, shell.offsetTop - els.continuousPages.offsetTop - 8);
+  return Math.max(0, getContinuousShellTop(shell) - 8);
 }
 
 function getContinuousMaxScrollTop() {
@@ -5018,22 +5110,12 @@ function captureContinuousScrollPosition() {
 
   const scrollTop = Math.max(0, els.canvasWrap.scrollTop);
   const marker = scrollTop + 8;
-  let nextPage = state.scrollPage;
-  let nextOffsetRatio = state.scrollOffsetRatio;
-
-  for (const shell of els.continuousPages.children) {
-    const pageNumber = Number.parseInt(shell.dataset.page, 10);
-    const top = shell.offsetTop - els.continuousPages.offsetTop;
-    const height = Math.max(shell.offsetHeight, 1);
-    const bottom = top + height;
-
-    if (bottom >= marker) {
-      const offset = clamp(scrollTop - top, 0, height);
-      nextPage = pageNumber;
-      nextOffsetRatio = clamp(offset / height, 0, 0.98);
-      break;
-    }
-  }
+  const shell = getContinuousShellAtOffset(marker);
+  const nextPage = getContinuousShellPageNumber(shell) || state.scrollPage;
+  const top = shell ? getContinuousShellTop(shell) : scrollTop;
+  const height = shell ? Math.max(shell.offsetHeight, 1) : 1;
+  const offset = clamp(scrollTop - top, 0, height);
+  const nextOffsetRatio = clamp(offset / height, 0, 0.98);
 
   const changed =
     nextPage !== state.scrollPage ||
@@ -5057,7 +5139,7 @@ function restoreContinuousScrollPosition(options = {}) {
   }
 
   const targetPage = clamp(Math.round(state.scrollPage || state.page), 1, pdfDoc.numPages);
-  const shell = els.continuousPages.querySelector(`[data-page="${targetPage}"]`);
+  const shell = getContinuousShellByPageNumber(targetPage);
 
   if (!shell) {
     return false;
@@ -5088,7 +5170,7 @@ function isLikelyTransientTopJump() {
 
 async function scrollToContinuousPage(pageNumber, options = {}) {
   const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
-  const shell = els.continuousPages.querySelector(`[data-page="${targetPage}"]`);
+  const shell = getContinuousShellByPageNumber(targetPage);
 
   if (!shell) {
     return;
@@ -5160,6 +5242,17 @@ function handleContinuousEdgeJump(edge) {
   jumpToContinuousEdge(edge).catch((error) => {
     console.error(error);
     showStatus("跳转失败，请再点一次。", true);
+  });
+}
+
+function scheduleContinuousScrollUpdate() {
+  if (isScrollTrackingSuppressed() || continuousScrollFrame) {
+    return;
+  }
+
+  continuousScrollFrame = window.requestAnimationFrame(() => {
+    continuousScrollFrame = 0;
+    updateCurrentPageFromScroll();
   });
 }
 
@@ -5393,7 +5486,7 @@ async function waitForDeferredContinuousTargetRender(documentId, openToken, targ
       return false;
     }
 
-    const shell = els.continuousPages.querySelector(`[data-page="${targetPage}"]`);
+    const shell = getContinuousShellByPageNumber(targetPage);
 
     if (shell?.dataset.rendered === "true") {
       return true;
@@ -5670,18 +5763,8 @@ function updateCurrentPageFromScroll() {
 
   const positionChanged = captureContinuousScrollPosition();
   const marker = els.canvasWrap.scrollTop + els.canvasWrap.clientHeight * 0.35;
-  let currentPage = state.page;
-
-  for (const shell of els.continuousPages.children) {
-    const pageNumber = Number.parseInt(shell.dataset.page, 10);
-    const top = shell.offsetTop - els.continuousPages.offsetTop;
-
-    if (top <= marker) {
-      currentPage = pageNumber;
-    } else {
-      break;
-    }
-  }
+  const currentShell = getContinuousShellAtOffset(marker);
+  const currentPage = getContinuousShellPageNumber(currentShell) || state.page;
 
   const pageChanged = currentPage !== state.page;
 
@@ -8808,7 +8891,7 @@ function wireEvents() {
     renderCurrentView(state.page, { behavior: "auto", restoreScroll: isScrollMode() });
   });
 
-  els.canvasWrap.addEventListener("scroll", updateCurrentPageFromScroll, { passive: true });
+  els.canvasWrap.addEventListener("scroll", scheduleContinuousScrollUpdate, { passive: true });
 
   document.addEventListener("fullscreenchange", () => {
     if (!document.fullscreenElement && appFullscreen && !syncingNativeFullscreen) {

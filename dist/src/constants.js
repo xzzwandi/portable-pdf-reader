@@ -8,7 +8,7 @@ export const LAST_DOCUMENT_ID = "last-document";
 export const LOCK_KEY = "portable-pdf-reader-lock";
 export const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 export const STATE_KEY = "portable-pdf-reader-state";
-export const APP_VERSION = "v106";
+export const APP_VERSION = "v107";
 
 export const ENCRYPTED_BACKUP_EXTENSION = ".pprenc";
 export const ENCRYPTED_BACKUP_MAGIC = "PPRENC1\n";
