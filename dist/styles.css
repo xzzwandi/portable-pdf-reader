@@ -338,6 +338,13 @@ canvas {
   gap: 14px;
 }
 
+.continuous-spacer {
+  width: 1px;
+  min-height: 0;
+  flex: 0 0 auto;
+  pointer-events: none;
+}
+
 .page-shell {
   display: grid;
   width: 100%;

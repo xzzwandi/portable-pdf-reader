@@ -52,7 +52,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=110";
+} from "./src/constants.js?v=111";
 import {
   bytesToHex,
   createChunkAad,
@@ -82,23 +82,23 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=110";
+} from "./src/encryption.js?v=111";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=110";
+} from "./src/utils.js?v=111";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=110";
+} from "./src/encrypted-backups.js?v=111";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=110";
+} from "./src/pdf-sources.js?v=111";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -251,6 +251,7 @@ const continuousRenderRuns = new Map();
 const continuousBlankRetries = new Map();
 const pagedBlankRetries = new Map();
 const libraryRecordCache = new Map();
+const recordDisplayNameCache = new Map();
 let libraryListDirty = true;
 let libraryRenderRequestId = 0;
 let continuousQueueRunning = false;
@@ -258,7 +259,20 @@ let continuousRenderRunId = 0;
 let continuousHealthTimer = null;
 let continuousCleanupTimer = null;
 let continuousScrollFrame = 0;
-const CONTINUOUS_VISIBLE_RANGE_BUFFER = 2;
+let continuousProgrammaticScrollTarget = 0;
+let continuousProgrammaticScrollUntil = 0;
+const CONTINUOUS_PAGE_GAP_PX = 14;
+const CONTINUOUS_DOM_WINDOW_PAGES = 36;
+const CONTINUOUS_CONSTRAINED_DOM_WINDOW_PAGES = 22;
+let continuousEstimatedPageWidth = 0;
+let continuousEstimatedShellHeight = 0;
+let continuousPageHeightTree = null;
+const continuousPageHeightOverrides = new Map();
+let continuousDomWindowStart = 0;
+let continuousDomWindowEnd = 0;
+let continuousWindowUpdating = false;
+const IDB_CHUNK_WRITE_BATCH_SIZE = 8;
+const PREPARED_CHUNK_STORAGE_FLAG = "__preparedChunkStorage";
 
 const state = {
   documentId: "",
@@ -441,12 +455,20 @@ async function upgradeLegacyLockConfig(password) {
 }
 
 function setSessionPassword(password) {
-  sessionPassword = password || "";
+  const nextPassword = password || "";
+
+  if (nextPassword !== sessionPassword) {
+    encryptionKeyCache.clear();
+    recordDisplayNameCache.clear();
+  }
+
+  sessionPassword = nextPassword;
 }
 
 function clearSessionPassword() {
   sessionPassword = "";
   encryptionKeyCache.clear();
+  recordDisplayNameCache.clear();
 }
 
 async function verifyLockPassword(password, options = {}) {
@@ -517,9 +539,23 @@ async function getRecordDisplayName(record = {}) {
       return getFallbackDocumentName(getDocumentFormat(record));
     }
 
+    const cacheKey = [
+      record.id || "",
+      record.encryption?.salt || "",
+      record.encryptedName?.nonce || record.encryptedName?.iv || "",
+      record.updatedAt || 0,
+    ].join("|");
+    const cachedName = recordDisplayNameCache.get(cacheKey);
+
+    if (cachedName) {
+      return cachedName;
+    }
+
     try {
       const key = await getEncryptionKeyForRecord(record);
-      return await decryptRecordName(record, key);
+      const displayName = await decryptRecordName(record, key);
+      recordDisplayNameCache.set(cacheKey, displayName);
+      return displayName;
     } catch (error) {
       console.warn(error);
       return getFallbackDocumentName(getDocumentFormat(record));
@@ -527,6 +563,47 @@ async function getRecordDisplayName(record = {}) {
   }
 
   return getPlainRecordName(record);
+}
+
+function getImmediateRecordDisplayName(record = {}) {
+  if (!isRecordNameEncrypted(record)) {
+    return getPlainRecordName(record);
+  }
+
+  const cacheKey = [
+    record.id || "",
+    record.encryption?.salt || "",
+    record.encryptedName?.nonce || record.encryptedName?.iv || "",
+    record.updatedAt || 0,
+  ].join("|");
+
+  return recordDisplayNameCache.get(cacheKey) || getFallbackDocumentName(getDocumentFormat(record));
+}
+
+async function resolveLibraryRecordNames(entries, renderId) {
+  const startedAt = performance.now();
+
+  for (const { element, record } of entries) {
+    if (renderId !== libraryRenderRequestId) {
+      return;
+    }
+
+    await waitForNextFrame();
+    const displayName = await getRecordDisplayName(record);
+
+    if (renderId !== libraryRenderRequestId) {
+      return;
+    }
+
+    if (element.isConnected) {
+      element.textContent = displayName;
+    }
+  }
+
+  recordDiagnosticEvent("library-names-resolved", {
+    documentCount: entries.length,
+    elapsedMs: Math.round(performance.now() - startedAt),
+  });
 }
 
 function getRecordOpeningLabel(record = {}) {
@@ -1168,6 +1245,8 @@ function summarizeReaderForDiagnostics() {
     },
     continuousPages: {
       children: els.continuousPages.childElementCount,
+      domWindowEnd: continuousDomWindowEnd,
+      domWindowStart: continuousDomWindowStart,
       lowMemoryMode: isConstrainedContinuousRendering(),
       maxCanvasPixels: MAX_CONTINUOUS_CANVAS_PIXELS,
       maxRenderedPages: getContinuousMaxRenderedPages(),
@@ -1807,6 +1886,35 @@ async function deleteStoredDocumentChunks(documentId) {
   );
 }
 
+async function deleteStoredDocumentChunksByStorageId(storageId) {
+  if (!storageId) {
+    return;
+  }
+
+  return withChunkStore("readwrite", (chunksStore) =>
+    new Promise((resolve, reject) => {
+      const range = IDBKeyRange.bound(
+        [storageId, 0],
+        [storageId, Number.MAX_SAFE_INTEGER],
+      );
+      const request = chunksStore.openKeyCursor(range);
+
+      request.onerror = () => reject(request.error || new Error("Chunk store request failed."));
+      request.onsuccess = () => {
+        const cursor = request.result;
+
+        if (!cursor) {
+          resolve();
+          return;
+        }
+
+        chunksStore.delete(cursor.primaryKey);
+        cursor.continue();
+      };
+    }),
+  );
+}
+
 async function deleteStoredDocumentChunksExcept(documentId, keptStorageId) {
   if (!documentId) {
     return;
@@ -1843,6 +1951,15 @@ async function putStoredDocumentChunks(chunks) {
   });
 }
 
+async function flushStoredDocumentChunkBatch(chunks) {
+  if (!chunks.length) {
+    return;
+  }
+
+  const batch = chunks.splice(0, chunks.length);
+  await putStoredDocumentChunks(batch);
+}
+
 async function putStoredDocumentChunksFromBlob(source) {
   if (!source?.blob || !source.chunkCount) {
     return;
@@ -1856,27 +1973,41 @@ async function putStoredDocumentChunksFromBlob(source) {
     storageId: source.storageId,
   });
 
-  for (let chunkIndex = 0; chunkIndex < source.chunkCount; chunkIndex += 1) {
-    const chunkStart = source.payloadOffset + chunkIndex * source.storageChunkBytes;
-    const chunkEnd = Math.min(source.payloadOffset + source.payloadSize, chunkStart + source.storageChunkBytes);
-    const bytes = await source.blob.slice(chunkStart, chunkEnd).arrayBuffer();
+  const pendingChunks = [];
 
-    await putStoredDocumentChunks([{
-      byteLength: bytes.byteLength,
-      bytes,
-      chunkIndex,
-      documentId: source.documentId,
-      storageId: source.storageId,
-      updatedAt: source.updatedAt,
-    }]);
+  try {
+    for (let chunkIndex = 0; chunkIndex < source.chunkCount; chunkIndex += 1) {
+      const chunkStart = source.payloadOffset + chunkIndex * source.storageChunkBytes;
+      const chunkEnd = Math.min(source.payloadOffset + source.payloadSize, chunkStart + source.storageChunkBytes);
+      const bytes = await source.blob.slice(chunkStart, chunkEnd).arrayBuffer();
 
-    recordDiagnosticEvent("chunk-storage-write-chunk", {
-      byteLength: bytes.byteLength,
-      chunkIndex,
-      chunkCount: source.chunkCount,
-      documentId: source.documentId,
-      storageId: source.storageId,
-    });
+      pendingChunks.push({
+        byteLength: bytes.byteLength,
+        bytes,
+        chunkIndex,
+        documentId: source.documentId,
+        storageId: source.storageId,
+        updatedAt: source.updatedAt,
+      });
+
+      if (
+        pendingChunks.length >= IDB_CHUNK_WRITE_BATCH_SIZE ||
+        chunkIndex === source.chunkCount - 1
+      ) {
+        await flushStoredDocumentChunkBatch(pendingChunks);
+      }
+
+      recordDiagnosticEvent("chunk-storage-write-chunk", {
+        byteLength: bytes.byteLength,
+        chunkIndex,
+        chunkCount: source.chunkCount,
+        documentId: source.documentId,
+        storageId: source.storageId,
+      });
+    }
+  } catch (error) {
+    await deleteStoredDocumentChunksByStorageId(source.storageId).catch(() => {});
+    throw error;
   }
 
   recordDiagnosticEvent("chunk-storage-write-success", {
@@ -1960,26 +2091,56 @@ async function materializeStoredRecordBlob(record = {}) {
 
   const parts = [];
   const chunkCount = Math.max(0, Math.floor(record.encryptedChunkStorage.chunkCount));
+  const chunkSize = Math.max(1, Math.floor(record.encryptedChunkStorage.chunkSize || 0));
+  const payloadSize = Math.max(0, Math.floor(record.encryptedChunkStorage.payloadSize || 0));
 
   for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
-    parts.push(await readStoredDocumentChunkBytes(record, chunkIndex));
+    const bytes = await readStoredDocumentChunkBytes(record, chunkIndex);
+    const byteLength = getStoredBlobBytesLength(bytes);
+    const expectedLength = Math.min(
+      chunkSize,
+      Math.max(0, payloadSize - chunkIndex * chunkSize),
+    );
+
+    if (byteLength !== expectedLength) {
+      throw new Error(
+        `Encrypted document chunk ${chunkIndex} has ${byteLength} bytes; expected ${expectedLength}.`,
+      );
+    }
+
+    parts.push(bytes);
   }
 
-  return {
+  const materializedBlob = new Blob(parts, {
+    type: record.blobType || record.type || "application/octet-stream",
+  });
+
+  if (materializedBlob.size !== payloadSize) {
+    throw new Error(
+      `Encrypted document payload has ${materializedBlob.size} bytes; expected ${payloadSize}.`,
+    );
+  }
+
+  const materializedRecord = {
     ...record,
-    blob: new Blob(parts, {
-      type: record.blobType || record.type || "application/octet-stream",
-    }),
+    blob: materializedBlob,
   };
+  delete materializedRecord.encryptedChunkStorage;
+  delete materializedRecord.encryptedPayloadOffset;
+  delete materializedRecord.encryptedPayloadSize;
+  delete materializedRecord[PREPARED_CHUNK_STORAGE_FLAG];
+  return materializedRecord;
 }
 
 async function createStoredEncryptedBackupBlob(record = {}) {
   const materializedRecord = await materializeStoredRecordBlob(record);
-  return createVerifiedEncryptedBackupBlob(materializedRecord);
+  return createVerifiedEncryptedBackupBlob(materializedRecord, {
+    payloadBlob: materializedRecord.blob,
+  });
 }
 
-async function createVerifiedEncryptedBackupBlob(record = {}) {
-  const backupBlob = await createEncryptedBackupBlob(record);
+async function createVerifiedEncryptedBackupBlob(record = {}, options = {}) {
+  const backupBlob = await createEncryptedBackupBlob(record, options);
   const parsedRecord = await parseEncryptedBackupFile(backupBlob);
   const expectedPayloadSize = getEncryptedPayloadSize(record);
 
@@ -2069,19 +2230,29 @@ async function ensureEncryptedRecordStoredInChunks(record, reason = "open") {
 
 async function prepareDocumentRecordForStorage(record) {
   if (!record || typeof record !== "object") {
-    return { chunkSource: null, replaceChunks: false, storageRecord: record };
+    return { chunkSource: null, cleanupStorageId: "", replaceChunks: false, storageRecord: record };
   }
 
   if (!isRecordEncrypted(record)) {
-    return { chunkSource: null, replaceChunks: true, storageRecord: record };
+    return { chunkSource: null, cleanupStorageId: "", replaceChunks: true, storageRecord: record };
   }
 
   if (isEncryptedRecordStoredInChunks(record) && !(record.blob instanceof Blob)) {
-    return { chunkSource: null, replaceChunks: false, storageRecord: record };
+    const storageRecord = { ...record };
+    const preparedChunkStorage = storageRecord[PREPARED_CHUNK_STORAGE_FLAG] === true;
+    delete storageRecord[PREPARED_CHUNK_STORAGE_FLAG];
+    return {
+      chunkSource: null,
+      cleanupStorageId: preparedChunkStorage
+        ? storageRecord.encryptedChunkStorage.storageId
+        : "",
+      replaceChunks: preparedChunkStorage,
+      storageRecord,
+    };
   }
 
   if (!(record.blob instanceof Blob)) {
-    return { chunkSource: null, replaceChunks: false, storageRecord: record };
+    return { chunkSource: null, cleanupStorageId: "", replaceChunks: false, storageRecord: record };
   }
 
   const payloadOffset = getEncryptedPayloadOffset(record);
@@ -2118,6 +2289,7 @@ async function prepareDocumentRecordForStorage(record) {
       storageId,
       updatedAt: now,
     },
+    cleanupStorageId: storageId,
     replaceChunks: true,
     storageRecord,
   };
@@ -2317,13 +2489,27 @@ async function getStoredDocument(documentId) {
 }
 
 async function putStoredDocument(record) {
-  const { chunkSource, replaceChunks, storageRecord } = await prepareDocumentRecordForStorage(record);
+  const {
+    chunkSource,
+    cleanupStorageId,
+    replaceChunks,
+    storageRecord,
+  } = await prepareDocumentRecordForStorage(record);
+  let result;
 
-  if (chunkSource) {
-    await putStoredDocumentChunksFromBlob(chunkSource);
+  try {
+    if (chunkSource) {
+      await putStoredDocumentChunksFromBlob(chunkSource);
+    }
+
+    result = await withStore("readwrite", (store) => requestToPromise(store.put(storageRecord)));
+  } catch (error) {
+    if (cleanupStorageId) {
+      await deleteStoredDocumentChunksByStorageId(cleanupStorageId).catch(() => {});
+    }
+    throw error;
   }
 
-  const result = await withStore("readwrite", (store) => requestToPromise(store.put(storageRecord)));
   await putLibraryMetadataForRecord(storageRecord).catch((error) => {
     console.warn(error);
     recordDiagnosticEvent("library-metadata-write-error", {
@@ -2641,38 +2827,82 @@ async function encryptDocumentFromSource(record, source, plainName, password, on
   const nameRecord = { ...record, name: plainName, size: originalSize };
   const encryptedName = await encryptRecordName(nameRecord, key, encryption);
   const totalChunks = Math.max(1, Math.ceil(originalSize / encryption.chunkSize));
-  const encryptedParts = [];
+  const storageId = createDocumentChunkStorageId(record.id || "");
+  const storageChunkBytes = encryption.chunkSize + getEncryptionTagBytes(encryption);
+  const payloadSize = originalSize + totalChunks * getEncryptionTagBytes(encryption);
+  const updatedAt = Date.now();
+  const pendingChunks = [];
 
-  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
-    const begin = chunkIndex * encryption.chunkSize;
-    const end = Math.min(begin + encryption.chunkSize, originalSize);
-    const plainBytes = await source.readRange(begin, end);
-    const encryptedBytes = sodiumApi.crypto_aead_xchacha20poly1305_ietf_encrypt(
-      plainBytes,
-      createChunkAad(record, encryption, chunkIndex),
-      null,
-      createChunkNonce(encryption, chunkIndex),
-      key,
-    );
+  try {
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      const begin = chunkIndex * encryption.chunkSize;
+      const end = Math.min(begin + encryption.chunkSize, originalSize);
+      const plainBytes = await source.readRange(begin, end);
+      const encryptedBytes = sodiumApi.crypto_aead_xchacha20poly1305_ietf_encrypt(
+        plainBytes,
+        createChunkAad(record, encryption, chunkIndex),
+        null,
+        createChunkNonce(encryption, chunkIndex),
+        key,
+      );
+      const expectedEncryptedLength = plainBytes.byteLength + getEncryptionTagBytes(encryption);
 
-    encryptedParts.push(encryptedBytes);
-    onProgress({
-      chunkIndex: chunkIndex + 1,
-      totalChunks,
-    });
+      if (encryptedBytes.byteLength !== expectedEncryptedLength) {
+        throw new Error(
+          `Encrypted chunk ${chunkIndex} has ${encryptedBytes.byteLength} bytes; expected ${expectedEncryptedLength}.`,
+        );
+      }
+
+      const storedBytes = encryptedBytes.slice().buffer;
+
+      pendingChunks.push({
+        byteLength: storedBytes.byteLength,
+        bytes: storedBytes,
+        chunkIndex,
+        documentId: record.id,
+        storageId,
+        updatedAt,
+      });
+
+      if (
+        pendingChunks.length >= IDB_CHUNK_WRITE_BATCH_SIZE ||
+        chunkIndex === totalChunks - 1
+      ) {
+        await flushStoredDocumentChunkBatch(pendingChunks);
+        await waitForNextFrame();
+      }
+
+      onProgress({
+        chunkIndex: chunkIndex + 1,
+        totalChunks,
+      });
+    }
+  } catch (error) {
+    await deleteStoredDocumentChunksByStorageId(storageId).catch(() => {});
+    throw error;
   }
 
-  const encryptedBlob = new Blob(encryptedParts, { type: "application/octet-stream" });
-
-  return {
+  const encryptedRecord = {
     ...withoutEncryptedPayloadLocation(withoutPlainRecordName(record)),
-    blob: encryptedBlob,
+    [PREPARED_CHUNK_STORAGE_FLAG]: true,
+    blobSize: payloadSize,
+    blobType: "application/octet-stream",
     encrypted: true,
+    encryptedChunkStorage: {
+      chunkCount: totalChunks,
+      chunkSize: storageChunkBytes,
+      payloadSize,
+      storageId,
+      version: 1,
+    },
     encryptedName,
     encryption,
     size: originalSize,
-    updatedAt: Date.now(),
+    updatedAt,
   };
+  delete encryptedRecord.blob;
+  delete encryptedRecord.blobBytes;
+  return encryptedRecord;
 }
 
 async function reencryptEncryptedRecord(record, oldPassword, newPassword, onProgress = () => {}) {
@@ -2845,13 +3075,15 @@ async function exportEncryptedDocumentBackupWithPassword(record, backupPassword)
     return;
   }
 
+  let backupRecord = null;
+
   try {
     updateBackupPromptState({
       busy: true,
       progress: 0,
       text: "正在用备份密码重新加密...",
     });
-    const backupRecord = await reencryptEncryptedRecord(
+    backupRecord = await reencryptEncryptedRecord(
       record,
       sessionPassword,
       backupPassword,
@@ -2863,7 +3095,7 @@ async function exportEncryptedDocumentBackupWithPassword(record, backupPassword)
         });
       },
     );
-    const backupBlob = await createVerifiedEncryptedBackupBlob(backupRecord);
+    const backupBlob = await createStoredEncryptedBackupBlob(backupRecord);
     triggerDownload(backupBlob, createEncryptedBackupFileName(record));
     hideBackupPrompt({ force: true });
     showStatus("已开始导出加密文件。");
@@ -2871,6 +3103,12 @@ async function exportEncryptedDocumentBackupWithPassword(record, backupPassword)
     console.error(error);
     updateBackupPromptState();
     showStatus("加密文件导出失败，请确认当前书架密码可用。", true);
+  } finally {
+    const storageId = backupRecord?.encryptedChunkStorage?.storageId || "";
+
+    if (storageId && backupRecord?.[PREPARED_CHUNK_STORAGE_FLAG] === true) {
+      await deleteStoredDocumentChunksByStorageId(storageId).catch(() => {});
+    }
   }
 }
 
@@ -3202,6 +3440,15 @@ function clearContinuousPages() {
   continuousBlankRetries.clear();
   pagedBlankRetries.clear();
   els.continuousPages.replaceChildren();
+  continuousEstimatedPageWidth = 0;
+  continuousEstimatedShellHeight = 0;
+  continuousPageHeightTree = null;
+  continuousPageHeightOverrides.clear();
+  continuousDomWindowStart = 0;
+  continuousDomWindowEnd = 0;
+  continuousWindowUpdating = false;
+  continuousProgrammaticScrollTarget = 0;
+  continuousProgrammaticScrollUntil = 0;
 }
 
 async function closeCurrentDocument() {
@@ -3376,18 +3623,25 @@ async function waitForPdfOperation(promise, {
   timeoutMs = PDF_RENDER_TIMEOUT_MS,
 } = {}) {
   const pending = [promise];
+  let timeoutId = 0;
 
   if (failurePromise) {
     pending.push(failurePromise);
   }
 
   if (timeoutMs > 0) {
-    pending.push(wait(timeoutMs).then(() => {
-      throw new Error(`${label} timed out after ${timeoutMs}ms.`);
+    pending.push(new Promise((resolve, reject) => {
+      timeoutId = window.setTimeout(() => {
+        reject(new Error(`${label} timed out after ${timeoutMs}ms.`));
+      }, timeoutMs);
     }));
   }
 
-  return Promise.race(pending);
+  try {
+    return await Promise.race(pending);
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
 }
 
 function createEncryptedDocumentSourceWithKey(record, key) {
@@ -3454,55 +3708,14 @@ async function encryptDocumentRecord(record, password, onProgress = () => {}) {
     throw new Error("Document record has no blob.");
   }
 
-  const originalSize = record.size || record.blob.size || 0;
-  const sodiumApi = await ensureSodiumReady();
-  const encryption = {
-    algorithm: ENCRYPTION_ALGORITHM,
-    chunkSize: ENCRYPTION_CHUNK_SIZE,
-    encryptedAt: Date.now(),
-    keyAlgorithm: ENCRYPTION_KEY_ALGORITHM,
-    memLimit: sodiumApi.crypto_pwhash_MEMLIMIT_INTERACTIVE,
-    noncePrefix: bytesToHex(randomBytes(XCHACHA_NONCE_PREFIX_BYTES)),
-    opsLimit: sodiumApi.crypto_pwhash_OPSLIMIT_INTERACTIVE,
-    originalSize,
-    salt: bytesToHex(randomBytes(sodiumApi.crypto_pwhash_SALTBYTES)),
-    tagLength: sodiumApi.crypto_aead_xchacha20poly1305_ietf_ABYTES * 8,
-    version: ENCRYPTION_VERSION,
-  };
-  const key = await deriveEncryptionKey(password, encryption);
-  const encryptedName = await encryptRecordName(record, key, encryption);
-  const totalChunks = Math.max(1, Math.ceil(originalSize / encryption.chunkSize));
-  const encryptedParts = [];
-
-  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
-    const begin = chunkIndex * encryption.chunkSize;
-    const end = Math.min(begin + encryption.chunkSize, originalSize);
-    const plainBytes = new Uint8Array(await record.blob.slice(begin, end).arrayBuffer());
-    const encryptedBytes = sodiumApi.crypto_aead_xchacha20poly1305_ietf_encrypt(
-      plainBytes,
-      createChunkAad(record, encryption, chunkIndex),
-      null,
-      createChunkNonce(encryption, chunkIndex),
-      key,
-    );
-
-    encryptedParts.push(encryptedBytes);
-    onProgress({
-      chunkIndex: chunkIndex + 1,
-      totalChunks,
-    });
-  }
-
-  const encryptedBlob = new Blob(encryptedParts, { type: "application/octet-stream" });
-
-  return {
-    ...withoutEncryptedPayloadLocation(withoutPlainRecordName(record)),
-    blob: encryptedBlob,
-    encrypted: true,
-    encryptedName,
-    encryption,
-    size: originalSize,
-  };
+  const source = new BlobDocumentSource(record.blob);
+  return encryptDocumentFromSource(
+    record,
+    source,
+    getPlainRecordName(record),
+    password,
+    onProgress,
+  );
 }
 
 async function renderPage(pageNumber, options = {}) {
@@ -3658,26 +3871,316 @@ async function estimateContinuousPageSize() {
   }
 }
 
-function buildContinuousPlaceholders(estimatedSize) {
-  const fragment = document.createDocumentFragment();
+function getContinuousDomWindowPageCount() {
+  return isConstrainedContinuousRendering()
+    ? CONTINUOUS_CONSTRAINED_DOM_WINDOW_PAGES
+    : CONTINUOUS_DOM_WINDOW_PAGES;
+}
 
-  for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber += 1) {
-    const shell = document.createElement("article");
-    shell.className = "page-shell";
-    shell.dataset.page = String(pageNumber);
-    setContinuousShellSize(shell, estimatedSize.width, estimatedSize.height);
+function resetContinuousPageMetrics(estimatedSize = {}) {
+  const pageCount = Math.max(0, pdfDoc?.numPages || 0);
+  continuousEstimatedPageWidth = Math.max(240, Math.floor(estimatedSize.width || getAvailableCanvasWidth()));
+  continuousEstimatedShellHeight = Math.max(320, Math.floor(estimatedSize.height || 420)) + 28;
+  continuousPageHeightTree = new Float64Array(pageCount + 1);
+  continuousPageHeightOverrides.clear();
+  continuousDomWindowStart = 0;
+  continuousDomWindowEnd = 0;
+}
 
-    const placeholder = createContinuousPlaceholder(estimatedSize.width, estimatedSize.height);
-
-    const label = document.createElement("div");
-    label.className = "page-label";
-    label.textContent = String(pageNumber);
-
-    shell.append(placeholder, label);
-    fragment.append(shell);
+function addContinuousPageHeightDelta(pageNumber, delta) {
+  if (!continuousPageHeightTree || !delta) {
+    return;
   }
 
-  els.continuousPages.append(fragment);
+  for (
+    let index = Math.max(1, Math.floor(pageNumber));
+    index < continuousPageHeightTree.length;
+    index += index & -index
+  ) {
+    continuousPageHeightTree[index] += delta;
+  }
+}
+
+function getContinuousPageHeightDelta(pageCount) {
+  if (!continuousPageHeightTree) {
+    return 0;
+  }
+
+  let total = 0;
+
+  for (
+    let index = clamp(Math.floor(pageCount), 0, continuousPageHeightTree.length - 1);
+    index > 0;
+    index -= index & -index
+  ) {
+    total += continuousPageHeightTree[index];
+  }
+
+  return total;
+}
+
+function getContinuousPageHeight(pageNumber) {
+  return (
+    continuousPageHeightOverrides.get(Math.floor(pageNumber)) ||
+    continuousEstimatedShellHeight ||
+    448
+  );
+}
+
+function getContinuousPageTopOffset(pageNumber) {
+  const targetPage = clamp(Math.floor(pageNumber), 1, Math.max(1, pdfDoc?.numPages || 1));
+  const precedingPages = targetPage - 1;
+  return (
+    precedingPages * (continuousEstimatedShellHeight + CONTINUOUS_PAGE_GAP_PX) +
+    getContinuousPageHeightDelta(precedingPages)
+  );
+}
+
+function getContinuousDocumentHeight() {
+  const pageCount = Math.max(0, pdfDoc?.numPages || 0);
+
+  if (!pageCount) {
+    return 0;
+  }
+
+  return (
+    pageCount * continuousEstimatedShellHeight +
+    Math.max(0, pageCount - 1) * CONTINUOUS_PAGE_GAP_PX +
+    getContinuousPageHeightDelta(pageCount)
+  );
+}
+
+function getContinuousPageNumberAtOffset(offset) {
+  const pageCount = Math.max(0, pdfDoc?.numPages || 0);
+
+  if (!pageCount) {
+    return 0;
+  }
+
+  const targetOffset = clamp(Math.floor(offset), 0, Math.max(0, getContinuousDocumentHeight() - 1));
+  let low = 1;
+  let high = pageCount;
+  let result = 1;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+
+    if (getContinuousPageTopOffset(mid) <= targetOffset) {
+      result = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return result;
+}
+
+function updateContinuousSpacerSizes() {
+  if (!pdfDoc || !continuousEstimatedShellHeight) {
+    return;
+  }
+
+  const topSpacer = els.continuousPages.querySelector(".continuous-spacer-top");
+  const bottomSpacer = els.continuousPages.querySelector(".continuous-spacer-bottom");
+
+  if (topSpacer) {
+    topSpacer.style.height = `${Math.max(
+      0,
+      getContinuousPageTopOffset(continuousDomWindowStart) - CONTINUOUS_PAGE_GAP_PX,
+    )}px`;
+  }
+
+  if (bottomSpacer) {
+    const lastPageBottom =
+      getContinuousPageTopOffset(continuousDomWindowEnd) +
+      getContinuousPageHeight(continuousDomWindowEnd);
+    bottomSpacer.style.height = `${Math.max(
+      0,
+      getContinuousDocumentHeight() - lastPageBottom - CONTINUOUS_PAGE_GAP_PX,
+    )}px`;
+  }
+}
+
+function updateContinuousPageHeight(pageNumber, height) {
+  const targetPage = Math.floor(pageNumber);
+
+  if (
+    !continuousPageHeightTree ||
+    !Number.isFinite(targetPage) ||
+    targetPage < 1 ||
+    targetPage > (pdfDoc?.numPages || 0)
+  ) {
+    return;
+  }
+
+  const nextHeight = Math.max(1, Math.floor(height));
+  const previousHeight = getContinuousPageHeight(targetPage);
+
+  if (Math.abs(nextHeight - previousHeight) < 1) {
+    return;
+  }
+
+  if (nextHeight === continuousEstimatedShellHeight) {
+    continuousPageHeightOverrides.delete(targetPage);
+  } else {
+    continuousPageHeightOverrides.set(targetPage, nextHeight);
+  }
+
+  addContinuousPageHeightDelta(targetPage, nextHeight - previousHeight);
+  updateContinuousSpacerSizes();
+}
+
+function createContinuousShell(pageNumber) {
+  const shell = document.createElement("article");
+  shell.className = "page-shell";
+  shell.dataset.page = String(pageNumber);
+  const pageHeight = Math.max(320, getContinuousPageHeight(pageNumber) - 28);
+  setContinuousShellSize(shell, continuousEstimatedPageWidth, pageHeight);
+
+  const placeholder = createContinuousPlaceholder(continuousEstimatedPageWidth, pageHeight);
+  const label = document.createElement("div");
+  label.className = "page-label";
+  label.textContent = String(pageNumber);
+  shell.append(placeholder, label);
+  return shell;
+}
+
+function createContinuousSpacer(className) {
+  const spacer = document.createElement("div");
+  spacer.className = `continuous-spacer ${className}`;
+  spacer.setAttribute("aria-hidden", "true");
+  return spacer;
+}
+
+function renderContinuousDomWindow(centerPage, options = {}) {
+  if (!pdfDoc || !continuousEstimatedShellHeight || continuousWindowUpdating) {
+    return false;
+  }
+
+  const pageCount = pdfDoc.numPages;
+  const windowSize = Math.min(getContinuousDomWindowPageCount(), pageCount);
+  const targetPage = clamp(Math.round(centerPage), 1, pageCount);
+  const start = clamp(
+    targetPage - Math.floor(windowSize / 2),
+    1,
+    Math.max(1, pageCount - windowSize + 1),
+  );
+  const end = Math.min(pageCount, start + windowSize - 1);
+
+  if (options.force !== true && start === continuousDomWindowStart && end === continuousDomWindowEnd) {
+    return false;
+  }
+
+  const currentScrollTop = Math.max(0, els.canvasWrap.scrollTop);
+  const anchorPage = getContinuousPageNumberAtOffset(currentScrollTop + 8) || targetPage;
+  const anchorHeight = Math.max(1, getContinuousPageHeight(anchorPage));
+  const anchorRatio = clamp(
+    (currentScrollTop - getContinuousPageTopOffset(anchorPage)) / anchorHeight,
+    0,
+    0.98,
+  );
+  const existingShells = new Map(
+    Array.from(els.continuousPages.querySelectorAll(".page-shell")).map((shell) => [
+      getContinuousShellPageNumber(shell),
+      shell,
+    ]),
+  );
+
+  continuousWindowUpdating = true;
+
+  try {
+    pageObserver?.disconnect();
+
+    for (const [pageNumber, task] of pageRenderTasks) {
+      if (pageNumber < start || pageNumber > end) {
+        try {
+          task.cancel();
+        } catch {
+          // PDF.js cancellation is best effort.
+        }
+        pageRenderTasks.delete(pageNumber);
+        pendingContinuousPages.delete(pageNumber);
+        continuousRenderRuns.delete(pageNumber);
+      }
+    }
+
+    for (const [pageNumber, shell] of existingShells) {
+      if (pageNumber < start || pageNumber > end) {
+        releaseContinuousCanvas(shell);
+      }
+    }
+
+    const fragment = document.createDocumentFragment();
+    continuousDomWindowStart = start;
+    continuousDomWindowEnd = end;
+
+    if (start > 1) {
+      fragment.append(createContinuousSpacer("continuous-spacer-top"));
+    }
+
+    for (let pageNumber = start; pageNumber <= end; pageNumber += 1) {
+      fragment.append(existingShells.get(pageNumber) || createContinuousShell(pageNumber));
+    }
+
+    if (end < pageCount) {
+      fragment.append(createContinuousSpacer("continuous-spacer-bottom"));
+    }
+
+    els.continuousPages.replaceChildren(fragment);
+    updateContinuousSpacerSizes();
+
+    if (options.preserveScroll !== false) {
+      const preservedPage =
+        anchorPage >= start && anchorPage <= end
+          ? anchorPage
+          : targetPage;
+      const preservedRatio = preservedPage === anchorPage ? anchorRatio : 0;
+      els.canvasWrap.scrollTop =
+        getContinuousPageTopOffset(preservedPage) +
+        preservedRatio * getContinuousPageHeight(preservedPage);
+    }
+  } finally {
+    continuousWindowUpdating = false;
+  }
+
+  if (options.setupObserver !== false) {
+    setupContinuousObserver(renderToken);
+  }
+
+  recordDiagnosticEvent("continuous-dom-window", {
+    end,
+    pageCount,
+    start,
+  });
+  return true;
+}
+
+function ensureContinuousDomWindow(pageNumber, options = {}) {
+  if (!pdfDoc || !continuousEstimatedShellHeight) {
+    return false;
+  }
+
+  const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
+  const edgeBuffer = Math.max(3, Math.floor(getContinuousDomWindowPageCount() * 0.2));
+  const insideSafeWindow =
+    targetPage >= continuousDomWindowStart + edgeBuffer &&
+    targetPage <= continuousDomWindowEnd - edgeBuffer;
+
+  if (options.force !== true && insideSafeWindow) {
+    return false;
+  }
+
+  return renderContinuousDomWindow(targetPage, options);
+}
+
+function buildContinuousPlaceholders(estimatedSize, targetPage = state.page) {
+  resetContinuousPageMetrics(estimatedSize);
+  renderContinuousDomWindow(targetPage, {
+    force: true,
+    preserveScroll: false,
+    setupObserver: false,
+  });
 }
 
 function setContinuousShellSize(shell, width, height) {
@@ -3686,6 +4189,7 @@ function setContinuousShellSize(shell, width, height) {
   shell.dataset.pageWidth = String(safeWidth);
   shell.dataset.pageHeight = String(safeHeight);
   shell.style.minHeight = `${safeHeight + 28}px`;
+  updateContinuousPageHeight(getContinuousShellPageNumber(shell), safeHeight + 28);
 }
 
 function createContinuousPlaceholder(width, height) {
@@ -3707,54 +4211,14 @@ function getContinuousShellByPageNumber(pageNumber) {
     return null;
   }
 
-  const shell = els.continuousPages.children[targetPage - 1];
-
-  if (getContinuousShellPageNumber(shell) === targetPage) {
-    return shell;
-  }
-
   return els.continuousPages.querySelector(`[data-page="${targetPage}"]`);
 }
 
 function getContinuousShellTop(shell) {
-  return Math.max(0, shell.offsetTop - els.continuousPages.offsetTop);
-}
-
-function getContinuousShellIndexAtOffset(offset) {
-  const children = els.continuousPages.children;
-  const count = children.length;
-
-  if (!count) {
-    return -1;
-  }
-
-  const targetOffset = Math.max(0, offset);
-  let low = 0;
-  let high = count - 1;
-  let nearestIndex = 0;
-
-  while (low <= high) {
-    const mid = Math.floor((low + high) / 2);
-    const shell = children[mid];
-    const top = getContinuousShellTop(shell);
-    const bottom = top + Math.max(shell.offsetHeight, 1);
-
-    if (targetOffset < top) {
-      high = mid - 1;
-    } else if (targetOffset >= bottom) {
-      nearestIndex = mid;
-      low = mid + 1;
-    } else {
-      return mid;
-    }
-  }
-
-  return clamp(nearestIndex, 0, count - 1);
-}
-
-function getContinuousShellAtOffset(offset) {
-  const index = getContinuousShellIndexAtOffset(offset);
-  return index >= 0 ? els.continuousPages.children[index] : null;
+  const pageNumber = getContinuousShellPageNumber(shell);
+  return pageNumber
+    ? getContinuousPageTopOffset(pageNumber)
+    : Math.max(0, shell.offsetTop - els.continuousPages.offsetTop);
 }
 
 function getContinuousShellSize(shell) {
@@ -3899,31 +4363,10 @@ function getContinuousShellDistance(shell, center = getContinuousViewportWindow(
 }
 
 function getVisibleContinuousShells(extraViewports = 0.35) {
-  const children = els.continuousPages.children;
-  const count = children.length;
-
-  if (!count) {
-    return [];
-  }
-
   const windowBounds = getContinuousViewportWindow(extraViewports);
-  const startIndex = Math.max(
-    0,
-    getContinuousShellIndexAtOffset(windowBounds.top) - CONTINUOUS_VISIBLE_RANGE_BUFFER,
+  const shells = Array.from(els.continuousPages.querySelectorAll(".page-shell")).filter(
+    (shell) => isContinuousShellNearViewport(shell, extraViewports, windowBounds),
   );
-  const endIndex = Math.min(
-    count - 1,
-    getContinuousShellIndexAtOffset(windowBounds.bottom) + CONTINUOUS_VISIBLE_RANGE_BUFFER,
-  );
-  const shells = [];
-
-  for (let index = startIndex; index <= endIndex; index += 1) {
-    const shell = children[index];
-
-    if (isContinuousShellNearViewport(shell, extraViewports, windowBounds)) {
-      shells.push(shell);
-    }
-  }
 
   const { center } = getContinuousViewportWindow(0);
   return shells.sort(
@@ -4290,7 +4733,12 @@ async function renderContinuousPage(pageNumber, token = renderToken, options = {
   }
 
   const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
-  const shell = getContinuousShellByPageNumber(targetPage);
+  let shell = getContinuousShellByPageNumber(targetPage);
+
+  if (!shell && options.force) {
+    ensureContinuousDomWindow(targetPage, { force: true });
+    shell = getContinuousShellByPageNumber(targetPage);
+  }
 
   if (!shell || (!options.force && shell.dataset.rendered === "true")) {
     return shell?.dataset.rendered === "true";
@@ -5185,10 +5633,9 @@ function captureContinuousScrollPosition() {
 
   const scrollTop = Math.max(0, els.canvasWrap.scrollTop);
   const marker = scrollTop + 8;
-  const shell = getContinuousShellAtOffset(marker);
-  const nextPage = getContinuousShellPageNumber(shell) || state.scrollPage;
-  const top = shell ? getContinuousShellTop(shell) : scrollTop;
-  const height = shell ? Math.max(shell.offsetHeight, 1) : 1;
+  const nextPage = getContinuousPageNumberAtOffset(marker) || state.scrollPage;
+  const top = getContinuousPageTopOffset(nextPage);
+  const height = Math.max(getContinuousPageHeight(nextPage), 1);
   const offset = clamp(scrollTop - top, 0, height);
   const nextOffsetRatio = clamp(offset / height, 0, 0.98);
 
@@ -5214,6 +5661,9 @@ function restoreContinuousScrollPosition(options = {}) {
   }
 
   const targetPage = clamp(Math.round(state.scrollPage || state.page), 1, pdfDoc.numPages);
+  ensureContinuousDomWindow(targetPage, {
+    preserveScroll: false,
+  });
   const shell = getContinuousShellByPageNumber(targetPage);
 
   if (!shell) {
@@ -5245,25 +5695,42 @@ function isLikelyTransientTopJump() {
 
 async function scrollToContinuousPage(pageNumber, options = {}) {
   const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
-  const shell = getContinuousShellByPageNumber(targetPage);
+  continuousProgrammaticScrollTarget = targetPage;
+  continuousProgrammaticScrollUntil = Date.now() + 1_200;
+  scrollTrackingSuppressionDepth += 1;
 
-  if (!shell) {
-    return;
-  }
+  try {
+    ensureContinuousDomWindow(targetPage);
+    const shell = getContinuousShellByPageNumber(targetPage);
 
-  if (options.renderFirst !== false) {
-    scheduleContinuousPageRender(targetPage, renderToken);
-  }
+    if (!shell) {
+      return;
+    }
 
-  els.canvasWrap.scrollTo({
-    top: getContinuousPageTop(shell),
-    behavior: options.behavior || "smooth",
-  });
+    if (options.renderFirst !== false) {
+      scheduleContinuousPageRender(targetPage, renderToken);
+    }
 
-  window.requestAnimationFrame(() => {
+    const targetTop = getContinuousPageTop(shell);
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      els.canvasWrap.scrollTop = targetTop;
+      els.canvasWrap.scrollTo({
+        top: targetTop,
+        behavior: attempt === 0 ? options.behavior || "smooth" : "auto",
+      });
+      await waitForNextFrame();
+
+      if (Math.abs(els.canvasWrap.scrollTop - targetTop) <= 4) {
+        break;
+      }
+    }
+
     queueVisibleContinuousPages(renderToken);
     pruneContinuousPages();
-  });
+  } finally {
+    scrollTrackingSuppressionDepth = Math.max(0, scrollTrackingSuppressionDepth - 1);
+  }
 }
 
 async function jumpToContinuousEdge(edge) {
@@ -5627,7 +6094,7 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
     }
 
     lastLayoutWidth = getAvailableCanvasWidth();
-    buildContinuousPlaceholders(estimatedSize);
+    buildContinuousPlaceholders(estimatedSize, targetPage);
     setupContinuousObserver(token);
 
     if (shouldRestoreScroll) {
@@ -5828,6 +6295,24 @@ function updateCurrentPageFromScroll() {
     return;
   }
 
+  if (
+    continuousProgrammaticScrollTarget &&
+    Date.now() < continuousProgrammaticScrollUntil
+  ) {
+    const marker = els.canvasWrap.scrollTop + els.canvasWrap.clientHeight * 0.35;
+    const markerPage = getContinuousPageNumberAtOffset(marker);
+
+    if (Math.abs(markerPage - continuousProgrammaticScrollTarget) > 1) {
+      return;
+    }
+
+    continuousProgrammaticScrollTarget = 0;
+    continuousProgrammaticScrollUntil = 0;
+  } else if (continuousProgrammaticScrollTarget) {
+    continuousProgrammaticScrollTarget = 0;
+    continuousProgrammaticScrollUntil = 0;
+  }
+
   if (isLikelyTransientTopJump()) {
     restoreContinuousScrollPosition({
       behavior: "auto",
@@ -5836,10 +6321,10 @@ function updateCurrentPageFromScroll() {
     return;
   }
 
-  const positionChanged = captureContinuousScrollPosition();
   const marker = els.canvasWrap.scrollTop + els.canvasWrap.clientHeight * 0.35;
-  const currentShell = getContinuousShellAtOffset(marker);
-  const currentPage = getContinuousShellPageNumber(currentShell) || state.page;
+  const currentPage = getContinuousPageNumberAtOffset(marker) || state.page;
+  ensureContinuousDomWindow(currentPage);
+  const positionChanged = captureContinuousScrollPosition();
 
   const pageChanged = currentPage !== state.page;
 
@@ -8593,6 +9078,7 @@ async function renderLibraryList(options = {}) {
     }
 
     const fragment = document.createDocumentFragment();
+    const encryptedNameEntries = [];
     libraryRecordCache.clear();
     els.libraryEmptyState.hidden = documents.length > 0;
     els.libraryEmptyState.textContent = documents.length > 0 ? "" : "还没有保存过 PDF。";
@@ -8626,11 +9112,10 @@ async function renderLibraryList(options = {}) {
       openButton.dataset.documentId = record.id;
 
       name.className = "library-name";
-      name.textContent = await getRecordDisplayName(record);
+      name.textContent = getImmediateRecordDisplayName(record);
 
-      if (renderId !== libraryRenderRequestId) {
-        libraryListDirty = true;
-        return;
+      if (isRecordNameEncrypted(record)) {
+        encryptedNameEntries.push({ element: name, record });
       }
 
       meta.className = "library-meta";
@@ -8670,6 +9155,13 @@ async function renderLibraryList(options = {}) {
     recordDiagnosticEvent("library-render-success", {
       documentCount: documents.length,
       elapsedMs: Math.round(performance.now() - startedAt),
+      encryptedNameCount: encryptedNameEntries.length,
+    });
+    resolveLibraryRecordNames(encryptedNameEntries, renderId).catch((error) => {
+      console.warn(error);
+      recordDiagnosticEvent("library-names-resolve-error", {
+        error: summarizeError(error),
+      });
     });
   } catch (error) {
     console.warn(error);
@@ -9428,7 +9920,7 @@ async function runEncryptedSwitchSelfTest() {
   );
   const otherRecord = createSelfTestPdfRecord(otherId, "selftest other", 2);
   const encryptedRecord = await encryptDocumentRecord(targetPlainRecord, password);
-  const backupBlob = await createEncryptedBackupBlob(encryptedRecord);
+  const backupBlob = await createStoredEncryptedBackupBlob(encryptedRecord);
   const backupFile =
     typeof File === "undefined"
       ? backupBlob
@@ -9600,6 +10092,68 @@ async function runRapidSwitchSelfTest() {
   console.info("Rapid PDF switch self-test passed.");
 }
 
+async function runContinuousWindowSelfTest() {
+  const documentId = `${DOCUMENT_ID_PREFIX}selftest-continuous-window`;
+  const targetPage = 110;
+
+  updateSelfTestResult("running", "prepare long PDF");
+  window.__portableReaderSelfTestMetrics = {};
+  showStatus("自测：准备长 PDF 窗口化渲染...", true);
+  await deleteStoredDocument(documentId).catch(() => {});
+  deleteDocumentProgress(documentId);
+
+  const record = createSelfTestPdfRecord(documentId, "continuous window", 120);
+  await putStoredDocument(record);
+  state.mode = READ_MODES.PAGED;
+  await openSelfTestRecord(record, { resetProgress: true }, "continuous window PDF");
+
+  state.mode = READ_MODES.SCROLL;
+  state.page = 1;
+  state.scrollPage = 1;
+  await renderContinuousDocument(1, { behavior: "auto", restoreScroll: false });
+
+  const maxDomPages = getContinuousDomWindowPageCount();
+  const initialShellCount = els.continuousPages.querySelectorAll(".page-shell").length;
+
+  if (initialShellCount > maxDomPages || initialShellCount >= pdfDoc.numPages) {
+    throw new Error(`Continuous DOM window created ${initialShellCount} shells for ${pdfDoc.numPages} pages.`);
+  }
+
+  updateSelfTestResult("running", "jump inside virtualized PDF");
+  await scrollToContinuousPage(targetPage, { behavior: "auto" });
+  await renderContinuousPage(targetPage, renderToken, {
+    force: true,
+    throwOnError: true,
+  });
+  let targetShell = null;
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    targetShell = getContinuousShellByPageNumber(targetPage);
+
+    if (targetShell?.dataset.rendered === "true") {
+      break;
+    }
+
+    await wait(100);
+  }
+
+  const finalShellCount = els.continuousPages.querySelectorAll(".page-shell").length;
+
+  if (targetShell?.dataset.rendered !== "true") {
+    throw new Error(`Continuous DOM window did not render page ${targetPage}.`);
+  }
+
+  if (finalShellCount > maxDomPages || continuousDomWindowStart <= 1) {
+    throw new Error(`Continuous DOM window did not move correctly; shells=${finalShellCount}.`);
+  }
+
+  updateSelfTestResult(
+    "passed",
+    `continuous DOM window stayed at ${finalShellCount}/${pdfDoc.numPages} pages`,
+  );
+  showStatus("自测通过：长 PDF 仅保留窗口内页面节点。");
+}
+
 async function runLockSecuritySelfTest() {
   const password = "portable-reader-lock-selftest";
   const originalConfig = window.localStorage.getItem(LOCK_KEY);
@@ -9681,7 +10235,15 @@ async function runDiagnosticsSelfTest() {
 }
 
 async function runSelfTest(mode) {
-  if (!["diagnostics", "encrypted-switch", "lock-security", "rapid-switch"].includes(mode)) {
+  if (
+    ![
+      "continuous-window",
+      "diagnostics",
+      "encrypted-switch",
+      "lock-security",
+      "rapid-switch",
+    ].includes(mode)
+  ) {
     showStatus(`未知自测：${mode}`, true);
     return;
   }
@@ -9689,6 +10251,8 @@ async function runSelfTest(mode) {
   try {
     if (mode === "diagnostics") {
       await runDiagnosticsSelfTest();
+    } else if (mode === "continuous-window") {
+      await runContinuousWindowSelfTest();
     } else if (mode === "lock-security") {
       await runLockSecuritySelfTest();
     } else if (mode === "rapid-switch") {

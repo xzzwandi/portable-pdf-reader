@@ -5,19 +5,21 @@ import {
   ENCRYPTED_BACKUP_MAGIC,
   ENCRYPTED_BACKUP_MAX_HEADER_BYTES,
   ENCRYPTED_BACKUP_VERSION,
-} from "./constants.js?v=110";
+} from "./constants.js?v=111";
 import {
   getDocumentFormat,
   getEncryptedPayloadBlob,
+  getEncryptedPayloadOffset,
   getEncryptedPayloadSize,
   getEncryptionOriginalSize,
   getExpectedEncryptedPayloadSize,
   isRecordEncrypted,
   isRecordNameEncrypted,
   withDetectedEncryptedPayloadLocation,
+  withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./encryption.js?v=110";
-import { createUint32Bytes, readUint32Bytes } from "./utils.js?v=110";
+} from "./encryption.js?v=111";
+import { createUint32Bytes, readUint32Bytes } from "./utils.js?v=111";
 
 function isLibraryDocument(record) {
   return Boolean(record?.blob && typeof record.id === "string" && record.id.startsWith(DOCUMENT_ID_PREFIX));
@@ -51,9 +53,15 @@ function createEncryptedBackupHeader(record) {
   };
 }
 
-export async function createEncryptedBackupBlob(record) {
-  const payloadRecord = await withDetectedEncryptedPayloadLocation(record);
-  const payloadBlob = getEncryptedPayloadBlob(payloadRecord);
+export async function createEncryptedBackupBlob(record, options = {}) {
+  const suppliedPayloadBlob = options.payloadBlob instanceof Blob ? options.payloadBlob : null;
+  const payloadRecord = suppliedPayloadBlob
+    ? withoutEncryptedPayloadLocation({
+        ...record,
+        blob: suppliedPayloadBlob,
+      })
+    : await withDetectedEncryptedPayloadLocation(record);
+  const payloadBlob = suppliedPayloadBlob || getEncryptedPayloadBlob(payloadRecord);
   const payloadSize = getEncryptedPayloadSize(payloadRecord);
   const expectedPayloadSize = getExpectedEncryptedPayloadSize(payloadRecord);
 
@@ -70,7 +78,9 @@ export async function createEncryptedBackupBlob(record) {
     payloadBlob.size !== payloadSize ||
     (expectedPayloadSize > 0 && payloadSize !== expectedPayloadSize)
   ) {
-    throw new Error("Encrypted backup payload is missing or incomplete.");
+    throw new Error(
+      `Encrypted backup payload is missing or incomplete: blob=${payloadBlob?.size || 0}, recordBlob=${payloadRecord.blob?.size || 0}, offset=${getEncryptedPayloadOffset(payloadRecord)}, payload=${payloadSize}, expected=${expectedPayloadSize}.`,
+    );
   }
 
   const headerBytes = new TextEncoder().encode(JSON.stringify(createEncryptedBackupHeader(payloadRecord)));
