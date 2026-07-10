@@ -1,10 +1,11 @@
 import {
+  APP_VERSION,
   DOCUMENT_FORMATS,
   DOCUMENT_ID_PREFIX,
   ENCRYPTED_BACKUP_MAGIC,
   ENCRYPTED_BACKUP_MAX_HEADER_BYTES,
   ENCRYPTED_BACKUP_VERSION,
-} from "./constants.js?v=104";
+} from "./constants.js?v=110";
 import {
   getDocumentFormat,
   getEncryptedPayloadBlob,
@@ -15,8 +16,8 @@ import {
   isRecordNameEncrypted,
   withDetectedEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./encryption.js?v=104";
-import { createUint32Bytes, readUint32Bytes } from "./utils.js?v=104";
+} from "./encryption.js?v=110";
+import { createUint32Bytes, readUint32Bytes } from "./utils.js?v=110";
 
 function isLibraryDocument(record) {
   return Boolean(record?.blob && typeof record.id === "string" && record.id.startsWith(DOCUMENT_ID_PREFIX));
@@ -29,6 +30,7 @@ function createEncryptedBackupHeader(record) {
 
   return {
     app: "portable-pdf-reader",
+    appVersion: APP_VERSION,
     kind: "encrypted-document",
     version: ENCRYPTED_BACKUP_VERSION,
     exportedAt: Date.now(),
@@ -52,6 +54,25 @@ function createEncryptedBackupHeader(record) {
 export async function createEncryptedBackupBlob(record) {
   const payloadRecord = await withDetectedEncryptedPayloadLocation(record);
   const payloadBlob = getEncryptedPayloadBlob(payloadRecord);
+  const payloadSize = getEncryptedPayloadSize(payloadRecord);
+  const expectedPayloadSize = getExpectedEncryptedPayloadSize(payloadRecord);
+
+  if (
+    !isLibraryDocument(payloadRecord) ||
+    !isRecordEncrypted(payloadRecord) ||
+    !isRecordNameEncrypted(payloadRecord)
+  ) {
+    throw new Error("Encrypted backup record is invalid.");
+  }
+
+  if (
+    !(payloadBlob instanceof Blob) ||
+    payloadBlob.size !== payloadSize ||
+    (expectedPayloadSize > 0 && payloadSize !== expectedPayloadSize)
+  ) {
+    throw new Error("Encrypted backup payload is missing or incomplete.");
+  }
+
   const headerBytes = new TextEncoder().encode(JSON.stringify(createEncryptedBackupHeader(payloadRecord)));
 
   if (headerBytes.length > ENCRYPTED_BACKUP_MAX_HEADER_BYTES) {
