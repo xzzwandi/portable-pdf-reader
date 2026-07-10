@@ -52,7 +52,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=107";
+} from "./src/constants.js?v=110";
 import {
   bytesToHex,
   createChunkAad,
@@ -82,23 +82,23 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=107";
+} from "./src/encryption.js?v=110";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=107";
+} from "./src/utils.js?v=110";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=107";
+} from "./src/encrypted-backups.js?v=110";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=107";
+} from "./src/pdf-sources.js?v=110";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -150,7 +150,6 @@ const els = {
   libraryEmptyState: document.querySelector("#libraryEmptyState"),
   libraryList: document.querySelector("#libraryList"),
   libraryOverlay: document.querySelector("#libraryOverlay"),
-  lockButton: document.querySelector("#lockButton"),
   lockCancelButton: document.querySelector("#lockCancelButton"),
   lockConfirmInput: document.querySelector("#lockConfirmInput"),
   lockDescription: document.querySelector("#lockDescription"),
@@ -346,6 +345,16 @@ function isScrollTrackingSuppressed() {
 function getLockConfig() {
   try {
     const config = JSON.parse(window.localStorage.getItem(LOCK_KEY) || "null");
+
+    if (
+      config?.version === 3 &&
+      config?.hashAlgorithm === ARGON2ID13_KEY_ALGORITHM &&
+      typeof config?.passwordHash === "string" &&
+      config.passwordHash.startsWith("$argon2id$")
+    ) {
+      return config;
+    }
+
     return config?.salt && config?.hash ? config : null;
   } catch {
     return null;
@@ -387,9 +396,48 @@ function hashLegacyLocalPassword(password, salt) {
   return hashString(`${salt}:${password}:local-lock`);
 }
 
-async function getPasswordHashCandidates(password, salt) {
+async function getLegacyPasswordHashCandidates(password, salt) {
   const hashes = [await hashPassword(password, salt), hashLegacyLocalPassword(password, salt)];
   return [...new Set(hashes)];
+}
+
+function isCurrentLockConfig(config = {}) {
+  return (
+    config?.version === 3 &&
+    config?.hashAlgorithm === ARGON2ID13_KEY_ALGORITHM &&
+    typeof config?.passwordHash === "string" &&
+    config.passwordHash.startsWith("$argon2id$")
+  );
+}
+
+async function createCurrentLockConfig(password) {
+  const sodiumApi = await ensureSodiumReady();
+  const passwordHash = sodiumApi.crypto_pwhash_str(
+    password,
+    sodiumApi.crypto_pwhash_OPSLIMIT_INTERACTIVE,
+    sodiumApi.crypto_pwhash_MEMLIMIT_INTERACTIVE,
+  );
+
+  return {
+    hashAlgorithm: ARGON2ID13_KEY_ALGORITHM,
+    passwordHash,
+    version: 3,
+  };
+}
+
+async function verifyCurrentLockPassword(password, config) {
+  const sodiumApi = await ensureSodiumReady();
+  return sodiumApi.crypto_pwhash_str_verify(config.passwordHash, password);
+}
+
+async function upgradeLegacyLockConfig(password) {
+  const config = await createCurrentLockConfig(password);
+  setLockConfig(config);
+  recordDiagnosticEvent("lock-config-upgraded", {
+    hashAlgorithm: config.hashAlgorithm,
+    version: config.version,
+  });
+  return config;
 }
 
 function setSessionPassword(password) {
@@ -401,14 +449,31 @@ function clearSessionPassword() {
   encryptionKeyCache.clear();
 }
 
-async function verifyLockPassword(password) {
+async function verifyLockPassword(password, options = {}) {
   const config = getLockConfig();
 
   if (!config) {
     return true;
   }
 
-  return (await getPasswordHashCandidates(password, config.salt)).includes(config.hash);
+  if (isCurrentLockConfig(config)) {
+    return verifyCurrentLockPassword(password, config);
+  }
+
+  const valid = (await getLegacyPasswordHashCandidates(password, config.salt)).includes(config.hash);
+
+  if (valid && options.upgradeLegacy !== false) {
+    try {
+      await upgradeLegacyLockConfig(password);
+    } catch (error) {
+      console.warn("Legacy lock configuration could not be upgraded.", error);
+      recordDiagnosticEvent("lock-config-upgrade-error", {
+        error: summarizeError(error),
+      });
+    }
+  }
+
+  return valid;
 }
 
 function getEncryptionKeyCacheId(record = {}, password = "") {
@@ -580,14 +645,7 @@ async function handleLockSubmit(event) {
         return;
       }
 
-      const salt = createSalt();
-      const hash = await hashPassword(password, salt);
-      setLockConfig({
-        hash,
-        hashAlgorithm: "SHA-256",
-        salt,
-        version: 2,
-      });
+      setLockConfig(await createCurrentLockConfig(password));
       clearSessionPassword();
       stripStoredPlainFileNames();
       showStatus("密码锁已开启。");
@@ -601,18 +659,14 @@ async function handleLockSubmit(event) {
     return;
   }
 
-  const config = getLockConfig();
-
-  if (!config) {
+  if (!getLockConfig()) {
     setLockBusy(false);
     hideLockOverlay();
     return;
   }
 
   try {
-    const hashes = await getPasswordHashCandidates(password, config.salt);
-
-    if (!hashes.includes(config.hash)) {
+    if (!(await verifyLockPassword(password))) {
       setLockMessage("密码不对。");
       els.lockPasswordInput.select();
       return;
@@ -1919,6 +1973,27 @@ async function materializeStoredRecordBlob(record = {}) {
   };
 }
 
+async function createStoredEncryptedBackupBlob(record = {}) {
+  const materializedRecord = await materializeStoredRecordBlob(record);
+  return createVerifiedEncryptedBackupBlob(materializedRecord);
+}
+
+async function createVerifiedEncryptedBackupBlob(record = {}) {
+  const backupBlob = await createEncryptedBackupBlob(record);
+  const parsedRecord = await parseEncryptedBackupFile(backupBlob);
+  const expectedPayloadSize = getEncryptedPayloadSize(record);
+
+  if (
+    parsedRecord.id !== record.id ||
+    parsedRecord.encryption?.salt !== record.encryption?.salt ||
+    getEncryptedPayloadSize(parsedRecord) !== expectedPayloadSize
+  ) {
+    throw new Error("Encrypted backup verification failed before download.");
+  }
+
+  return backupBlob;
+}
+
 function reviveStoredDocumentRecord(record) {
   if (!record || typeof record !== "object") {
     return record;
@@ -2515,7 +2590,8 @@ function isEncryptedBackupFile(file) {
 }
 
 function createEncryptedBackupFileName(record = {}) {
-  return `portable-reader-${hashString(record.id || String(Date.now()))}${ENCRYPTED_BACKUP_EXTENSION}`;
+  const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+  return `portable-reader-${hashString(record.id || String(Date.now()))}-${APP_VERSION}-${timestamp}${ENCRYPTED_BACKUP_EXTENSION}`;
 }
 
 function triggerDownload(blob, fileName) {
@@ -2660,8 +2736,7 @@ async function exportEncryptedDocumentBackup(documentId) {
 
   try {
     showStatus("正在准备导出加密文件...", true);
-    record = await materializeStoredRecordBlob(record);
-    const backupBlob = await createEncryptedBackupBlob(record);
+    const backupBlob = await createStoredEncryptedBackupBlob(record);
     triggerDownload(backupBlob, createEncryptedBackupFileName(record));
     showStatus("已开始导出加密文件。");
   } catch (error) {
@@ -2753,7 +2828,7 @@ async function exportEncryptedDocumentBackupWithCurrentPassword(record) {
       progress: 100,
       text: "正在准备导出...",
     });
-    const backupBlob = await createEncryptedBackupBlob(record);
+    const backupBlob = await createStoredEncryptedBackupBlob(record);
     triggerDownload(backupBlob, createEncryptedBackupFileName(record));
     hideBackupPrompt({ force: true });
     showStatus("已开始导出加密文件。");
@@ -2788,7 +2863,7 @@ async function exportEncryptedDocumentBackupWithPassword(record, backupPassword)
         });
       },
     );
-    const backupBlob = await createEncryptedBackupBlob(backupRecord);
+    const backupBlob = await createVerifiedEncryptedBackupBlob(backupRecord);
     triggerDownload(backupBlob, createEncryptedBackupFileName(record));
     hideBackupPrompt({ force: true });
     showStatus("已开始导出加密文件。");
@@ -8765,7 +8840,6 @@ function wireEvents() {
   els.diagnosticsOverlay.addEventListener("touchstart", rememberPanelTouch, { passive: true });
   els.diagnosticsOverlay.addEventListener("touchmove", preventPanelScrollLeak, { passive: false });
   els.diagnosticsOverlay.addEventListener("wheel", preventPanelScrollLeak, { passive: false });
-  els.lockButton.addEventListener("click", lockReader);
   els.lockCancelButton.addEventListener("click", hideLockOverlay);
   els.lockForm.addEventListener("submit", handleLockSubmit);
   els.lockOverlay.addEventListener("touchmove", preventLockScroll, { passive: false });
@@ -9435,6 +9509,16 @@ async function runEncryptedSwitchSelfTest() {
     throw new Error("Imported encrypted self-test record still contains backup container bytes.");
   }
 
+  updateSelfTestResult("running", "export stored encrypted PDF");
+  showStatus("自测：导出分块存储的加密 PDF...", true);
+  const exportedBackupBlob = await createStoredEncryptedBackupBlob(storedEncryptedRecord);
+  const exportedBackupRecord = await parseEncryptedBackupFile(exportedBackupBlob);
+  await verifyEncryptedBackupRecord(exportedBackupRecord, password);
+
+  if (getEncryptedPayloadSize(exportedBackupRecord) !== expectedEncryptedPayloadSize) {
+    throw new Error("Exported encrypted self-test backup payload size does not match storage metadata.");
+  }
+
   updateSelfTestResult("running", "reopen encrypted PDF after switching");
   showStatus("自测：从书架重新打开加密 PDF...", true);
   await openSelfTestRecord(storedEncryptedRecord, {}, "reopen encrypted PDF after switching");
@@ -9516,6 +9600,63 @@ async function runRapidSwitchSelfTest() {
   console.info("Rapid PDF switch self-test passed.");
 }
 
+async function runLockSecuritySelfTest() {
+  const password = "portable-reader-lock-selftest";
+  const originalConfig = window.localStorage.getItem(LOCK_KEY);
+
+  try {
+    updateSelfTestResult("running", "create Argon2id lock config");
+    const currentConfig = await createCurrentLockConfig(password);
+
+    if (!isCurrentLockConfig(currentConfig) || currentConfig.hash || currentConfig.salt) {
+      throw new Error("Current lock configuration is not an Argon2id encoded hash.");
+    }
+
+    setLockConfig(currentConfig);
+
+    if (!(await verifyLockPassword(password, { upgradeLegacy: false }))) {
+      throw new Error("Argon2id lock configuration rejected the correct password.");
+    }
+
+    if (await verifyLockPassword(`${password}-wrong`, { upgradeLegacy: false })) {
+      throw new Error("Argon2id lock configuration accepted an incorrect password.");
+    }
+
+    updateSelfTestResult("running", "migrate legacy lock config");
+    const legacySalt = createSalt();
+    const legacyHash = await hashPassword(password, legacySalt);
+    setLockConfig({
+      hash: legacyHash,
+      hashAlgorithm: "SHA-256",
+      salt: legacySalt,
+      version: 2,
+    });
+
+    if (!(await verifyLockPassword(password))) {
+      throw new Error("Legacy lock configuration rejected the correct password.");
+    }
+
+    const migratedConfig = getLockConfig();
+
+    if (!isCurrentLockConfig(migratedConfig) || migratedConfig.hash || migratedConfig.salt) {
+      throw new Error("Legacy lock configuration was not migrated to Argon2id.");
+    }
+
+    if (!(await verifyLockPassword(password, { upgradeLegacy: false }))) {
+      throw new Error("Migrated Argon2id lock configuration rejected the correct password.");
+    }
+
+    updateSelfTestResult("passed", "Argon2id lock verification and legacy migration passed");
+    showStatus("自测通过：密码锁已使用 Argon2id，旧配置可自动迁移。");
+  } finally {
+    if (originalConfig === null) {
+      window.localStorage.removeItem(LOCK_KEY);
+    } else {
+      window.localStorage.setItem(LOCK_KEY, originalConfig);
+    }
+  }
+}
+
 async function runDiagnosticsSelfTest() {
   updateSelfTestResult("running", "prepare diagnostics");
   latestDiagnosticsText = "";
@@ -9540,7 +9681,7 @@ async function runDiagnosticsSelfTest() {
 }
 
 async function runSelfTest(mode) {
-  if (!["diagnostics", "encrypted-switch", "rapid-switch"].includes(mode)) {
+  if (!["diagnostics", "encrypted-switch", "lock-security", "rapid-switch"].includes(mode)) {
     showStatus(`未知自测：${mode}`, true);
     return;
   }
@@ -9548,6 +9689,8 @@ async function runSelfTest(mode) {
   try {
     if (mode === "diagnostics") {
       await runDiagnosticsSelfTest();
+    } else if (mode === "lock-security") {
+      await runLockSecuritySelfTest();
     } else if (mode === "rapid-switch") {
       await runRapidSwitchSelfTest();
     } else {
