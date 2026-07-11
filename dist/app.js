@@ -52,7 +52,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=111";
+} from "./src/constants.js?v=112";
 import {
   bytesToHex,
   createChunkAad,
@@ -82,23 +82,23 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=111";
+} from "./src/encryption.js?v=112";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=111";
+} from "./src/utils.js?v=112";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=111";
+} from "./src/encrypted-backups.js?v=112";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=111";
+} from "./src/pdf-sources.js?v=112";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -113,6 +113,7 @@ const els = {
   backupForm: document.querySelector("#backupForm"),
   backupOverlay: document.querySelector("#backupOverlay"),
   backupPasswordInput: document.querySelector("#backupPasswordInput"),
+  backupPlainButton: document.querySelector("#backupPlainButton"),
   backupProgress: document.querySelector("#backupProgress"),
   backupProgressText: document.querySelector("#backupProgressText"),
   backupSubmitButton: document.querySelector("#backupSubmitButton"),
@@ -2792,6 +2793,61 @@ function triggerDownload(blob, fileName) {
   window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
+function getPlainDocumentMimeType(record = {}) {
+  return getDocumentFormat(record) === DOCUMENT_FORMATS.EPUB
+    ? "application/epub+zip"
+    : "application/pdf";
+}
+
+async function createPlainDocumentExport(record, onProgress = () => {}) {
+  const type = getPlainDocumentMimeType(record);
+
+  if (!isRecordEncrypted(record)) {
+    const blob = record.blob instanceof Blob
+      ? record.blob.slice(0, record.blob.size, record.blob.type || record.type || type)
+      : new Blob([record.blobBytes], { type: record.type || type });
+
+    return {
+      blob,
+      fileName: getPlainRecordName(record),
+    };
+  }
+
+  if (!sessionPassword) {
+    throw new Error("Encrypted document is locked.");
+  }
+
+  const key = await getEncryptionKeyForRecord(record);
+  const fileName = await decryptRecordName(record, key);
+  const source = createEncryptedDocumentSourceWithKey(record, key);
+  const chunkSize = Math.max(1, Math.floor(source.chunkSize || ENCRYPTION_CHUNK_SIZE));
+  const totalChunks = Math.max(1, Math.ceil(source.length / chunkSize));
+  const parts = [];
+
+  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+    const begin = chunkIndex * chunkSize;
+    const end = Math.min(source.length, begin + chunkSize);
+    const bytes = await source.readRange(begin, end);
+    parts.push(bytes);
+    onProgress({
+      chunkIndex: chunkIndex + 1,
+      totalChunks,
+    });
+    await waitForNextFrame();
+  }
+
+  const blob = new Blob(parts, { type });
+
+  if (blob.size !== source.length) {
+    throw new Error(`Decrypted document has ${blob.size} bytes; expected ${source.length}.`);
+  }
+
+  return {
+    blob,
+    fileName: fileName || getFallbackDocumentName(getDocumentFormat(record)),
+  };
+}
+
 async function importEncryptedBackupFile(file) {
   const record = await parseEncryptedBackupFile(file);
   return importEncryptedBackupRecordWithCurrentPassword(record);
@@ -2979,6 +3035,7 @@ function updateBackupPromptState({ busy = false, progress = 0, text = "" } = {})
   backupOperationInProgress = busy;
   els.backupCancelButton.disabled = busy;
   els.backupCurrentButton.disabled = busy;
+  els.backupPlainButton.disabled = busy;
   els.backupPasswordInput.disabled = busy;
   els.backupConfirmInput.disabled = busy;
   els.backupSubmitButton.disabled = busy;
@@ -3006,16 +3063,17 @@ function showBackupExportPrompt(record) {
     return;
   }
 
-  if (!isRecordEncrypted(record) || !isRecordNameEncrypted(record)) {
-    showStatus("这个文件还没有加密，不能导出加密备份。", true);
+  if (!isRecordEncrypted(record)) {
+    exportDocumentAsPlainFile(record);
     return;
   }
 
   closeLibrary();
   closeToc();
   els.backupTitle.textContent = "导出加密文件";
-  els.backupDescription.textContent = "可以直接使用当前书架密码导出，也可以另设备份密码导出。";
+  els.backupDescription.textContent = "可以导出加密备份，也可以解密后按原文件导出。未加密文件将不再受书架密码保护。";
   els.backupCurrentButton.hidden = false;
+  els.backupPlainButton.hidden = false;
   els.backupConfirmInput.hidden = false;
   els.backupConfirmInput.required = true;
   els.backupPasswordInput.placeholder = "输入新的备份密码";
@@ -3035,6 +3093,7 @@ function showBackupImportPasswordPrompt(record) {
   els.backupTitle.textContent = "输入备份密码";
   els.backupDescription.textContent = "这个加密备份不是用当前书架密码导出的，请输入备份文件的密码。";
   els.backupCurrentButton.hidden = true;
+  els.backupPlainButton.hidden = true;
   els.backupConfirmInput.hidden = true;
   els.backupConfirmInput.required = false;
   els.backupPasswordInput.placeholder = "输入备份密码";
@@ -3066,6 +3125,57 @@ async function exportEncryptedDocumentBackupWithCurrentPassword(record) {
     console.error(error);
     updateBackupPromptState();
     showStatus("加密文件导出失败。", true);
+  }
+}
+
+async function exportDocumentAsPlainFile(record, options = {}) {
+  const fromPrompt = options.fromPrompt === true;
+
+  try {
+    if (fromPrompt) {
+      updateBackupPromptState({
+        busy: true,
+        progress: 0,
+        text: "正在解密原文件...",
+      });
+    } else {
+      showStatus("正在准备导出未加密文件...", true);
+    }
+
+    const { blob, fileName } = await createPlainDocumentExport(
+      record,
+      ({ chunkIndex, totalChunks }) => {
+        if (!fromPrompt) {
+          return;
+        }
+
+        updateBackupPromptState({
+          busy: true,
+          progress: Math.round((chunkIndex / Math.max(1, totalChunks)) * 100),
+          text: `正在解密 ${chunkIndex}/${totalChunks}`,
+        });
+      },
+    );
+    triggerDownload(blob, fileName);
+
+    if (fromPrompt) {
+      hideBackupPrompt({ force: true });
+    }
+
+    showStatus("已开始导出未加密文件。请妥善保管。", true);
+  } catch (error) {
+    console.error(error);
+
+    if (fromPrompt) {
+      updateBackupPromptState();
+    }
+
+    showStatus(
+      isRecordEncrypted(record)
+        ? "未加密文件导出失败，请确认书架已解锁。"
+        : "文件导出失败。",
+      true,
+    );
   }
 }
 
@@ -3152,6 +3262,14 @@ async function handleBackupCurrentExport() {
   }
 
   await exportEncryptedDocumentBackupWithCurrentPassword(pendingBackupRequest.record);
+}
+
+async function handleBackupPlainExport() {
+  if (backupOperationInProgress || pendingBackupRequest?.mode !== "export") {
+    return;
+  }
+
+  await exportDocumentAsPlainFile(pendingBackupRequest.record, { fromPrompt: true });
 }
 
 async function handleBackupSubmit(event) {
@@ -9337,6 +9455,7 @@ function wireEvents() {
   els.lockOverlay.addEventListener("touchmove", preventLockScroll, { passive: false });
   els.lockOverlay.addEventListener("wheel", preventLockScroll, { passive: false });
   els.backupCurrentButton.addEventListener("click", handleBackupCurrentExport);
+  els.backupPlainButton.addEventListener("click", handleBackupPlainExport);
   els.backupCancelButton.addEventListener("click", hideBackupPrompt);
   els.backupForm.addEventListener("submit", handleBackupSubmit);
   els.backupOverlay.addEventListener("click", (event) => {
@@ -9999,6 +10118,23 @@ async function runEncryptedSwitchSelfTest() {
 
   if (storedPrefix === ENCRYPTED_BACKUP_MAGIC) {
     throw new Error("Imported encrypted self-test record still contains backup container bytes.");
+  }
+
+  updateSelfTestResult("running", "export decrypted original PDF");
+  showStatus("自测：导出未加密原文件...", true);
+  const plainExport = await createPlainDocumentExport(storedEncryptedRecord);
+  const [expectedPlainHash, exportedPlainHash] = await Promise.all([
+    window.crypto.subtle.digest("SHA-256", await targetPlainRecord.blob.arrayBuffer()),
+    window.crypto.subtle.digest("SHA-256", await plainExport.blob.arrayBuffer()),
+  ]);
+
+  if (
+    plainExport.fileName !== targetPlainRecord.name ||
+    plainExport.blob.type !== targetPlainRecord.type ||
+    plainExport.blob.size !== targetPlainRecord.blob.size ||
+    bytesToHex(new Uint8Array(exportedPlainHash)) !== bytesToHex(new Uint8Array(expectedPlainHash))
+  ) {
+    throw new Error("Decrypted self-test export does not match the original PDF.");
   }
 
   updateSelfTestResult("running", "export stored encrypted PDF");

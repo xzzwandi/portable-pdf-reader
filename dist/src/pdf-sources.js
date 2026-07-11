@@ -7,7 +7,7 @@ import {
   PDF_RANGE_CHUNK_SIZE,
   PDF_SOURCE_READ_RETRY_DELAY_MS,
   PDF_SOURCE_READ_RETRY_LIMIT,
-} from "./constants.js?v=111";
+} from "./constants.js?v=112";
 import {
   createChunkAad,
   createChunkIv,
@@ -17,8 +17,8 @@ import {
   getEncryptedPayloadSize,
   getEncryptionOriginalSize,
   getEncryptionTagBytes,
-} from "./encryption.js?v=111";
-import { clamp, wait } from "./utils.js?v=111";
+} from "./encryption.js?v=112";
+import { clamp, wait } from "./utils.js?v=112";
 
 const PDFJS_ROOT = new URL("../vendor/pdfjs/", import.meta.url).href;
 const PDFJS_WORKER_VERSION = APP_VERSION.replace(/^v/, "");
