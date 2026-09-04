@@ -52,7 +52,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=112";
+} from "./src/constants.js?v=113";
 import {
   bytesToHex,
   createChunkAad,
@@ -82,23 +82,23 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=112";
+} from "./src/encryption.js?v=113";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=112";
+} from "./src/utils.js?v=113";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=112";
+} from "./src/encrypted-backups.js?v=113";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=112";
+} from "./src/pdf-sources.js?v=113";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -237,6 +237,7 @@ let epubPaneTouchStart = null;
 let overlayTouchY = 0;
 let appFullscreen = false;
 let syncingNativeFullscreen = false;
+let fullscreenTransitionInProgress = false;
 let epubTocEntriesCache = null;
 let epubSectionHrefIndex = null;
 let tocEntries = [];
@@ -265,6 +266,7 @@ let continuousProgrammaticScrollUntil = 0;
 const CONTINUOUS_PAGE_GAP_PX = 14;
 const CONTINUOUS_DOM_WINDOW_PAGES = 36;
 const CONTINUOUS_CONSTRAINED_DOM_WINDOW_PAGES = 22;
+const CONTINUOUS_READING_MARKER_RATIO = 0.35;
 let continuousEstimatedPageWidth = 0;
 let continuousEstimatedShellHeight = 0;
 let continuousPageHeightTree = null;
@@ -3364,26 +3366,29 @@ function updateFullscreenButtons() {
   els.floatingFullscreenButton.setAttribute("aria-pressed", String(appFullscreen));
 }
 
-function syncFullscreenLayoutAfterFrame() {
-  window.requestAnimationFrame(() => {
-    lastViewportChangeAt = Date.now();
+async function syncFullscreenLayoutAfterFrame(continuousAnchor = null) {
+  await waitForNextFrame();
+  lastViewportChangeAt = Date.now();
 
-    if (epubRendition) {
-      epubRendition.resize("100%", "100%", state.epubCfi || undefined);
-      return;
-    }
+  if (epubRendition) {
+    epubRendition.resize("100%", "100%", state.epubCfi || undefined);
+    return;
+  }
 
-    if (!pdfDoc) {
-      return;
-    }
+  if (!pdfDoc) {
+    return;
+  }
 
-    if (isScrollMode()) {
-      renderCurrentView(state.page, { behavior: "auto", restoreScroll: true });
-      return;
-    }
+  if (isScrollMode()) {
+    await renderCurrentView(continuousAnchor?.page || state.page, {
+      behavior: "auto",
+      continuousAnchor,
+      restoreScroll: true,
+    });
+    return;
+  }
 
-    renderCurrentView(state.page, { behavior: "auto" });
-  });
+  await renderCurrentView(state.page, { behavior: "auto" });
 }
 
 function setAppFullscreen(enabled, options = {}) {
@@ -3394,10 +3399,10 @@ function setAppFullscreen(enabled, options = {}) {
     return;
   }
 
-  if (pdfDoc && isScrollMode()) {
-    captureContinuousScrollPosition();
-  }
+  const continuousAnchor =
+    options.continuousAnchor || (pdfDoc && isScrollMode() ? captureContinuousReadingAnchor() : null);
 
+  clearContinuousScrollUpdate();
   appFullscreen = nextFullscreen;
   document.documentElement.classList.toggle("is-app-fullscreen", appFullscreen);
   document.body.classList.toggle("is-app-fullscreen", appFullscreen);
@@ -3405,7 +3410,9 @@ function setAppFullscreen(enabled, options = {}) {
   updateControls();
 
   if (options.syncLayout !== false) {
-    syncFullscreenLayoutAfterFrame();
+    syncFullscreenLayoutAfterFrame(continuousAnchor).catch((error) => {
+      console.error(error);
+    });
   }
 }
 
@@ -3444,13 +3451,53 @@ async function exitNativeFullscreen() {
 }
 
 async function toggleAppFullscreen() {
-  const nextFullscreen = !appFullscreen;
-  setAppFullscreen(nextFullscreen);
+  if (fullscreenTransitionInProgress) {
+    return;
+  }
 
-  if (nextFullscreen) {
-    await enterNativeFullscreen();
-  } else {
-    await exitNativeFullscreen();
+  const nextFullscreen = !appFullscreen;
+  const continuousAnchor = pdfDoc && isScrollMode() ? captureContinuousReadingAnchor() : null;
+  fullscreenTransitionInProgress = true;
+  scrollTrackingSuppressionDepth += 1;
+  setAppFullscreen(nextFullscreen, {
+    continuousAnchor,
+    syncLayout: false,
+  });
+
+  try {
+    if (nextFullscreen) {
+      await enterNativeFullscreen();
+    } else {
+      await exitNativeFullscreen();
+    }
+
+    await syncFullscreenLayoutAfterFrame(continuousAnchor);
+    await wait(220);
+  } finally {
+    scrollTrackingSuppressionDepth = Math.max(0, scrollTrackingSuppressionDepth - 1);
+    fullscreenTransitionInProgress = false;
+  }
+}
+
+async function handleNativeFullscreenExit() {
+  if (fullscreenTransitionInProgress || !appFullscreen) {
+    return;
+  }
+
+  const continuousAnchor = pdfDoc && isScrollMode() ? captureContinuousReadingAnchor() : null;
+  fullscreenTransitionInProgress = true;
+  scrollTrackingSuppressionDepth += 1;
+  setAppFullscreen(false, {
+    continuousAnchor,
+    syncLayout: false,
+  });
+
+  try {
+    await syncFullscreenLayoutAfterFrame(continuousAnchor);
+    await wait(220);
+  } finally {
+    scrollTrackingSuppressionDepth = Math.max(0, scrollTrackingSuppressionDepth - 1);
+    fullscreenTransitionInProgress = false;
   }
 }
 
@@ -5709,14 +5756,25 @@ async function setEpubScrollEdge(edge) {
   return false;
 }
 
+function applyContinuousScrollTopInstant(top) {
+  const previousScrollBehavior = els.canvasWrap.style.scrollBehavior;
+  els.canvasWrap.style.scrollBehavior = "auto";
+
+  try {
+    els.canvasWrap.scrollTop = top;
+    els.canvasWrap.scrollTo({
+      top,
+      behavior: "auto",
+    });
+  } finally {
+    els.canvasWrap.style.scrollBehavior = previousScrollBehavior;
+  }
+}
+
 function setContinuousScrollTop(top, edge = "") {
   const maxScrollTop = getContinuousMaxScrollTop();
   const targetTop = edge === "bottom" ? maxScrollTop : clamp(Math.round(top), 0, maxScrollTop);
-  els.canvasWrap.scrollTop = targetTop;
-  els.canvasWrap.scrollTo({
-    top: targetTop,
-    behavior: "auto",
-  });
+  applyContinuousScrollTopInstant(targetTop);
 
   if (maxScrollTop <= 2) {
     window.scrollTo({
@@ -5727,11 +5785,7 @@ function setContinuousScrollTop(top, edge = "") {
 
   window.requestAnimationFrame(() => {
     if (Math.abs(els.canvasWrap.scrollTop - targetTop) > 4) {
-      els.canvasWrap.scrollTop = targetTop;
-      els.canvasWrap.scrollTo({
-        top: targetTop,
-        behavior: "auto",
-      });
+      applyContinuousScrollTopInstant(targetTop);
     }
     if (maxScrollTop <= 2) {
       window.scrollTo({
@@ -5767,6 +5821,49 @@ function captureContinuousScrollPosition() {
   state.scrollTop = scrollTop;
 
   return changed;
+}
+
+function captureContinuousReadingAnchor() {
+  if (!pdfDoc || !isScrollMode() || !els.continuousPages.childElementCount) {
+    return null;
+  }
+
+  const viewportRatio = CONTINUOUS_READING_MARKER_RATIO;
+  const marker = Math.max(0, els.canvasWrap.scrollTop) + els.canvasWrap.clientHeight * viewportRatio;
+  const page = getContinuousPageNumberAtOffset(marker) || state.page;
+  const pageTop = getContinuousPageTopOffset(page);
+  const pageHeight = Math.max(getContinuousPageHeight(page), 1);
+
+  return {
+    offsetRatio: clamp((marker - pageTop) / pageHeight, 0, 0.98),
+    page,
+    viewportRatio,
+  };
+}
+
+function restoreContinuousReadingAnchor(anchor) {
+  if (!anchor || !pdfDoc || !isScrollMode() || !els.continuousPages.childElementCount) {
+    return false;
+  }
+
+  const targetPage = clamp(Math.round(anchor.page || state.page), 1, pdfDoc.numPages);
+  ensureContinuousDomWindow(targetPage, {
+    preserveScroll: false,
+  });
+
+  const shell = getContinuousShellByPageNumber(targetPage);
+
+  if (!shell) {
+    return false;
+  }
+
+  const pageHeight = Math.max(getContinuousPageHeight(targetPage), 1);
+  const pageOffset = clamp(anchor.offsetRatio || 0, 0, 0.98) * pageHeight;
+  const viewportOffset = clamp(anchor.viewportRatio || 0, 0, 1) * els.canvasWrap.clientHeight;
+  const targetTop = getContinuousPageTopOffset(targetPage) + pageOffset - viewportOffset;
+  setContinuousScrollTop(targetTop);
+  scheduleContinuousPageRender(targetPage, renderToken);
+  return true;
 }
 
 function restoreContinuousScrollPosition(options = {}) {
@@ -5912,6 +6009,11 @@ function scheduleContinuousScrollUpdate() {
 
   continuousScrollFrame = window.requestAnimationFrame(() => {
     continuousScrollFrame = 0;
+
+    if (isScrollTrackingSuppressed()) {
+      return;
+    }
+
     updateCurrentPageFromScroll();
   });
 }
@@ -6184,8 +6286,11 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
     }
   };
   const shouldRestoreScroll = options.restoreScroll === true;
+  const continuousAnchor = options.continuousAnchor || null;
   const targetPage = clamp(
-    Math.round(shouldRestoreScroll ? state.scrollPage || pageNumber : pageNumber),
+    Math.round(
+      continuousAnchor?.page || (shouldRestoreScroll ? state.scrollPage || pageNumber : pageNumber),
+    ),
     1,
     pdfDoc.numPages,
   );
@@ -6215,7 +6320,9 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
     buildContinuousPlaceholders(estimatedSize, targetPage);
     setupContinuousObserver(token);
 
-    if (shouldRestoreScroll) {
+    if (continuousAnchor) {
+      restoreContinuousReadingAnchor(continuousAnchor);
+    } else if (shouldRestoreScroll) {
       restoreContinuousScrollPosition({ behavior: "auto" });
     } else {
       await scrollToContinuousPage(targetPage, {
@@ -6251,7 +6358,9 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
       Math.abs(els.canvasWrap.scrollTop - scrollTopAfterInitialPosition) > 24;
 
     if (!userMovedDuringRender) {
-      if (shouldRestoreScroll) {
+      if (continuousAnchor) {
+        restoreContinuousReadingAnchor(continuousAnchor);
+      } else if (shouldRestoreScroll) {
         restoreContinuousScrollPosition({ behavior: "auto" });
       } else {
         await scrollToContinuousPage(targetPage, {
@@ -6417,7 +6526,8 @@ function updateCurrentPageFromScroll() {
     continuousProgrammaticScrollTarget &&
     Date.now() < continuousProgrammaticScrollUntil
   ) {
-    const marker = els.canvasWrap.scrollTop + els.canvasWrap.clientHeight * 0.35;
+    const marker =
+      els.canvasWrap.scrollTop + els.canvasWrap.clientHeight * CONTINUOUS_READING_MARKER_RATIO;
     const markerPage = getContinuousPageNumberAtOffset(marker);
 
     if (Math.abs(markerPage - continuousProgrammaticScrollTarget) > 1) {
@@ -6439,7 +6549,8 @@ function updateCurrentPageFromScroll() {
     return;
   }
 
-  const marker = els.canvasWrap.scrollTop + els.canvasWrap.clientHeight * 0.35;
+  const marker =
+    els.canvasWrap.scrollTop + els.canvasWrap.clientHeight * CONTINUOUS_READING_MARKER_RATIO;
   const currentPage = getContinuousPageNumberAtOffset(marker) || state.page;
   ensureContinuousDomWindow(currentPage);
   const positionChanged = captureContinuousScrollPosition();
@@ -9580,7 +9691,9 @@ function wireEvents() {
 
   document.addEventListener("fullscreenchange", () => {
     if (!document.fullscreenElement && appFullscreen && !syncingNativeFullscreen) {
-      setAppFullscreen(false);
+      handleNativeFullscreenExit().catch((error) => {
+        console.error(error);
+      });
     }
   });
 
@@ -9631,7 +9744,16 @@ function wireEvents() {
     });
     lastViewportChangeAt = Date.now();
     window.clearTimeout(resizeTimer);
+
+    if (fullscreenTransitionInProgress) {
+      return;
+    }
+
     resizeTimer = window.setTimeout(() => {
+      if (fullscreenTransitionInProgress) {
+        return;
+      }
+
       if (epubRendition) {
         epubRendition.resize("100%", "100%", state.epubCfi || undefined);
         return;
@@ -9649,8 +9771,12 @@ function wireEvents() {
           return;
         }
 
-        captureContinuousScrollPosition();
-        renderCurrentView(state.page, { behavior: "auto", restoreScroll: true });
+        const continuousAnchor = captureContinuousReadingAnchor();
+        renderCurrentView(continuousAnchor?.page || state.page, {
+          behavior: "auto",
+          continuousAnchor,
+          restoreScroll: true,
+        });
         return;
       }
 
@@ -10290,6 +10416,75 @@ async function runContinuousWindowSelfTest() {
   showStatus("自测通过：长 PDF 仅保留窗口内页面节点。");
 }
 
+async function runFullscreenProgressSelfTest() {
+  const documentId = `${DOCUMENT_ID_PREFIX}selftest-fullscreen-progress`;
+  const targetPage = 110;
+
+  updateSelfTestResult("running", "prepare fullscreen progress PDF");
+  showStatus("自测：准备全屏进度测试...", true);
+  await deleteStoredDocument(documentId).catch(() => {});
+  deleteDocumentProgress(documentId);
+
+  const record = createSelfTestPdfRecord(documentId, "fullscreen progress", 120);
+  await putStoredDocument(record);
+  state.mode = READ_MODES.PAGED;
+  await openSelfTestRecord(record, { resetProgress: true }, "fullscreen progress PDF");
+
+  state.mode = READ_MODES.SCROLL;
+  state.page = 1;
+  state.scrollPage = 1;
+  await renderContinuousDocument(1, { behavior: "auto", restoreScroll: false });
+  ensureContinuousDomWindow(targetPage);
+  const precedingPage = targetPage - 1;
+  const precedingPageHeight = getContinuousPageHeight(precedingPage);
+  setContinuousScrollTop(
+    getContinuousPageTopOffset(precedingPage) +
+      precedingPageHeight -
+      els.canvasWrap.clientHeight * 0.2,
+  );
+  await renderContinuousPage(targetPage, renderToken, {
+    force: true,
+    throwOnError: true,
+  });
+  await waitForNextFrame();
+  continuousProgrammaticScrollTarget = 0;
+  continuousProgrammaticScrollUntil = 0;
+  updateCurrentPageFromScroll();
+
+  const before = captureContinuousReadingAnchor();
+
+  if (!before || before.page !== targetPage || state.page !== targetPage) {
+    throw new Error(`Fullscreen progress self-test did not reach page ${targetPage}.`);
+  }
+
+  if (state.scrollPage === state.page) {
+    throw new Error("Fullscreen progress self-test did not create a cross-page viewport.");
+  }
+
+  try {
+    await toggleAppFullscreen();
+    const entered = captureContinuousReadingAnchor();
+
+    if (!entered || entered.page !== before.page || state.page !== before.page) {
+      throw new Error(`Entering fullscreen changed progress from page ${before.page} to ${state.page}.`);
+    }
+
+    await toggleAppFullscreen();
+    const exited = captureContinuousReadingAnchor();
+
+    if (!exited || exited.page !== before.page || state.page !== before.page) {
+      throw new Error(`Exiting fullscreen changed progress from page ${before.page} to ${state.page}.`);
+    }
+  } finally {
+    if (appFullscreen) {
+      await toggleAppFullscreen();
+    }
+  }
+
+  updateSelfTestResult("passed", `fullscreen preserved PDF progress at page ${targetPage}`);
+  showStatus(`自测通过：全屏切换保持在第 ${targetPage} 页。`);
+}
+
 async function runLockSecuritySelfTest() {
   const password = "portable-reader-lock-selftest";
   const originalConfig = window.localStorage.getItem(LOCK_KEY);
@@ -10376,6 +10571,7 @@ async function runSelfTest(mode) {
       "continuous-window",
       "diagnostics",
       "encrypted-switch",
+      "fullscreen-progress",
       "lock-security",
       "rapid-switch",
     ].includes(mode)
@@ -10389,6 +10585,8 @@ async function runSelfTest(mode) {
       await runDiagnosticsSelfTest();
     } else if (mode === "continuous-window") {
       await runContinuousWindowSelfTest();
+    } else if (mode === "fullscreen-progress") {
+      await runFullscreenProgressSelfTest();
     } else if (mode === "lock-security") {
       await runLockSecuritySelfTest();
     } else if (mode === "rapid-switch") {
