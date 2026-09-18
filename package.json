@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "description": "A local-first web PDF reader for mobile Safari.",
   "private": true,
+  "type": "module",
   "scripts": {
+    "test": "node --test tests/*.test.mjs",
     "start": "py -3 -m http.server 5173 --bind 0.0.0.0",
     "build": "node scripts/build.mjs",
     "serve:dist": "py -3 -m http.server 5174 --bind 0.0.0.0 --directory dist"
