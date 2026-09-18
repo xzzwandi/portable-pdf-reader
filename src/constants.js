@@ -8,7 +8,7 @@ export const LAST_DOCUMENT_ID = "last-document";
 export const LOCK_KEY = "portable-pdf-reader-lock";
 export const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 export const STATE_KEY = "portable-pdf-reader-state";
-export const APP_VERSION = "v113";
+export const APP_VERSION = "v114";
 
 export const ENCRYPTED_BACKUP_EXTENSION = ".pprenc";
 export const ENCRYPTED_BACKUP_MAGIC = "PPRENC1\n";
@@ -35,7 +35,6 @@ export const CONTINUOUS_HEALTH_CHECK_INTERVAL_MS = 1_500;
 export const CONTINUOUS_BLANK_RETRY_LIMIT = 3;
 export const CONTINUOUS_CLEANUP_IDLE_MS = 3_500;
 
-export const PAGED_BLANK_RETRY_LIMIT = 2;
 export const PAGED_BLANK_RETRY_DELAY_MS = 120;
 
 export const PDF_RANGE_CHUNK_SIZE = 1_048_576;

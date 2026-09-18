@@ -36,7 +36,6 @@ import {
   MAX_PAGED_CANVAS_PIXELS,
   METADATA_STORE_NAME,
   PAGED_BLANK_RETRY_DELAY_MS,
-  PAGED_BLANK_RETRY_LIMIT,
   PBKDF2_KEY_ALGORITHM,
   PDF_LOAD_TIMEOUT_MS,
   PDF_RANGE_CHUNK_SIZE,
@@ -52,7 +51,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=113";
+} from "./src/constants.js?v=114";
 import {
   bytesToHex,
   createChunkAad,
@@ -82,23 +81,28 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=113";
+} from "./src/encryption.js?v=114";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=113";
+} from "./src/utils.js?v=114";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=113";
+} from "./src/encrypted-backups.js?v=114";
+import {
+  createExportBlob,
+  releaseExportBlob,
+  transferExportBlobCleanup,
+} from "./src/export-blobs.js?v=114";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=113";
+} from "./src/pdf-sources.js?v=114";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -251,7 +255,7 @@ const pendingContinuousPages = new Map();
 const continuousPinnedPages = new Set();
 const continuousRenderRuns = new Map();
 const continuousBlankRetries = new Map();
-const pagedBlankRetries = new Map();
+let blankCheckCanvas = null;
 const libraryRecordCache = new Map();
 const recordDisplayNameCache = new Map();
 let libraryListDirty = true;
@@ -1654,6 +1658,11 @@ function readSavedState() {
 }
 
 function saveReaderState(options = {}) {
+  // Unsaved files must not replace the last saved document or its progress.
+  if (!state.documentId) {
+    return;
+  }
+
   try {
     if (isScrollMode()) {
       captureContinuousScrollPosition();
@@ -2092,37 +2101,31 @@ async function materializeStoredRecordBlob(record = {}) {
     return record;
   }
 
-  const parts = [];
   const chunkCount = Math.max(0, Math.floor(record.encryptedChunkStorage.chunkCount));
   const chunkSize = Math.max(1, Math.floor(record.encryptedChunkStorage.chunkSize || 0));
   const payloadSize = Math.max(0, Math.floor(record.encryptedChunkStorage.payloadSize || 0));
 
-  for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
-    const bytes = await readStoredDocumentChunkBytes(record, chunkIndex);
-    const byteLength = getStoredBlobBytesLength(bytes);
-    const expectedLength = Math.min(
-      chunkSize,
-      Math.max(0, payloadSize - chunkIndex * chunkSize),
-    );
-
-    if (byteLength !== expectedLength) {
-      throw new Error(
-        `Encrypted document chunk ${chunkIndex} has ${byteLength} bytes; expected ${expectedLength}.`,
+  async function* readChunks() {
+    for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+      const bytes = await readStoredDocumentChunkBytes(record, chunkIndex);
+      const byteLength = getStoredBlobBytesLength(bytes);
+      const expectedLength = Math.min(
+        chunkSize,
+        Math.max(0, payloadSize - chunkIndex * chunkSize),
       );
+      if (byteLength !== expectedLength) {
+        throw new Error(
+          `Encrypted document chunk ${chunkIndex} has ${byteLength} bytes; expected ${expectedLength}.`,
+        );
+      }
+      yield bytes;
     }
-
-    parts.push(bytes);
   }
 
-  const materializedBlob = new Blob(parts, {
+  const materializedBlob = await createExportBlob(readChunks(), {
+    size: payloadSize,
     type: record.blobType || record.type || "application/octet-stream",
   });
-
-  if (materializedBlob.size !== payloadSize) {
-    throw new Error(
-      `Encrypted document payload has ${materializedBlob.size} bytes; expected ${payloadSize}.`,
-    );
-  }
 
   const materializedRecord = {
     ...record,
@@ -2137,9 +2140,16 @@ async function materializeStoredRecordBlob(record = {}) {
 
 async function createStoredEncryptedBackupBlob(record = {}) {
   const materializedRecord = await materializeStoredRecordBlob(record);
-  return createVerifiedEncryptedBackupBlob(materializedRecord, {
-    payloadBlob: materializedRecord.blob,
-  });
+  try {
+    const backupBlob = await createVerifiedEncryptedBackupBlob(materializedRecord, {
+      payloadBlob: materializedRecord.blob,
+    });
+    transferExportBlobCleanup(materializedRecord.blob, backupBlob);
+    return backupBlob;
+  } catch (error) {
+    await releaseExportBlob(materializedRecord.blob).catch(() => {});
+    throw error;
+  }
 }
 
 async function createVerifiedEncryptedBackupBlob(record = {}, options = {}) {
@@ -2786,13 +2796,24 @@ function createEncryptedBackupFileName(record = {}) {
 function triggerDownload(blob, fileName) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
-  link.href = url;
-  link.download = fileName;
-  link.rel = "noopener";
-  document.body.append(link);
-  link.click();
-  link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  const release = () => {
+    URL.revokeObjectURL(url);
+    releaseExportBlob(blob).catch((error) => console.warn(error));
+  };
+  try {
+    link.href = url;
+    link.download = fileName;
+    link.rel = "noopener";
+    document.body.append(link);
+    link.click();
+    // Keep file-backed downloads readable while the browser copies their data.
+    window.setTimeout(release, 5 * 60_000);
+  } catch (error) {
+    release();
+    throw error;
+  } finally {
+    link.remove();
+  }
 }
 
 function getPlainDocumentMimeType(record = {}) {
@@ -2824,25 +2845,20 @@ async function createPlainDocumentExport(record, onProgress = () => {}) {
   const source = createEncryptedDocumentSourceWithKey(record, key);
   const chunkSize = Math.max(1, Math.floor(source.chunkSize || ENCRYPTION_CHUNK_SIZE));
   const totalChunks = Math.max(1, Math.ceil(source.length / chunkSize));
-  const parts = [];
-
-  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
-    const begin = chunkIndex * chunkSize;
-    const end = Math.min(source.length, begin + chunkSize);
-    const bytes = await source.readRange(begin, end);
-    parts.push(bytes);
-    onProgress({
-      chunkIndex: chunkIndex + 1,
-      totalChunks,
-    });
-    await waitForNextFrame();
+  async function* readChunks() {
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      const begin = chunkIndex * chunkSize;
+      const end = Math.min(source.length, begin + chunkSize);
+      yield await source.readRange(begin, end);
+      onProgress({
+        chunkIndex: chunkIndex + 1,
+        totalChunks,
+      });
+      await waitForNextFrame();
+    }
   }
 
-  const blob = new Blob(parts, { type });
-
-  if (blob.size !== source.length) {
-    throw new Error(`Decrypted document has ${blob.size} bytes; expected ${source.length}.`);
-  }
+  const blob = await createExportBlob(readChunks(), { size: source.length, type });
 
   return {
     blob,
@@ -3029,7 +3045,7 @@ async function exportEncryptedDocumentBackup(documentId) {
     showStatus("已开始导出加密文件。");
   } catch (error) {
     console.error(error);
-    showStatus("加密文件导出失败。", true);
+    showStatus(error?.userMessage || "加密文件导出失败。", true);
   }
 }
 
@@ -3126,7 +3142,7 @@ async function exportEncryptedDocumentBackupWithCurrentPassword(record) {
   } catch (error) {
     console.error(error);
     updateBackupPromptState();
-    showStatus("加密文件导出失败。", true);
+    showStatus(error?.userMessage || "加密文件导出失败。", true);
   }
 }
 
@@ -3173,9 +3189,9 @@ async function exportDocumentAsPlainFile(record, options = {}) {
     }
 
     showStatus(
-      isRecordEncrypted(record)
+      error?.userMessage || (isRecordEncrypted(record)
         ? "未加密文件导出失败，请确认书架已解锁。"
-        : "文件导出失败。",
+        : "文件导出失败。"),
       true,
     );
   }
@@ -3214,7 +3230,7 @@ async function exportEncryptedDocumentBackupWithPassword(record, backupPassword)
   } catch (error) {
     console.error(error);
     updateBackupPromptState();
-    showStatus("加密文件导出失败，请确认当前书架密码可用。", true);
+    showStatus(error?.userMessage || "加密文件导出失败，请确认当前书架密码可用。", true);
   } finally {
     const storageId = backupRecord?.encryptedChunkStorage?.storageId || "";
 
@@ -3603,7 +3619,6 @@ function clearContinuousPages() {
   continuousPinnedPages.clear();
   continuousRenderRuns.clear();
   continuousBlankRetries.clear();
-  pagedBlankRetries.clear();
   els.continuousPages.replaceChildren();
   continuousEstimatedPageWidth = 0;
   continuousEstimatedShellHeight = 0;
@@ -3637,7 +3652,6 @@ async function closeCurrentDocument() {
   els.canvas.removeAttribute("height");
   els.canvas.removeAttribute("style");
   els.epubViewer.replaceChildren();
-  pagedBlankRetries.clear();
   resetEpubTocCache();
   epubAtEnd = false;
   epubAtStart = false;
@@ -3891,7 +3905,6 @@ async function renderPage(pageNumber, options = {}) {
   const token = ++renderToken;
   const documentToken = documentOpenToken;
   const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
-  const blankRetryCount = Math.max(0, Math.floor(options.blankRetryCount || 0));
   state.page = targetPage;
   state.scrollPage = targetPage;
   state.scrollOffsetRatio = 0;
@@ -3899,6 +3912,7 @@ async function renderPage(pageNumber, options = {}) {
   updateViewerMode();
   updateControls();
   let page = null;
+  let scratchCanvas = null;
   showStatus("正在渲染...", true);
 
   try {
@@ -3916,7 +3930,7 @@ async function renderPage(pageNumber, options = {}) {
 
     lastLayoutWidth = getAvailableCanvasWidth();
     const viewport = getScaledViewport(page);
-    const scratchCanvas = document.createElement("canvas");
+    scratchCanvas = document.createElement("canvas");
     const context = prepareCanvas(scratchCanvas, viewport);
 
     renderTask = page.render({
@@ -3933,31 +3947,8 @@ async function renderPage(pageNumber, options = {}) {
       return false;
     }
 
-    if (isCanvasLikelyBlank(scratchCanvas) && blankRetryCount < PAGED_BLANK_RETRY_LIMIT) {
-      pagedBlankRetries.set(targetPage, blankRetryCount + 1);
-      window.setTimeout(() => {
-        if (
-          token === renderToken &&
-          documentToken === documentOpenToken &&
-          pdfDoc &&
-          state.page === targetPage &&
-          !isScrollMode()
-        ) {
-          renderPage(targetPage, {
-            blankRetryCount: blankRetryCount + 1,
-            commitProgress: options.commitProgress !== false,
-          }).catch((error) => {
-            console.error(error);
-          });
-        }
-      }, PAGED_BLANK_RETRY_DELAY_MS);
-      releaseCanvasBitmap(scratchCanvas, { removeStyle: true });
-      return false;
-    }
-
-    pagedBlankRetries.delete(targetPage);
+    // A fulfilled render can legitimately contain no ink (blank or sparse pages).
     commitRenderedCanvas(scratchCanvas, els.canvas);
-    releaseCanvasBitmap(scratchCanvas, { removeStyle: true });
     els.canvasWrap.scrollTop = 0;
     saveReaderState({
       commitProgress: options.commitProgress !== false,
@@ -3965,7 +3956,7 @@ async function renderPage(pageNumber, options = {}) {
     hideStatus();
     return true;
   } catch (error) {
-    if (documentToken !== documentOpenToken) {
+    if (documentToken !== documentOpenToken || token !== renderToken) {
       return false;
     }
 
@@ -3995,6 +3986,7 @@ async function renderPage(pageNumber, options = {}) {
     });
     return false;
   } finally {
+    releaseCanvasBitmap(scratchCanvas, { removeStyle: true });
     try {
       page?.cleanup?.();
     } catch {
@@ -4544,38 +4536,23 @@ function isCanvasLikelyBlank(canvas) {
     return true;
   }
 
-  const context = canvas.getContext("2d", { willReadFrequently: true });
-
-  if (!context) {
-    return false;
-  }
-
-  const sampleColumns = 17;
-  const sampleRows = 23;
-  let nonWhitePixels = 0;
-
   try {
-    for (let row = 0; row < sampleRows; row += 1) {
-      const y = clamp(
-        Math.floor(((row + 0.5) / sampleRows) * canvas.height),
-        0,
-        canvas.height - 1,
-      );
-
-      for (let column = 0; column < sampleColumns; column += 1) {
-        const x = clamp(
-          Math.floor(((column + 0.5) / sampleColumns) * canvas.width),
-          0,
-          canvas.width - 1,
-        );
-        const data = context.getImageData(x, y, 1, 1).data;
-
-        if (data[3] > 0 && (data[0] < 245 || data[1] < 245 || data[2] < 245)) {
-          nonWhitePixels += 1;
-
-          if (nonWhitePixels >= 2) {
-            return false;
-          }
+    // One small readback avoids hundreds of synchronous GPU reads per check.
+    blankCheckCanvas ||= document.createElement("canvas");
+    blankCheckCanvas.width = 128;
+    blankCheckCanvas.height = 128;
+    const context = blankCheckCanvas.getContext("2d", { willReadFrequently: true });
+    if (!context) {
+      return false;
+    }
+    context.drawImage(canvas, 0, 0, 128, 128);
+    const data = context.getImageData(0, 0, 128, 128).data;
+    let nonWhitePixels = 0;
+    for (let offset = 0; offset < data.length; offset += 4) {
+      if (data[offset + 3] > 0 && (data[offset] < 245 || data[offset + 1] < 245 || data[offset + 2] < 245)) {
+        nonWhitePixels += 1;
+        if (nonWhitePixels >= 2) {
+          return false;
         }
       }
     }
@@ -4646,6 +4623,10 @@ function checkVisibleContinuousPages() {
 
     if (shell.dataset.rendered === "true") {
       const canvas = shell.querySelector("canvas");
+
+      if (canvas?.width > 1 && canvas?.height > 1 && shell.dataset.expectedInk === "false") {
+        continue;
+      }
 
       if (!isCanvasLikelyBlank(canvas)) {
         continuousBlankRetries.delete(pageNumber);
@@ -5000,6 +4981,8 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, doc
   shell.dataset.renderStartedAt = String(Date.now());
   let page = null;
   let task = null;
+  let renderCanvas = null;
+  let directRender = false;
 
   try {
     page = await waitForPdfOperation(pdfDoc.getPage(targetPage), {
@@ -5020,12 +5003,13 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, doc
     }
 
     const viewport = getScaledViewport(page);
-    const directRender = shouldRenderContinuousDirectToTarget();
-    const renderCanvas = directRender
+    directRender = shouldRenderContinuousDirectToTarget();
+    renderCanvas = directRender
       ? ensureContinuousCanvas(shell, viewport)
       : document.createElement("canvas");
     const context = prepareCanvas(renderCanvas, viewport);
 
+    noteSelfTestMetric("continuousPageRenders");
     task = page.render({
       canvasContext: context,
       viewport,
@@ -5042,41 +5026,20 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, doc
       !isContinuousRenderCurrent(targetPage, shell, token, runId)
     ) {
       // A stale render can finish after a retry has reused the shell; leave the newer canvas alone.
-      if (!directRender) {
-        releaseCanvasBitmap(renderCanvas, { removeStyle: true });
-      }
       return false;
     }
 
-    if (isCanvasLikelyBlank(renderCanvas)) {
-      const retryCount = continuousBlankRetries.get(targetPage) || 0;
-
-      if (retryCount < getContinuousBlankRetryLimit()) {
-        continuousBlankRetries.set(targetPage, retryCount + 1);
-        releaseContinuousCanvas(shell);
-        if (!directRender) {
-          releaseCanvasBitmap(renderCanvas, { removeStyle: true });
-        }
-        window.setTimeout(() => {
-          if (
-            token === renderToken &&
-            documentToken === documentOpenToken &&
-            pdfDoc &&
-            isScrollMode() &&
-            shell.isConnected
-          ) {
-            scheduleContinuousPageRender(targetPage, token);
-          }
-        }, PAGED_BLANK_RETRY_DELAY_MS);
-        return false;
-      }
+    if (!isCanvasLikelyBlank(renderCanvas)) {
+      shell.dataset.expectedInk = "true";
+      continuousBlankRetries.delete(targetPage);
+    } else if (!shell.dataset.expectedInk) {
+      // Accept legitimate blank content. Only recover pages whose ink disappears.
+      shell.dataset.expectedInk = "false";
     }
 
-    continuousBlankRetries.delete(targetPage);
     if (!directRender) {
       const canvas = ensureContinuousCanvas(shell, viewport);
       commitRenderedCanvas(renderCanvas, canvas);
-      releaseCanvasBitmap(renderCanvas, { removeStyle: true });
     }
     shell.dataset.rendered = "true";
     shell.dataset.renderedAt = String(Date.now());
@@ -5107,6 +5070,9 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, doc
     }
     return false;
   } finally {
+    if (!directRender) {
+      releaseCanvasBitmap(renderCanvas, { removeStyle: true });
+    }
     try {
       page?.cleanup?.();
     } catch {
@@ -7896,7 +7862,7 @@ async function loadEpubFromSource(source, meta = {}, openToken = beginDocumentOp
     epubBook = book;
     createEpubRendition();
 
-    state.documentId = meta.id || state.documentId;
+    state.documentId = meta.id || "";
     state.fileName = meta.name || state.fileName || "未命名.epub";
     state.epubProgress = clamp(state.epubProgress || 0, 0, 1);
     state.page = clamp(state.page || 1, 1, epubBook.spine?.length || Number.MAX_SAFE_INTEGER);
@@ -8108,7 +8074,7 @@ async function loadPdfFromSource(
 
     pdfDoc = loadedDoc;
     activePdfRangeFailurePromise = loadingTask.rangeFailurePromise || null;
-    state.documentId = meta.id || state.documentId;
+    state.documentId = meta.id || "";
     state.fileName = meta.name || state.fileName || "未命名.pdf";
     state.page = clamp(requestedPage, 1, pdfDoc.numPages);
     state.scrollPage = clamp(state.scrollPage || state.page, 1, pdfDoc.numPages);
@@ -8529,6 +8495,33 @@ async function handleEncryptionMigrationSubmit(event) {
   }
 }
 
+async function openTemporaryDocument(file) {
+  persistReaderPositionNow();
+  const openToken = beginDocumentOpen();
+  await closeCurrentDocument();
+  if (!isDocumentOpenCurrent(openToken)) {
+    return false;
+  }
+
+  const format = getDocumentFormatFromFile(file);
+  Object.assign(state, {
+    documentId: "",
+    fileName: file.name || getFallbackDocumentName(format),
+    format,
+    page: 1,
+    scrollPage: 1,
+    scrollOffsetRatio: 0,
+    scrollTop: 0,
+    epubCfi: "",
+    epubProgress: 0,
+    zoom: 1,
+  });
+  const meta = { id: "", name: state.fileName };
+  return format === DOCUMENT_FORMATS.EPUB
+    ? loadEpubFromBlob(file, meta, openToken)
+    : loadPdfFromBlob(file, meta, 1, openToken);
+}
+
 async function handleFileSelection(file) {
   recordDiagnosticEvent("handle-file-selection-start", {
     encryptedBackup: isEncryptedBackupFile(file),
@@ -8546,34 +8539,36 @@ async function handleFileSelection(file) {
     return;
   }
 
+  let record;
   try {
     if (getLockConfig() && sessionPassword) {
       showStatus("正在加密并加入书架...", true);
     }
 
-    const record = await saveDocumentFile(file);
-    deleteDocumentProgress(record.id);
-    await openDocumentRecord(record, { resetProgress: true });
-    recordDiagnosticEvent("handle-file-selection-success", {
-      file: summarizeFile(file),
-      record: summarizeRecordForDiagnostics(record),
-    });
-    showStatus("已加入书架。");
+    record = await saveDocumentFile(file);
   } catch (error) {
     console.error(error);
     recordDiagnosticEvent("handle-file-selection-error", {
       error: summarizeError(error),
       file: summarizeFile(file),
     });
-    const format = getDocumentFormatFromFile(file);
-    showStatus("文件已选择，但保存到书架失败。", true);
-
-    if (format === DOCUMENT_FORMATS.EPUB) {
-      await loadEpubFromBlob(file, { name: file.name || "未命名.epub" });
-    } else {
-      await loadPdfFromBlob(file, { name: file.name || "未命名.pdf" }, 1);
+    const opened = await openTemporaryDocument(file);
+    if (opened) {
+      showStatus("文件已临时打开，但未能保存到书架。", true);
     }
+    return opened;
   }
+
+  deleteDocumentProgress(record.id);
+  const opened = await openDocumentRecord(record, { resetProgress: true });
+  if (opened) {
+    recordDiagnosticEvent("handle-file-selection-success", {
+      file: summarizeFile(file),
+      record: summarizeRecordForDiagnostics(record),
+    });
+    showStatus("已加入书架。");
+  }
+  return opened;
 }
 
 async function handleEncryptedBackupSelectionV2(file) {
@@ -9308,6 +9303,7 @@ async function renderLibraryList(options = {}) {
 
     const fragment = document.createDocumentFragment();
     const encryptedNameEntries = [];
+    const progressMap = getProgressMap();
     libraryRecordCache.clear();
     els.libraryEmptyState.hidden = documents.length > 0;
     els.libraryEmptyState.textContent = documents.length > 0 ? "" : "还没有保存过 PDF。";
@@ -9316,7 +9312,7 @@ async function renderLibraryList(options = {}) {
       const record = documents[index];
       libraryRecordCache.set(record.id, record);
 
-      const progress = readDocumentProgress(record.id);
+      const progress = progressMap[record.id];
       const item = document.createElement("article");
       const openButton = document.createElement("button");
       const name = document.createElement("span");
@@ -9949,7 +9945,7 @@ setPdfSourceDiagnosticHandler((type, detail = {}) => {
   recordDiagnosticEvent(`pdf-source:${type}`, detail);
 });
 
-function createSelfTestPdfBytes(label, pageCount = 3, fillerBytes = 0) {
+function createSelfTestPdfBytes(label, pageCount = 3, fillerBytes = 0, blankPages = []) {
   const encoder = new TextEncoder();
   const safeLabel = String(label).replace(/[()\\]/g, "\\$&");
   const objects = [];
@@ -9962,7 +9958,8 @@ function createSelfTestPdfBytes(label, pageCount = 3, fillerBytes = 0) {
   for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
     const pageObjectId = 4 + pageIndex * 2;
     const contentObjectId = pageObjectId + 1;
-    const content = `0 0 0 rg 36 82 220 12 re f BT /F1 22 Tf 36 120 Td (${safeLabel} page ${pageIndex + 1}) Tj ET`;
+    const content = blankPages.includes(pageIndex + 1) ? "" :
+      `0 0 0 rg 36 82 220 12 re f BT /F1 22 Tf 36 120 Td (${safeLabel} page ${pageIndex + 1}) Tj ET`;
 
     pageObjectIds.push(pageObjectId);
     objects[pageObjectId] =
@@ -9997,8 +9994,8 @@ function createSelfTestPdfBytes(label, pageCount = 3, fillerBytes = 0) {
   return encoder.encode(pdf);
 }
 
-function createSelfTestPdfRecord(id, name, pageCount = 3, fillerBytes = 0) {
-  const bytes = createSelfTestPdfBytes(name, pageCount, fillerBytes);
+function createSelfTestPdfRecord(id, name, pageCount = 3, fillerBytes = 0, blankPages = []) {
+  const bytes = createSelfTestPdfBytes(name, pageCount, fillerBytes, blankPages);
   const blob = new Blob([bytes], { type: "application/pdf" });
   const now = Date.now();
 
@@ -10565,6 +10562,69 @@ async function runDiagnosticsSelfTest() {
   updateSelfTestResult("passed", `diagnostics ready: ${text.length} bytes`);
 }
 
+async function runReaderRegressionSelfTest() {
+  updateSelfTestResult("running", "blank PDF and temporary document regression");
+  window.__portableReaderSelfTestMetrics = {};
+  const record = createSelfTestPdfRecord(`${DOCUMENT_ID_PREFIX}selftest-reader-regressions`, "blank pages.pdf", 3, 0, [1, 2, 3]);
+  await putStoredDocument(record);
+  state.mode = READ_MODES.PAGED;
+  await openSelfTestRecord(record, { resetProgress: true }, "blank first page");
+  await goToPage(3);
+  await setReadMode(READ_MODES.SCROLL);
+  await wait(800);
+  const renderCount = window.__portableReaderSelfTestMetrics.continuousPageRenders || 0;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    checkVisibleContinuousPages();
+    await wait(600);
+  }
+  if ((window.__portableReaderSelfTestMetrics.continuousPageRenders || 0) !== renderCount) {
+    throw new Error("Legitimate blank pages were rendered again while idle.");
+  }
+
+  await setReadMode(READ_MODES.PAGED);
+  await goToPage(3);
+  persistReaderPositionNow();
+  const originalSave = saveDocumentFile;
+  try {
+    saveDocumentFile = async () => { throw new DOMException("Self-test quota failure", "QuotaExceededError"); };
+    const temporaryFile = new File([record.blob], "temporary.pdf", { type: "application/pdf" });
+    if (!await handleFileSelection(temporaryFile) || state.documentId !== "") {
+      throw new Error("Unsaved PDF did not open as a temporary document.");
+    }
+    await goToPage(2);
+    persistReaderPositionNow();
+    if (readDocumentProgress(record.id)?.page !== 3 ||
+        JSON.parse(window.localStorage.getItem(STATE_KEY)).documentId !== record.id) {
+      throw new Error("Temporary document overwrote saved reading progress.");
+    }
+  } finally {
+    saveDocumentFile = originalSave;
+  }
+  await openSelfTestRecord(record, {}, "return to saved book");
+  if (state.page !== 3) throw new Error("Saved book lost its page after temporary reading.");
+
+  updateSelfTestResult("running", "large export file storage");
+  showStatus("自测：验证大文件分块导出...", true);
+  const chunkSize = 1024 * 1024;
+  async function* chunks() {
+    for (let index = 0; index < 33; index += 1) {
+      yield new Uint8Array(chunkSize).fill(index + 17);
+    }
+  }
+  const blob = await createExportBlob(chunks(), { size: 33 * chunkSize, type: "application/pdf" });
+  try {
+    const first = new Uint8Array(await blob.slice(0, 16).arrayBuffer());
+    const last = new Uint8Array(await blob.slice(-16).arrayBuffer());
+    if (first.some((byte) => byte !== 17) || last.some((byte) => byte !== 49)) {
+      throw new Error("Large export bytes did not match their source.");
+    }
+  } finally {
+    await releaseExportBlob(blob);
+  }
+  updateSelfTestResult("passed", "blank pages, temporary progress and large export verified");
+  showStatus("自测通过：空白页、临时阅读进度和大文件导出正常。", true);
+}
+
 async function runSelfTest(mode) {
   if (
     ![
@@ -10574,6 +10634,7 @@ async function runSelfTest(mode) {
       "fullscreen-progress",
       "lock-security",
       "rapid-switch",
+      "reader-regressions",
     ].includes(mode)
   ) {
     showStatus(`未知自测：${mode}`, true);
@@ -10581,7 +10642,9 @@ async function runSelfTest(mode) {
   }
 
   try {
-    if (mode === "diagnostics") {
+    if (mode === "reader-regressions") {
+      await runReaderRegressionSelfTest();
+    } else if (mode === "diagnostics") {
       await runDiagnosticsSelfTest();
     } else if (mode === "continuous-window") {
       await runContinuousWindowSelfTest();
