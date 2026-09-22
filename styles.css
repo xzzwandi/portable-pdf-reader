@@ -248,6 +248,9 @@ h1 {
   height: 100%;
   padding: 16px;
   overflow: auto;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
+  overflow-anchor: none;
   overscroll-behavior: contain;
   background:
     linear-gradient(90deg, rgba(36, 33, 29, 0.04) 1px, transparent 1px),
@@ -258,7 +261,7 @@ h1 {
 
 .canvas-wrap.is-continuous {
   display: block;
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
 }
 
 .epub-pane {
