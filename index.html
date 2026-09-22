@@ -8,8 +8,9 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./icons/icon.svg" />
-    <link rel="stylesheet" href="./styles.css?v=117" />
-    <link rel="stylesheet" href="./src/pdf-tools.css?v=117" />
+    <link rel="stylesheet" href="./styles.css?v=118" />
+    <link rel="stylesheet" href="./src/pdf-tools.css?v=118" />
+    <link rel="stylesheet" href="./src/pdf-navigator.css?v=118" />
   </head>
   <body>
     <div class="app-shell">
@@ -19,7 +20,7 @@
           <div>
             <div class="brand-title">
               <h1>随身阅读</h1>
-              <span id="appVersion" class="version-badge">v117</span>
+              <span id="appVersion" class="version-badge">v118</span>
             </div>
             <p id="docName">未打开文件</p>
           </div>
@@ -53,6 +54,7 @@
 
       <footer id="controls" class="controls" hidden>
         <button id="prevButton" type="button" aria-label="上一页">上页</button>
+        <button id="pdfPreviewButton" class="pdf-preview-trigger" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="pdfNavigatorOverlay">1 / 0 ▴</button>
         <label class="page-jump" for="pageInput">
           <input id="pageInput" type="number" min="1" value="1" inputmode="numeric" aria-label="跳转到页码" />
           <span id="pageTotal">/ 0</span>
@@ -104,6 +106,7 @@
       <button id="floatingFullscreenButton" class="floating-fullscreen" type="button" aria-label="退出全屏" aria-pressed="true" hidden>
         退
       </button>
+      <button id="floatingPdfPreviewButton" class="floating-pdf-preview" type="button" aria-label="打开页面预览" aria-haspopup="dialog" aria-expanded="false" aria-controls="pdfNavigatorOverlay" hidden>页面预览</button>
       <button id="tocButton" class="floating-toc" type="button" aria-label="打开章节目录" hidden>
         目录
       </button>
@@ -264,8 +267,8 @@
       </div>
     </div>
 
-    <script src="./vendor/jszip/jszip.min.js?v=117"></script>
-    <script src="./vendor/epubjs/epub.min.js?v=117"></script>
-    <script type="module" src="./app.js?v=117"></script>
+    <script src="./vendor/jszip/jszip.min.js?v=118"></script>
+    <script src="./vendor/epubjs/epub.min.js?v=118"></script>
+    <script type="module" src="./app.js?v=118"></script>
   </body>
 </html>

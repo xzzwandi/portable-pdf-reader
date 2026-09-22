@@ -7,6 +7,7 @@ import { createExportBlob, releaseExportBlob, transferExportBlobCleanup, MAX_MEM
 const source = fs.readFileSync(new URL("../app.js", import.meta.url), "utf8");
 function load(context, names) {
   context.pdfTools ??= null;
+  context.pdfNavigator ??= null;
   for (const name of names) {
     const start = new RegExp(`^(?:async )?function ${name}\\(`, "m").exec(source);
     assert.ok(start, `Missing function ${name}`);
@@ -88,6 +89,7 @@ function temporaryContext(format) {
     console: { error: noop, warn: noop },
     state: { documentId: "doc:old-book", fileName: "old.pdf", page: 88, scrollPage: 88, zoom: 1, mode: "paged", epubCfi: "old-cfi" },
     pdfDoc: { numPages: 100 }, epubBook: null, activePdfLoadingTask: null, activePdfRangeFailurePromise: null,
+    pdfNavigationTransaction: null,
     DOCUMENT_FORMATS: { PDF: "pdf", EPUB: "epub" }, STATE_KEY: "state", PROGRESS_KEY: "progress", PDF_LOAD_TIMEOUT_MS: 1000,
     EncryptedDocumentSource: class {}, BlobDocumentSource: class { constructor(blob) { this.blob = blob; this.length = blob.size; } },
     beginDocumentOpen: () => 1, isDocumentOpenCurrent: () => true,
