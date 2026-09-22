@@ -1,5 +1,6 @@
 const DEFAULT_CACHE_LIMIT = 24;
 const DEFAULT_MAX_DIMENSION = 320;
+const MAX_PREVIEW_DIMENSION = 640;
 const DEFAULT_TIMEOUT_MS = 8_000;
 
 function boundedOption(value, fallback, maximum) {
@@ -53,7 +54,9 @@ function waitForOperation(operation, signal, timeoutMs) {
 export function createPdfThumbnailCache(options = {}) {
   const createCanvas = options.createCanvas || (() => document.createElement("canvas"));
   const cacheLimit = boundedOption(options.cacheLimit, DEFAULT_CACHE_LIMIT, 32);
-  const maxDimension = boundedOption(options.maxDimension, DEFAULT_MAX_DIMENSION, 320);
+  // Full-page previews can opt into sharper images and a smaller cache. Keep
+  // the 320px default so compact thumbnail strips retain their memory budget.
+  const maxDimension = boundedOption(options.maxDimension, DEFAULT_MAX_DIMENSION, MAX_PREVIEW_DIMENSION);
   const timeoutMs = boundedOption(options.timeoutMs, DEFAULT_TIMEOUT_MS, 30_000);
   const cache = new Map();
   let pdfDocument = null;

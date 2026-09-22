@@ -12,7 +12,7 @@ function exportError(error) {
 }
 
 function createFileWriter() {
-  const worker = new Worker(new URL("./export-worker.js?v=118", import.meta.url));
+  const worker = new Worker(new URL("./export-worker.js?v=119", import.meta.url));
   let sequence = 0;
   let failure = null;
   const requests = new Map();

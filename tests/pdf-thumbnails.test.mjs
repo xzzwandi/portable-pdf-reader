@@ -258,8 +258,41 @@ test("default cache holds at most 24 thumbnails and malformed candidates never l
   const { cache, canvases, loads } = fixture();
   await cache.request(Array.from({ length: 30 }, (_value, index) => index + 1));
   assert.equal(canvases.filter((canvas) => canvas.width > 0).length, 24);
+  assert.ok(canvases.every((canvas) => Math.max(canvas.width, canvas.height) <= 320));
   assert.ok(canvases.slice(0, 6).every((canvas) => canvas.width === 0 && canvas.height === 0));
   await cache.request([NaN, Infinity, -1, 0, 101, "1", null]);
   assert.equal(loads.length, 30);
+  cache.clear();
+});
+
+test("full-page previews render at 640px while a twelve-entry cache remains bounded and releases evicted bitmaps", async () => {
+  const { cache, doc, page, canvases, loads } = fixture({ maxDimension: 640, cacheLimit: 12 });
+  doc.getPage = (number) => {
+    loads.push(number);
+    return Promise.resolve(page(number, null, 1000, 1000));
+  };
+  const receivedSizes = [];
+  await cache.request(Array.from({ length: 15 }, (_value, index) => index + 1), {
+    onThumbnail: (_number, canvas) => receivedSizes.push([canvas.width, canvas.height]),
+  });
+  assert.ok(receivedSizes.every(([width, height]) => width === 640 && height === 640));
+  const retained = canvases.filter((canvas) => canvas.width > 0);
+  assert.equal(retained.length, 12);
+  assert.equal(retained.reduce((bytes, canvas) => bytes + canvas.width * canvas.height * 4, 0), 19_660_800);
+  assert.ok(canvases.slice(0, 3).every((canvas) => canvas.width === 0 && canvas.height === 0));
+  let cached;
+  await cache.request([15], { onThumbnail: (_number, canvas) => { cached = canvas; } });
+  assert.equal(cached, canvases[14]);
+  assert.equal(loads.length, 15);
+  cache.clear();
+  assert.ok(canvases.every((canvas) => canvas.width === 0 && canvas.height === 0));
+});
+
+test("oversized preview configuration cannot allocate canvases larger than the 640px hard limit", async () => {
+  const { cache, doc, page } = fixture({ maxDimension: 4096, cacheLimit: 1 });
+  doc.getPage = (number) => Promise.resolve(page(number, null, 100_000, 100_000));
+  let dimensions;
+  await cache.request([1], { onThumbnail: (_number, canvas) => { dimensions = [canvas.width, canvas.height]; } });
+  assert.deepEqual(dimensions, [640, 640]);
   cache.clear();
 });
