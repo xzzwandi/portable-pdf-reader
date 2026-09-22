@@ -1,6 +1,6 @@
 import sodium from "./vendor/libsodium/libsodium-wrappers.mjs";
-import { createPdfTools } from "./src/pdf-tools.js?v=118";
-import { createPdfNavigator } from "./src/pdf-navigator.js?v=118";
+import { createPdfTools } from "./src/pdf-tools.js?v=119";
+import { createPdfNavigator } from "./src/pdf-navigator.js?v=119";
 import {
   AES_GCM_ENCRYPTION_VERSION,
   AES_GCM_IV_BYTES,
@@ -53,7 +53,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=118";
+} from "./src/constants.js?v=119";
 import {
   bytesToHex,
   createChunkAad,
@@ -83,28 +83,28 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=118";
+} from "./src/encryption.js?v=119";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=118";
+} from "./src/utils.js?v=119";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=118";
+} from "./src/encrypted-backups.js?v=119";
 import {
   createExportBlob,
   releaseExportBlob,
   transferExportBlobCleanup,
-} from "./src/export-blobs.js?v=118";
+} from "./src/export-blobs.js?v=119";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=118";
+} from "./src/pdf-sources.js?v=119";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -11535,7 +11535,8 @@ async function runPdfNavigationSelfTest() {
   const openPreview = () => {
     if (!pdfNavigator.open()) throw new Error("Preview did not open");
     const panel = document.querySelector(".pdf-navigator-panel").getBoundingClientRect();
-    if (Math.abs(panel.top) > 1 || Math.abs(panel.bottom - window.innerHeight) > 2) throw new Error("Preview must use the full reader height");
+    if (Math.abs(panel.top) > 1 || Math.abs(panel.bottom - window.innerHeight) > 2 ||
+        Math.abs(panel.left) > 1 || Math.abs(panel.right - window.innerWidth) > 2) throw new Error("Preview must fill the entire reader viewport");
   };
   const select = (page) => {
     const input = document.querySelector("#pdfNavigatorPageInput");

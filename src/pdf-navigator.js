@@ -1,4 +1,4 @@
-import { createPdfThumbnailCache } from "./pdf-thumbnails.js?v=118";
+import { createPdfThumbnailCache } from "./pdf-thumbnails.js?v=119";
 
 const THUMBNAIL_DELAY_MS = 100;
 const NEARBY_RADIUS = 50;
@@ -18,7 +18,7 @@ function button(text, className, action) {
 }
 
 export function createPdfNavigator(options = {}) {
-  const thumbnails = createPdfThumbnailCache();
+  const thumbnails = createPdfThumbnailCache({ maxDimension: 640, cacheLimit: 12 });
   let doc = null;
   let documentId = "";
   let generation = 0;
@@ -53,8 +53,10 @@ export function createPdfNavigator(options = {}) {
   title.id = "pdfNavigatorTitle";
   const closeButton = button("关闭", "pdf-navigator-close", () => close());
   closeButton.setAttribute("aria-label", "关闭页面预览");
-  header.append(title, closeButton);
   const reading = element("p", "pdf-navigator-reading");
+  const heading = element("div", "pdf-navigator-heading");
+  heading.append(title, reading);
+  header.append(heading, closeButton);
   const modes = element("div", "pdf-navigator-modes");
   const rangeLabel = element("label", "pdf-navigator-range-label", "快速跨页");
   rangeLabel.htmlFor = "pdfNavigatorRange";
@@ -103,7 +105,7 @@ export function createPdfNavigator(options = {}) {
   status.setAttribute("aria-live", "polite");
   status.hidden = true;
   footer.append(previewLabel, fineControls, hint, goButton, status);
-  panel.append(header, reading, modes, middle, footer);
+  panel.append(header, modes, middle, footer);
   overlay.append(panel);
   const returnButton = button("返回原位", "pdf-navigator-return", () => void restore());
   returnButton.id = "pdfNavigatorReturnButton";

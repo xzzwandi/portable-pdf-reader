@@ -19,8 +19,8 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./constants.js?v=118";
-import { readUint32Bytes } from "./utils.js?v=118";
+} from "./constants.js?v=119";
+import { readUint32Bytes } from "./utils.js?v=119";
 
 export async function ensureSodiumReady() {
   await sodium.ready;
