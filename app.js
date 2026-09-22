@@ -1,5 +1,6 @@
 import sodium from "./vendor/libsodium/libsodium-wrappers.mjs";
-import { createPdfTools } from "./src/pdf-tools.js?v=117";
+import { createPdfTools } from "./src/pdf-tools.js?v=118";
+import { createPdfNavigator } from "./src/pdf-navigator.js?v=118";
 import {
   AES_GCM_ENCRYPTION_VERSION,
   AES_GCM_IV_BYTES,
@@ -52,7 +53,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=117";
+} from "./src/constants.js?v=118";
 import {
   bytesToHex,
   createChunkAad,
@@ -82,28 +83,28 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=117";
+} from "./src/encryption.js?v=118";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=117";
+} from "./src/utils.js?v=118";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=117";
+} from "./src/encrypted-backups.js?v=118";
 import {
   createExportBlob,
   releaseExportBlob,
   transferExportBlobCleanup,
-} from "./src/export-blobs.js?v=117";
+} from "./src/export-blobs.js?v=118";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=117";
+} from "./src/pdf-sources.js?v=118";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -152,6 +153,7 @@ const els = {
   fitButton: document.querySelector("#fitButton"),
   floatingFullscreenButton: document.querySelector("#floatingFullscreenButton"),
   floatingLockButton: document.querySelector("#floatingLockButton"),
+  floatingPdfPreviewButton: document.querySelector("#floatingPdfPreviewButton"),
   fullscreenButton: document.querySelector("#fullscreenButton"),
   imageCloseButton: document.querySelector("#imageCloseButton"),
   imageOverlay: document.querySelector("#imageOverlay"),
@@ -176,6 +178,8 @@ const els = {
   openButton: document.querySelector("#openButton"),
   pageInput: document.querySelector("#pageInput"),
   pageTotal: document.querySelector("#pageTotal"),
+  pageJump: document.querySelector(".page-jump"),
+  pdfPreviewButton: document.querySelector("#pdfPreviewButton"),
   pagedModeButton: document.querySelector("#pagedModeButton"),
   prevButton: document.querySelector("#prevButton"),
   runtimeLogButton: document.querySelector("#runtimeLogButton"),
@@ -195,6 +199,9 @@ const els = {
 
 let pdfDoc = null;
 let pdfTools = null;
+let pdfNavigator = null;
+let pdfNavigationIntent = 0;
+let pdfNavigationTransaction = null;
 let pdfObjectUrl = "";
 let epubBook = null;
 let epubRendition = null;
@@ -700,6 +707,8 @@ function releasePageBehindLock() {
 
 function showLockOverlay(mode = "unlock") {
   closeReaderTools(false);
+  cancelPdfNavigationForInput();
+  pdfNavigator?.clear();
   pdfTools?.clear();
   configureLockOverlay(mode);
   closeImagePreview();
@@ -717,8 +726,10 @@ function hideLockOverlay() {
   els.floatingLockButton.hidden = false;
   if (pdfDoc) {
     pdfTools?.setDocument(pdfDoc, state.documentId);
+    pdfNavigator?.setDocument(pdfDoc, state.documentId);
     refreshPdfTextLayers();
   }
+  updateControls();
 }
 
 function lockReader() {
@@ -1681,6 +1692,11 @@ function readSavedState() {
 }
 
 function saveReaderState(options = {}) {
+  // Preview navigation commits only after its destination is painted. A newer
+  // book or render must never inherit an older navigation's save suppression.
+  if (pdfNavigationTransaction && pdfNavigationTransaction.document === pdfDoc &&
+      pdfNavigationTransaction.documentToken === documentOpenToken &&
+      pdfNavigationTransaction.renderToken === renderToken) return;
   // Unsaved files must not replace the last saved document or its progress.
   if (!state.documentId) {
     return;
@@ -3400,7 +3416,10 @@ async function handleBackupSubmit(event) {
 }
 
 function setReaderVisible(visible) {
-  if (!visible) closeReaderTools(false);
+  if (!visible) {
+    closeReaderTools(false);
+    pdfNavigator?.clear();
+  }
   els.emptyState.hidden = visible;
   els.viewerPane.hidden = !visible;
   els.controls.hidden = !visible;
@@ -3433,6 +3452,8 @@ function updateFullscreenButtons() {
   els.floatingFullscreenButton.textContent = appFullscreen ? "退" : "全";
   els.floatingFullscreenButton.setAttribute("aria-label", fullscreenLabel);
   els.floatingFullscreenButton.setAttribute("aria-pressed", String(appFullscreen));
+  els.floatingPdfPreviewButton.hidden = !appFullscreen || !pdfDoc || !els.lockOverlay.hidden;
+  els.floatingPdfPreviewButton.textContent = `${state.page} / ${pdfDoc?.numPages || 0} · 预览`;
 }
 
 async function syncFullscreenLayoutAfterFrame(continuousAnchor = null, pagedAnchor = null, openToken = documentOpenToken) {
@@ -3705,6 +3726,11 @@ function updateControls() {
     : String(hasDocument ? state.page : 1);
   els.pageInput.max = String(epubMode ? epubTotal : Math.max(total, 1));
   els.pageTotal.textContent = epubMode ? `章 / ${epubTotal} · ${epubPercent}%` : `/ ${total}`;
+  els.pageJump.hidden = !epubMode;
+  els.pdfPreviewButton.hidden = epubMode;
+  els.pdfPreviewButton.disabled = !pdfDoc || !els.lockOverlay.hidden;
+  els.pdfPreviewButton.textContent = `${hasDocument ? state.page : 1} / ${total} ▴`;
+  els.pdfPreviewButton.setAttribute("aria-label", `页面预览，正在读第 ${state.page} 页，共 ${total} 页`);
 
   els.prevButton.disabled =
     !hasDocument || (epubMode ? epubNavigationInProgress || epubAtStart : state.page <= 1);
@@ -3720,6 +3746,7 @@ function updateControls() {
     button.disabled = !pdfDoc || epubMode;
   }
   pdfTools?.update();
+  pdfNavigator?.update();
   updateFullscreenButtons();
   els.tocButton.hidden = !epubMode;
   els.tocButton.disabled = !epubMode || epubNavigationInProgress;
@@ -3822,6 +3849,8 @@ function clearContinuousPages() {
 
 async function closeCurrentDocument() {
   closeReaderTools(false);
+  pdfNavigator?.clear();
+  cancelPdfNavigationForInput({ restore: false });
   pdfTools?.clear();
   renderToken += 1;
   setEpubLoading(false);
@@ -6860,7 +6889,200 @@ async function renderCurrentView(pageNumber = state.page, options = {}) {
   }
 }
 
+function capturePdfNavigationPosition() {
+  if (!pdfDoc || !els.lockOverlay.hidden) return null;
+  const continuousAnchor = isScrollMode() ? captureContinuousReadingAnchor() : null;
+  const pagedAnchor = isScrollMode() ? null : capturePagedReadingAnchor();
+  const wrap = els.canvasWrap;
+  return {
+    document: pdfDoc,
+    documentId: state.documentId,
+    documentToken: documentOpenToken,
+    mode: state.mode,
+    zoom: state.zoom,
+    page: continuousAnchor?.page || pagedAnchor?.page || state.page,
+    continuousAnchor,
+    pagedAnchor,
+    horizontalRatio: clamp(wrap.scrollLeft / Math.max(1, wrap.scrollWidth - wrap.clientWidth), 0, 1),
+  };
+}
+
+function isPdfNavigationPositionCurrent(position) {
+  return Boolean(position && pdfDoc && position.document === pdfDoc &&
+    position.documentId === state.documentId && position.documentToken === documentOpenToken &&
+    els.lockOverlay.hidden);
+}
+
+function cancelPdfNavigationForInput({ restore = true } = {}) {
+  if (!pdfNavigationTransaction) return;
+  const transaction = pdfNavigationTransaction;
+  const ownsRender = transaction.document === pdfDoc && transaction.documentToken === documentOpenToken &&
+    transaction.renderToken === renderToken;
+  pdfNavigationIntent++;
+  transaction.abort();
+  transaction.release();
+  pdfNavigationTransaction = null;
+  if (!ownsRender) return;
+  // Retire the renderer too: clearing only the transaction would let an old
+  // awaited page complete and save its destination after a cancel or lock.
+  renderToken++;
+  cancelCurrentRender();
+  clearContinuousScrollUpdate();
+  if (restore && isPdfNavigationPositionCurrent(transaction.origin)) {
+    const origin = transaction.origin;
+    assignPdfNavigationPosition(origin);
+    const recovery = renderCurrentView(origin.page, {
+      behavior: "auto", restoreScroll: true,
+      continuousAnchor: origin.continuousAnchor, pagedAnchor: origin.pagedAnchor,
+    });
+    const token = renderToken;
+    Promise.resolve(recovery).then((rendered) => {
+      if (rendered === true && token === renderToken && origin.document === pdfDoc &&
+          origin.documentToken === documentOpenToken && origin.documentId === state.documentId) {
+        finishPdfNavigationPosition(origin);
+        updateControls();
+        saveReaderState();
+      }
+    }).catch((error) => console.warn("Could not restore interrupted PDF navigation", error));
+  }
+}
+
+function waitForPdfNavigationRender(rendering, signal) {
+  if (!signal) return rendering;
+  return new Promise((resolve, reject) => {
+    const abort = () => resolve(false);
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve(rendering).then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    if (signal.aborted) abort();
+  });
+}
+
+function assignPdfNavigationPosition(position) {
+  state.mode = position.mode === READ_MODES.PAGED ? READ_MODES.PAGED : READ_MODES.SCROLL;
+  state.zoom = clamp(position.zoom || 1, 0.6, 2.6);
+  state.page = clamp(Math.round(position.page), 1, pdfDoc.numPages);
+  state.scrollPage = state.page;
+  state.scrollOffsetRatio = 0;
+  state.scrollTop = 0;
+}
+
+function finishPdfNavigationPosition(position) {
+  if (isScrollMode()) {
+    restoreContinuousReadingAnchor(position.continuousAnchor || { page: position.page, offsetRatio: 0, viewportRatio: 0 });
+    const wrap = els.canvasWrap;
+    wrap.scrollLeft = clamp(position.horizontalRatio || 0, 0, 1) * Math.max(0, wrap.scrollWidth - wrap.clientWidth);
+    continuousProgrammaticScrollTarget = 0;
+    continuousProgrammaticScrollUntil = 0;
+    captureContinuousScrollPosition();
+    state.page = captureContinuousReadingAnchor()?.page || position.page;
+  } else if (position.pagedAnchor) {
+    restorePagedReadingAnchor(position.pagedAnchor);
+  }
+}
+
+async function applyPdfNavigationPosition(position, { signal } = {}) {
+  if (!isPdfNavigationPositionCurrent(position) || signal?.aborted || fullscreenTransitionInProgress) return false;
+  cancelPdfNavigationForInput({ restore: false });
+  const origin = capturePdfNavigationPosition();
+  const intent = ++pdfNavigationIntent;
+  const renderWaitController = new AbortController();
+  const abortWait = () => renderWaitController.abort();
+  signal?.addEventListener("abort", abortWait, { once: true });
+  const resumeScroll = pauseContinuousScrollForFullscreen();
+  // The preview has already stopped momentum. Restore the scrollbar before
+  // measuring the destination, so an overlay never changes the PDF's width.
+  resumeScroll();
+  clearContinuousScrollUpdate();
+  window.clearTimeout(scrollStateTimer);
+  scrollTrackingSuppressionDepth++;
+  let released = false;
+  const transaction = {
+    document: pdfDoc, documentToken: documentOpenToken, renderToken, origin,
+    abort: abortWait,
+    release() {
+      if (released) return;
+      released = true;
+      resumeScroll();
+      scrollTrackingSuppressionDepth = Math.max(0, scrollTrackingSuppressionDepth - 1);
+    },
+  };
+  pdfNavigationTransaction = transaction;
+  const ownsView = () => pdfNavigationTransaction === transaction && intent === pdfNavigationIntent &&
+    isPdfNavigationPositionCurrent(position) && renderToken === transaction.renderToken;
+  let succeeded = false;
+  let rolledBack = false;
+  try {
+    assignPdfNavigationPosition(position);
+    const rendering = renderCurrentView(position.page, {
+      behavior: "auto", restoreScroll: true, commitProgress: false,
+      continuousAnchor: position.continuousAnchor || (isScrollMode() ? { page: position.page, offsetRatio: 0, viewportRatio: 0 } : null),
+      pagedAnchor: position.pagedAnchor,
+    });
+    // Both render paths increment their generation synchronously, before their
+    // first await. Capture that generation before other views can take over.
+    transaction.renderToken = renderToken;
+    const rendered = await waitForPdfNavigationRender(rendering, renderWaitController.signal);
+    if (!ownsView() || signal?.aborted || rendered !== true) return false;
+    finishPdfNavigationPosition(position);
+    await waitForNextFrame();
+    if (!ownsView() || signal?.aborted) return false;
+    finishPdfNavigationPosition(position);
+    succeeded = true;
+    return true;
+  } finally {
+    // A cancelled/failed jump may already have rebuilt the canvases. Restore
+    // both state and pixels; never roll an older request over a newer view.
+    if (!succeeded && ownsView() && origin) {
+      renderToken++;
+      cancelCurrentRender();
+      clearContinuousScrollUpdate();
+      assignPdfNavigationPosition(origin);
+      try {
+        const rendering = renderCurrentView(origin.page, {
+          behavior: "auto", restoreScroll: true, commitProgress: false,
+          continuousAnchor: origin.continuousAnchor,
+          pagedAnchor: origin.pagedAnchor,
+        });
+        transaction.renderToken = renderToken;
+        const restored = await rendering;
+        if (ownsView() && restored === true) {
+          finishPdfNavigationPosition(origin);
+          rolledBack = true;
+        }
+      } catch (error) { console.warn("Could not restore cancelled PDF navigation", error); }
+    }
+    const canCommit = ownsView() && (succeeded || rolledBack);
+    signal?.removeEventListener("abort", abortWait);
+    transaction.release();
+    if (pdfNavigationTransaction === transaction) pdfNavigationTransaction = null;
+    if (canCommit) {
+      updateControls();
+      saveReaderState();
+      if (isScrollMode()) {
+        queueVisibleContinuousPages(renderToken);
+        scheduleContinuousHealthCheck(0);
+      }
+    }
+  }
+}
+
+async function navigatePdfFromPreview(page, options = {}) {
+  const position = capturePdfNavigationPosition();
+  if (!position) return false;
+  position.page = clamp(Math.round(page), 1, pdfDoc.numPages);
+  if (!Number.isFinite(position.page)) return false;
+  position.continuousAnchor = { page: position.page, offsetRatio: 0, viewportRatio: 0 };
+  position.pagedAnchor = null;
+  position.horizontalRatio = 0;
+  return applyPdfNavigationPosition(position, options);
+}
+
+async function restorePdfNavigationPosition(position, options = {}) {
+  return applyPdfNavigationPosition(position, options);
+}
+
 async function goToPage(pageNumber) {
+  cancelPdfNavigationForInput();
   if (isEpubDocument()) {
     return;
   }
@@ -8540,6 +8762,7 @@ async function loadPdfFromSource(
     state.zoom = clamp(state.zoom || 1, 0.6, 2.6);
 
     pdfTools?.setDocument(pdfDoc, state.documentId);
+    pdfNavigator?.setDocument(pdfDoc, state.documentId);
     updateControls();
     setReaderVisible(true);
     updateViewerMode();
@@ -9221,6 +9444,7 @@ function openReaderTools() {
   closeLibrary();
   closeToc();
   pdfTools?.close();
+  pdfNavigator?.close({ restoreFocus: false });
   els.readerToolsOverlay.hidden = false;
   els.moreButton.setAttribute("aria-expanded", "true");
   updateControls();
@@ -9242,6 +9466,7 @@ async function openLibrary() {
   closeToc();
   closeReaderTools(false);
   pdfTools?.close();
+  pdfNavigator?.close({ restoreFocus: false });
   els.libraryOverlay.hidden = false;
   updatePanelScrollLock();
 
@@ -9270,6 +9495,7 @@ function openToc() {
   closeLibrary();
   closeReaderTools(false);
   pdfTools?.close();
+  pdfNavigator?.close({ restoreFocus: false });
   els.tocOverlay.hidden = false;
   updatePanelScrollLock();
   renderTocList();
@@ -9279,6 +9505,7 @@ function updatePanelScrollLock() {
   const panelOpen =
     !els.readerToolsOverlay.hidden ||
     pdfTools?.isOpen() ||
+    pdfNavigator?.isOpen() ||
     !els.libraryOverlay.hidden ||
     !els.tocOverlay.hidden ||
     !els.encryptionOverlay.hidden ||
@@ -10049,6 +10276,13 @@ function canTurnPdfPageWithSwipe(target) {
 }
 
 function wireEvents() {
+  // A fresh action after cancelling navigation owns the view immediately.
+  for (const type of ["pointerdown", "touchstart", "wheel", "keydown"]) {
+    document.querySelector(".app-shell").addEventListener(type, () => cancelPdfNavigationForInput(), { capture: true, passive: true });
+  }
+  for (const button of [els.pdfPreviewButton, els.floatingPdfPreviewButton]) {
+    button.addEventListener("click", () => pdfNavigator?.open());
+  }
   for (const type of ["touchstart", "wheel", "pointerdown"]) {
     els.canvasWrap.addEventListener(type, handleContinuousScrollInput, { passive: true });
   }
@@ -10338,7 +10572,7 @@ function wireEvents() {
   });
 
   window.addEventListener("keydown", (event) => {
-    if (event.defaultPrevented || pdfTools?.isOpen()) return;
+    if (event.defaultPrevented || pdfTools?.isOpen() || pdfNavigator?.isOpen()) return;
     if (!els.readerToolsOverlay.hidden) {
       if (event.key === "Escape") closeReaderTools();
       return;
@@ -11278,6 +11512,109 @@ async function runReaderRegressionSelfTest() {
   showStatus("自测通过：空白页、临时阅读进度和大文件导出正常。", true);
 }
 
+async function waitForPdfNavigationSelfTest(predicate, label) {
+  for (let attempt = 0; attempt < 120; attempt++) {
+    if (predicate()) return;
+    await wait(100);
+  }
+  throw new Error(`PDF navigator: timed out waiting for ${label}`);
+}
+
+async function runPdfNavigationSelfTest() {
+  const record = createSelfTestPdfRecord(`${DOCUMENT_ID_PREFIX}selftest-navigation`, "Preview 1200", 1200, 0, [], [540, 1080, 720, 1600]);
+  await putStoredDocument(record);
+  state.mode = READ_MODES.SCROLL;
+  await openSelfTestRecord(record, { resetProgress: true }, "thumbnail navigation PDF");
+  await navigatePdfFromPreview(148);
+  restoreContinuousReadingAnchor({ page: 148, offsetRatio: 0.43, viewportRatio: CONTINUOUS_READING_MARKER_RATIO });
+  await wait(400);
+  updateCurrentPageFromScroll();
+  const origin = capturePdfNavigationPosition();
+  saveReaderState();
+  const savedPage = JSON.parse(window.localStorage.getItem(STATE_KEY)).page;
+  const openPreview = () => {
+    if (!pdfNavigator.open()) throw new Error("Preview did not open");
+    const panel = document.querySelector(".pdf-navigator-panel").getBoundingClientRect();
+    if (Math.abs(panel.top) > 1 || Math.abs(panel.bottom - window.innerHeight) > 2) throw new Error("Preview must use the full reader height");
+  };
+  const select = (page) => {
+    const input = document.querySelector("#pdfNavigatorPageInput");
+    input.value = String(page);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  const commit = async (page) => {
+    select(page);
+    document.querySelector(".pdf-navigator-go").click();
+    await waitForPdfNavigationSelfTest(() => !pdfNavigator.isOpen() && state.page === page, `jump to ${page}`);
+  };
+  updateSelfTestResult("running", "preview leaves reading position and saved progress unchanged");
+  openPreview();
+  const strip = document.querySelector(".pdf-navigator-strip");
+  for (const [type, y] of [["pointerdown", 300], ["pointermove", 180], ["pointerup", 180]]) {
+    strip.dispatchEvent(new PointerEvent(type, { pointerId: 17, pointerType: "touch", clientY: y, bubbles: true, cancelable: true }));
+  }
+  if (Number(document.querySelector("#pdfNavigatorPageInput").value) <= origin.page || state.page !== origin.page) throw new Error("Vertical thumbnail drag must change only its preview candidate");
+  for (const page of [400, 900, 1, 1200, 900]) select(page);
+  await waitForPdfNavigationSelfTest(() => document.querySelectorAll(".pdf-navigator-thumbnail canvas").length === 3, "three real thumbnails");
+  const previewAnchor = captureContinuousReadingAnchor();
+  if (state.page !== origin.page || previewAnchor.page !== origin.page ||
+      Math.abs(previewAnchor.offsetRatio - origin.continuousAnchor.offsetRatio) > 0.02 ||
+      JSON.parse(window.localStorage.getItem(STATE_KEY)).page !== savedPage) throw new Error("Preview changed reading progress");
+  await commit(900);
+  const back = document.querySelector("#pdfNavigatorReturnButton");
+  if (back.hidden || !back.textContent.includes(String(origin.page))) throw new Error("Missing original return point");
+  await goToPage(901);
+  await renderContinuousPage(901, renderToken, { force: true });
+  if (!back.textContent.includes(String(origin.page))) throw new Error("Ordinary page turn replaced the original return point");
+  updateSelfTestResult("running", "fullscreen retains navigation history and preview does not move the PDF");
+  await toggleAppFullscreen();
+  if (back.hidden) throw new Error("Fullscreen cleared the return point");
+  openPreview();
+  select(1200);
+  document.querySelector(".pdf-navigator-close").click();
+  await toggleAppFullscreen();
+  back.click();
+  await waitForPdfNavigationSelfTest(() => back.hidden && !pdfNavigationTransaction, "precise continuous return");
+  await wait(350);
+  const returned = captureContinuousReadingAnchor();
+  if (returned.page !== origin.page || Math.abs(returned.offsetRatio - origin.continuousAnchor.offsetRatio) > 0.025) throw new Error("Returning lost the page's reading position");
+  assertSelfTestFullscreenPaint("Thumbnail return");
+
+  updateSelfTestResult("running", "paged preview restores zoom and reading point");
+  await setReadMode(READ_MODES.PAGED);
+  state.zoom = 1.6;
+  await renderPage(148);
+  els.canvasWrap.scrollLeft = Math.max(0, els.canvasWrap.scrollWidth - els.canvasWrap.clientWidth) / 2;
+  els.canvasWrap.scrollTop = Math.min(180, Math.max(0, els.canvasWrap.scrollHeight - els.canvasWrap.clientHeight));
+  const paged = capturePdfNavigationPosition();
+  openPreview();
+  await commit(777);
+  back.click();
+  await waitForPdfNavigationSelfTest(() => back.hidden && !pdfNavigationTransaction, "precise paged return");
+  const pagedAfter = capturePagedReadingAnchor();
+  if (state.zoom !== paged.zoom || pagedAfter.page !== paged.page ||
+      Math.abs(pagedAfter.xRatio - paged.pagedAnchor.xRatio) > 0.025 ||
+      Math.abs(pagedAfter.yRatio - paged.pagedAnchor.yRatio) > 0.025) throw new Error("Paged return lost zoom or its anchor");
+
+  updateSelfTestResult("running", "switching books clears previews; a one-page PDF remains usable");
+  openPreview();
+  select(1000);
+  const short = createSelfTestPdfRecord(`${DOCUMENT_ID_PREFIX}selftest-navigation-short`, "Single page", 1);
+  await putStoredDocument(short);
+  await openSelfTestRecord(short, { resetProgress: true }, "single-page navigation PDF");
+  if (pdfNavigator.isOpen() || !back.hidden) throw new Error("Old preview survived a document switch");
+  openPreview();
+  await waitForPdfNavigationSelfTest(() => document.querySelectorAll(".pdf-navigator-thumbnail canvas").length === 1, "single-page thumbnail");
+  if (!document.querySelector("#pdfNavigatorRange").disabled) throw new Error("Single-page slider should be disabled");
+  pdfNavigator.close();
+  state.mode = READ_MODES.SCROLL;
+  state.zoom = 1;
+  await openSelfTestRecord(record, { resetProgress: true }, "final navigation PDF");
+  await navigatePdfFromPreview(148);
+  updateSelfTestResult("passed", "real thumbnails, preview isolation, fullscreen, precise return in both modes and document switching passed");
+  showStatus("自测通过：缩略图、预览进度隔离、全屏、精确返回和切书正常。", true);
+}
+
 async function runSelfTest(mode) {
   if (
     ![
@@ -11289,6 +11626,7 @@ async function runSelfTest(mode) {
       "lock-security",
       "rapid-switch",
       "reader-regressions",
+      "pdf-navigation",
     ].includes(mode)
   ) {
     showStatus(`未知自测：${mode}`, true);
@@ -11296,7 +11634,9 @@ async function runSelfTest(mode) {
   }
 
   try {
-    if (mode === "reader-regressions") {
+    if (mode === "pdf-navigation") {
+      await runPdfNavigationSelfTest();
+    } else if (mode === "reader-regressions") {
       await runReaderRegressionSelfTest();
     } else if (mode === "diagnostics") {
       await runDiagnosticsSelfTest();
@@ -11360,12 +11700,39 @@ pdfTools = createPdfTools({
   navigate: (page) => goToPage(page),
   showStatus,
   onOpen: () => {
+    pdfNavigator?.close({ restoreFocus: false });
     closeReaderTools(false);
     closeLibrary();
     closeToc();
     updatePanelScrollLock();
   },
   onClose: () => updatePanelScrollLock(),
+});
+pdfNavigator = createPdfNavigator({
+  getDocument: () => els.lockOverlay.hidden ? pdfDoc : null,
+  getDocumentId: () => state.documentId,
+  getPage: () => isScrollMode() ? captureContinuousReadingAnchor()?.page || state.page : state.page,
+  isAvailable: () => Boolean(pdfDoc && els.lockOverlay.hidden && !els.viewerPane.hidden),
+  capturePosition: capturePdfNavigationPosition,
+  navigate: navigatePdfFromPreview,
+  restorePosition: restorePdfNavigationPosition,
+  showStatus,
+  onOpen: () => {
+    closeReaderTools(false);
+    pdfTools?.close({ restoreFocus: false });
+    closeLibrary();
+    closeToc();
+    pauseContinuousScrollForFullscreen()();
+    clearContinuousScrollUpdate();
+    updatePanelScrollLock();
+    els.pdfPreviewButton.setAttribute("aria-expanded", "true");
+    els.floatingPdfPreviewButton.setAttribute("aria-expanded", "true");
+  },
+  onClose: () => {
+    updatePanelScrollLock();
+    els.pdfPreviewButton.setAttribute("aria-expanded", "false");
+    els.floatingPdfPreviewButton.setAttribute("aria-expanded", "false");
+  },
 });
 initializeVersionBadge();
 installRuntimeLogHooks();
