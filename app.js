@@ -1,4 +1,5 @@
 import sodium from "./vendor/libsodium/libsodium-wrappers.mjs";
+import { createPdfTools } from "./src/pdf-tools.js?v=116";
 import {
   AES_GCM_ENCRYPTION_VERSION,
   AES_GCM_IV_BYTES,
@@ -51,7 +52,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=114";
+} from "./src/constants.js?v=116";
 import {
   bytesToHex,
   createChunkAad,
@@ -81,34 +82,41 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=114";
+} from "./src/encryption.js?v=116";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=114";
+} from "./src/utils.js?v=116";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=114";
+} from "./src/encrypted-backups.js?v=116";
 import {
   createExportBlob,
   releaseExportBlob,
   transferExportBlobCleanup,
-} from "./src/export-blobs.js?v=114";
+} from "./src/export-blobs.js?v=116";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=114";
+} from "./src/pdf-sources.js?v=116";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
   canvasWrap: document.querySelector("#canvasWrap"),
   continuousPages: document.querySelector("#continuousPages"),
   controls: document.querySelector("#controls"),
+  moreButton: document.querySelector("#moreButton"),
+  readerToolsOverlay: document.querySelector("#readerToolsOverlay"),
+  readerToolsCloseButton: document.querySelector("#readerToolsCloseButton"),
+  zoomLevel: document.querySelector("#zoomLevel"),
+  pdfOutlineButton: document.querySelector("#pdfOutlineButton"),
+  pdfSearchButton: document.querySelector("#pdfSearchButton"),
+  pdfBookmarksButton: document.querySelector("#pdfBookmarksButton"),
   appVersion: document.querySelector("#appVersion"),
   backupCancelButton: document.querySelector("#backupCancelButton"),
   backupConfirmInput: document.querySelector("#backupConfirmInput"),
@@ -186,6 +194,7 @@ const els = {
 };
 
 let pdfDoc = null;
+let pdfTools = null;
 let pdfObjectUrl = "";
 let epubBook = null;
 let epubRendition = null;
@@ -242,6 +251,7 @@ let overlayTouchY = 0;
 let appFullscreen = false;
 let syncingNativeFullscreen = false;
 let fullscreenTransitionInProgress = false;
+let fullscreenLayoutChangePending = false;
 let epubTocEntriesCache = null;
 let epubSectionHrefIndex = null;
 let tocEntries = [];
@@ -255,6 +265,9 @@ const pendingContinuousPages = new Map();
 const continuousPinnedPages = new Set();
 const continuousRenderRuns = new Map();
 const continuousBlankRetries = new Map();
+const continuousPageFailures = new Map();
+const CONTINUOUS_PAGE_MAX_ATTEMPTS = 3;
+const CONTINUOUS_PAGE_RETRY_DELAY_MS = 1_500;
 let blankCheckCanvas = null;
 const libraryRecordCache = new Map();
 const recordDisplayNameCache = new Map();
@@ -682,6 +695,8 @@ function releasePageBehindLock() {
 }
 
 function showLockOverlay(mode = "unlock") {
+  closeReaderTools(false);
+  pdfTools?.clear();
   configureLockOverlay(mode);
   closeImagePreview();
   closeLibrary();
@@ -696,6 +711,10 @@ function hideLockOverlay() {
   els.lockOverlay.hidden = true;
   releasePageBehindLock();
   els.floatingLockButton.hidden = false;
+  if (pdfDoc) {
+    pdfTools?.setDocument(pdfDoc, state.documentId);
+    refreshPdfTextLayers();
+  }
 }
 
 function lockReader() {
@@ -2738,6 +2757,11 @@ async function saveDocumentFile(file) {
   const type = format === DOCUMENT_FORMATS.EPUB ? "application/epub+zip" : "application/pdf";
   const id = createDocumentId(file.name || fallbackName, file.size, file.lastModified || 0);
   const existing = await getStoredDocument(id).catch(() => null);
+
+  if (hasStoredDocumentPayload(existing)) {
+    return existing;
+  }
+
   const blob = file.slice(0, file.size, file.type || type);
   const now = Date.now();
   let record = {
@@ -2757,9 +2781,7 @@ async function saveDocumentFile(file) {
 
   await putStoredDocument(record);
 
-  if (!existing) {
-    deleteDocumentProgress(id);
-  }
+  deleteDocumentProgress(id);
 
   return record;
 }
@@ -2875,6 +2897,31 @@ async function verifyEncryptedBackupRecord(record, password) {
   const key = await deriveRecordEncryptionKey(record, password);
   await decryptRecordName(record, key);
   return key;
+}
+
+async function verifyEncryptedBackupPayload(record, key, onProgress = () => {}) {
+  const source = createEncryptedDocumentSourceWithKey(record, key);
+
+  try {
+    if (
+      !Number.isSafeInteger(source.chunkSize) || source.chunkSize <= 0 ||
+      !Number.isSafeInteger(source.length) || source.length < 0
+    ) {
+      throw new Error("Invalid encrypted backup chunk metadata.");
+    }
+
+    const totalChunks = Math.max(1, Math.ceil(source.length / source.chunkSize));
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      await source.readEncryptedChunk(chunkIndex);
+      source.chunkCache.clear();
+      onProgress({ chunkIndex: chunkIndex + 1, totalChunks });
+      await waitForNextFrame();
+    }
+  } catch (cause) {
+    const error = new Error("Encrypted backup payload verification failed.", { cause });
+    error.userMessage = "加密备份正文已损坏，未替换书架文件。";
+    throw error;
+  }
 }
 
 function createEncryptionMetadata(originalSize) {
@@ -3001,8 +3048,9 @@ async function saveImportedEncryptedBackupRecord(
   });
 
   if (backupPassword === targetPassword) {
-    await verifyEncryptedBackupRecord(record, backupPassword);
     recordToSave = await withPayloadOnlyEncryptedBlob(await withDetectedEncryptedPayloadLocation(record));
+    const key = await verifyEncryptedBackupRecord(recordToSave, backupPassword);
+    await verifyEncryptedBackupPayload(recordToSave, key, onProgress);
   } else {
     recordToSave = await reencryptEncryptedRecord(record, backupPassword, targetPassword, onProgress);
   }
@@ -3348,6 +3396,7 @@ async function handleBackupSubmit(event) {
 }
 
 function setReaderVisible(visible) {
+  if (!visible) closeReaderTools(false);
   els.emptyState.hidden = visible;
   els.viewerPane.hidden = !visible;
   els.controls.hidden = !visible;
@@ -3382,8 +3431,9 @@ function updateFullscreenButtons() {
   els.floatingFullscreenButton.setAttribute("aria-pressed", String(appFullscreen));
 }
 
-async function syncFullscreenLayoutAfterFrame(continuousAnchor = null) {
+async function syncFullscreenLayoutAfterFrame(continuousAnchor = null, pagedAnchor = null, openToken = documentOpenToken) {
   await waitForNextFrame();
+  if (documentOpenToken !== openToken) return;
   lastViewportChangeAt = Date.now();
 
   if (epubRendition) {
@@ -3404,7 +3454,71 @@ async function syncFullscreenLayoutAfterFrame(continuousAnchor = null) {
     return;
   }
 
-  await renderCurrentView(state.page, { behavior: "auto" });
+  await renderCurrentView(state.page, { behavior: "auto", pagedAnchor });
+}
+
+function getActuallyVisibleContinuousShells() {
+  const viewport = els.canvasWrap.getBoundingClientRect();
+  return Array.from(els.continuousPages.querySelectorAll(".page-shell")).filter((shell) => {
+    const rect = shell.getBoundingClientRect();
+    return rect.bottom > viewport.top + 1 && rect.top < viewport.bottom - 1;
+  });
+}
+
+async function reconcileFullscreenViewport(continuousAnchor, pagedAnchor, openToken) {
+  const doc = pdfDoc;
+  const current = () => doc && pdfDoc === doc && documentOpenToken === openToken;
+  if (!current()) return;
+
+  // Native fullscreen and mobile browser chrome can finish resizing after the
+  // first render. Replay that final layout without waiting for a user scroll.
+  for (let attempt = 0; attempt < 3 && current(); attempt += 1) {
+    fullscreenLayoutChangePending = false;
+    await waitForNextFrame();
+    if (!current()) return;
+
+    if (Math.abs(getAvailableCanvasWidth() - lastLayoutWidth) > 1) {
+      await syncFullscreenLayoutAfterFrame(continuousAnchor, pagedAnchor, openToken);
+      if (!current()) return;
+    }
+    if (!isScrollMode()) return;
+
+    const token = renderToken;
+    if (continuousAnchor) restoreContinuousReadingAnchor(continuousAnchor);
+    const marker = els.canvasWrap.scrollTop + els.canvasWrap.clientHeight * CONTINUOUS_READING_MARKER_RATIO;
+    ensureContinuousDomWindow(getContinuousPageNumberAtOffset(marker) || state.page);
+    await waitForNextFrame();
+    if (!current() || token !== renderToken) return;
+
+    const shells = getActuallyVisibleContinuousShells();
+    const pinned = shells.map(getContinuousShellPageNumber).filter((page) => !continuousPinnedPages.has(page));
+    for (const page of pinned) continuousPinnedPages.add(page);
+    try {
+      for (const shell of shells) {
+        if (!current() || token !== renderToken) return;
+        const canvas = shell.querySelector("canvas");
+        if (shell.dataset.rendered === "true" && canvas?.width > 1 && canvas.height > 1 &&
+            (shell.dataset.expectedInk === "false" || !isCanvasLikelyBlank(canvas))) continue;
+        await renderContinuousPage(getContinuousShellPageNumber(shell), token, { force: true });
+      }
+    } finally {
+      if (current() && token === renderToken) {
+        for (const page of pinned) continuousPinnedPages.delete(page);
+      }
+    }
+    if (!current() || token !== renderToken) return;
+    // Rendering mixed-size pages changes spacers, so restore the reading point
+    // once more and paint any newly exposed pages on the next bounded pass.
+    if (continuousAnchor) restoreContinuousReadingAnchor(continuousAnchor);
+    await waitForNextFrame();
+    if (!current() || token !== renderToken) return;
+    const visible = getActuallyVisibleContinuousShells();
+    const complete = visible.length && visible.every((shell) => {
+      const canvas = shell.querySelector("canvas");
+      return shell.dataset.rendered === "true" && canvas?.width > 1 && canvas.height > 1;
+    });
+    if (complete && !fullscreenLayoutChangePending && Math.abs(getAvailableCanvasWidth() - lastLayoutWidth) <= 1) break;
+  }
 }
 
 function setAppFullscreen(enabled, options = {}) {
@@ -3417,6 +3531,7 @@ function setAppFullscreen(enabled, options = {}) {
 
   const continuousAnchor =
     options.continuousAnchor || (pdfDoc && isScrollMode() ? captureContinuousReadingAnchor() : null);
+  const pagedAnchor = options.pagedAnchor || (pdfDoc && !isScrollMode() ? capturePagedReadingAnchor() : null);
 
   clearContinuousScrollUpdate();
   appFullscreen = nextFullscreen;
@@ -3426,7 +3541,7 @@ function setAppFullscreen(enabled, options = {}) {
   updateControls();
 
   if (options.syncLayout !== false) {
-    syncFullscreenLayoutAfterFrame(continuousAnchor).catch((error) => {
+    syncFullscreenLayoutAfterFrame(continuousAnchor, pagedAnchor).catch((error) => {
       console.error(error);
     });
   }
@@ -3473,10 +3588,15 @@ async function toggleAppFullscreen() {
 
   const nextFullscreen = !appFullscreen;
   const continuousAnchor = pdfDoc && isScrollMode() ? captureContinuousReadingAnchor() : null;
+  const pagedAnchor = pdfDoc && !isScrollMode() ? capturePagedReadingAnchor() : null;
+  const openToken = documentOpenToken;
+  window.clearTimeout(resizeTimer);
+  fullscreenLayoutChangePending = false;
   fullscreenTransitionInProgress = true;
   scrollTrackingSuppressionDepth += 1;
   setAppFullscreen(nextFullscreen, {
     continuousAnchor,
+    pagedAnchor,
     syncLayout: false,
   });
 
@@ -3487,11 +3607,17 @@ async function toggleAppFullscreen() {
       await exitNativeFullscreen();
     }
 
-    await syncFullscreenLayoutAfterFrame(continuousAnchor);
+    if (documentOpenToken !== openToken) return;
+    await syncFullscreenLayoutAfterFrame(continuousAnchor, pagedAnchor, openToken);
     await wait(220);
+    await reconcileFullscreenViewport(continuousAnchor, pagedAnchor, openToken);
   } finally {
     scrollTrackingSuppressionDepth = Math.max(0, scrollTrackingSuppressionDepth - 1);
     fullscreenTransitionInProgress = false;
+    if (documentOpenToken === openToken && pdfDoc && isScrollMode()) {
+      updateCurrentPageFromScroll();
+      scheduleContinuousHealthCheck(0);
+    }
   }
 }
 
@@ -3501,19 +3627,29 @@ async function handleNativeFullscreenExit() {
   }
 
   const continuousAnchor = pdfDoc && isScrollMode() ? captureContinuousReadingAnchor() : null;
+  const pagedAnchor = pdfDoc && !isScrollMode() ? capturePagedReadingAnchor() : null;
+  const openToken = documentOpenToken;
+  window.clearTimeout(resizeTimer);
+  fullscreenLayoutChangePending = false;
   fullscreenTransitionInProgress = true;
   scrollTrackingSuppressionDepth += 1;
   setAppFullscreen(false, {
     continuousAnchor,
+    pagedAnchor,
     syncLayout: false,
   });
 
   try {
-    await syncFullscreenLayoutAfterFrame(continuousAnchor);
+    await syncFullscreenLayoutAfterFrame(continuousAnchor, pagedAnchor, openToken);
     await wait(220);
+    await reconcileFullscreenViewport(continuousAnchor, pagedAnchor, openToken);
   } finally {
     scrollTrackingSuppressionDepth = Math.max(0, scrollTrackingSuppressionDepth - 1);
     fullscreenTransitionInProgress = false;
+    if (documentOpenToken === openToken && pdfDoc && isScrollMode()) {
+      updateCurrentPageFromScroll();
+      scheduleContinuousHealthCheck(0);
+    }
   }
 }
 
@@ -3529,8 +3665,8 @@ function updateControls() {
   const fullscreenEpubMode = epubMode && appFullscreen;
 
   els.docName.textContent = state.fileName || "未打开文件";
-  els.prevButton.textContent = epubMode ? "上一章" : "上一页";
-  els.nextButton.textContent = epubMode ? "下一章" : "下一页";
+  els.prevButton.textContent = epubMode ? "上章" : "上页";
+  els.nextButton.textContent = epubMode ? "下章" : "下页";
   els.prevButton.setAttribute("aria-label", epubMode ? "上一章" : "上一页");
   els.nextButton.setAttribute("aria-label", epubMode ? "下一章" : "下一页");
   els.pageInput.value = epubMode
@@ -3547,6 +3683,12 @@ function updateControls() {
   els.zoomOutButton.disabled = !hasDocument || epubMode || state.zoom <= 0.6;
   els.zoomInButton.disabled = !hasDocument || epubMode || state.zoom >= 2.6;
   els.fitButton.disabled = !hasDocument || epubMode;
+  els.moreButton.disabled = !hasDocument;
+  els.zoomLevel.textContent = `${Math.round(state.zoom * 100)}%`;
+  for (const button of [els.pdfOutlineButton, els.pdfSearchButton, els.pdfBookmarksButton]) {
+    button.disabled = !pdfDoc || epubMode;
+  }
+  pdfTools?.update();
   updateFullscreenButtons();
   els.tocButton.hidden = !epubMode;
   els.tocButton.disabled = !epubMode || epubNavigationInProgress;
@@ -3619,6 +3761,8 @@ function clearContinuousPages() {
   continuousPinnedPages.clear();
   continuousRenderRuns.clear();
   continuousBlankRetries.clear();
+  continuousPageFailures.clear();
+  pdfTools?.clearTextLayers();
   els.continuousPages.replaceChildren();
   continuousEstimatedPageWidth = 0;
   continuousEstimatedShellHeight = 0;
@@ -3632,6 +3776,8 @@ function clearContinuousPages() {
 }
 
 async function closeCurrentDocument() {
+  closeReaderTools(false);
+  pdfTools?.clear();
   renderToken += 1;
   setEpubLoading(false);
   closeImagePreview();
@@ -3651,6 +3797,7 @@ async function closeCurrentDocument() {
   els.canvas.removeAttribute("width");
   els.canvas.removeAttribute("height");
   els.canvas.removeAttribute("style");
+  delete els.canvas.dataset.page;
   els.epubViewer.replaceChildren();
   resetEpubTocCache();
   epubAtEnd = false;
@@ -3742,7 +3889,9 @@ function getCanvasOutputScale(viewport) {
     MAX_CANVAS_DIMENSION / Math.max(viewport.height, 1),
   );
 
-  return Math.max(0.25, Math.min(dpr, pixelScale, dimensionScale));
+  // Page geometry can be much larger than a normal sheet. Hard canvas limits
+  // take precedence over a minimum output resolution.
+  return Math.min(dpr, pixelScale, dimensionScale);
 }
 
 function prepareCanvas(canvas, viewport) {
@@ -3777,6 +3926,8 @@ function releaseCanvasBitmap(canvas, options = {}) {
 }
 
 function releasePagedCanvasBitmap() {
+  pdfTools?.removeTextLayer(els.canvas);
+  delete els.canvas.dataset.page;
   releaseCanvasBitmap(els.canvas, { removeStyle: true });
 }
 
@@ -3897,6 +4048,37 @@ async function encryptDocumentRecord(record, password, onProgress = () => {}) {
   );
 }
 
+function capturePagedReadingAnchor() {
+  const canvas = els.canvas;
+  const page = Number(canvas.dataset.page);
+  if (!pdfDoc || isScrollMode() || !page || !canvas.width || !canvas.height) {
+    return null;
+  }
+
+  const rect = canvas.getBoundingClientRect();
+  const wrapRect = els.canvasWrap.getBoundingClientRect();
+  const viewportX = els.canvasWrap.clientWidth * 0.5;
+  const viewportY = els.canvasWrap.clientHeight * CONTINUOUS_READING_MARKER_RATIO;
+  return {
+    page,
+    xRatio: clamp((wrapRect.left + viewportX - rect.left) / Math.max(1, rect.width), 0, 1),
+    yRatio: clamp((wrapRect.top + viewportY - rect.top) / Math.max(1, rect.height), 0, 1),
+  };
+}
+
+function restorePagedReadingAnchor(anchor) {
+  if (!anchor || Number(els.canvas.dataset.page) !== anchor.page) {
+    return;
+  }
+  const wrap = els.canvasWrap;
+  const rect = els.canvas.getBoundingClientRect();
+  const wrapRect = wrap.getBoundingClientRect();
+  const left = wrap.scrollLeft + rect.left - wrapRect.left + rect.width * anchor.xRatio - wrap.clientWidth * 0.5;
+  const top = wrap.scrollTop + rect.top - wrapRect.top + rect.height * anchor.yRatio - wrap.clientHeight * CONTINUOUS_READING_MARKER_RATIO;
+  wrap.scrollLeft = Math.max(0, left);
+  wrap.scrollTop = Math.max(0, top);
+}
+
 async function renderPage(pageNumber, options = {}) {
   if (!pdfDoc) {
     return false;
@@ -3905,6 +4087,8 @@ async function renderPage(pageNumber, options = {}) {
   const token = ++renderToken;
   const documentToken = documentOpenToken;
   const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
+  const pagedAnchor = options.pagedAnchor ||
+    (Number(els.canvas.dataset?.page) === targetPage ? capturePagedReadingAnchor() : null);
   state.page = targetPage;
   state.scrollPage = targetPage;
   state.scrollOffsetRatio = 0;
@@ -3917,6 +4101,9 @@ async function renderPage(pageNumber, options = {}) {
 
   try {
     await cancelCurrentRender();
+    if (token !== renderToken || documentToken !== documentOpenToken || !pdfDoc) {
+      return false;
+    }
     clearContinuousPages();
 
     page = await waitForPdfOperation(pdfDoc.getPage(targetPage), {
@@ -3949,7 +4136,16 @@ async function renderPage(pageNumber, options = {}) {
 
     // A fulfilled render can legitimately contain no ink (blank or sparse pages).
     commitRenderedCanvas(scratchCanvas, els.canvas);
-    els.canvasWrap.scrollTop = 0;
+    if (els.canvas.dataset) {
+      els.canvas.dataset.page = String(targetPage);
+    }
+    if (pagedAnchor?.page === targetPage) {
+      restorePagedReadingAnchor(pagedAnchor);
+    } else {
+      els.canvasWrap.scrollTop = 0;
+      els.canvasWrap.scrollLeft = 0;
+    }
+    pdfTools?.renderTextLayer({ page, viewport, canvas: els.canvas }).catch(() => {});
     saveReaderState({
       commitProgress: options.commitProgress !== false,
     });
@@ -4200,6 +4396,9 @@ function createContinuousShell(pageNumber) {
   label.className = "page-label";
   label.textContent = String(pageNumber);
   shell.append(placeholder, label);
+  if (continuousPageFailures.has(pageNumber)) {
+    showContinuousPageFailure(pageNumber, shell);
+  }
   return shell;
 }
 
@@ -4421,6 +4620,7 @@ function releaseContinuousCanvas(shell) {
   const canvas = shell.querySelector("canvas");
 
   if (canvas) {
+    pdfTools?.removeTextLayer(canvas);
     canvas.width = 0;
     canvas.height = 0;
     canvas.removeAttribute("width");
@@ -4434,6 +4634,70 @@ function releaseContinuousCanvas(shell) {
   delete shell.dataset.renderedAt;
   delete shell.dataset.renderStartedAt;
   delete shell.dataset.renderRunId;
+}
+
+function canRetryContinuousPage(pageNumber, now = Date.now()) {
+  const failure = continuousPageFailures.get(pageNumber);
+  return !failure || (failure.attempts < CONTINUOUS_PAGE_MAX_ATTEMPTS && now >= failure.retryAt);
+}
+
+function clearContinuousPageFailure(pageNumber, shell) {
+  continuousPageFailures.delete(pageNumber);
+  if (shell) {
+    delete shell.dataset.renderFailed;
+    shell.querySelector(".page-render-error")?.remove();
+  }
+}
+
+function showContinuousPageFailure(pageNumber, shell) {
+  const failure = continuousPageFailures.get(pageNumber);
+  if (!failure || !shell) {
+    return;
+  }
+  shell.dataset.renderFailed = "true";
+  shell.querySelector(".page-render-error")?.remove();
+  ensureContinuousPlaceholder(shell);
+  const panel = document.createElement("div");
+  panel.className = "page-render-error";
+  panel.setAttribute("role", "status");
+  const message = document.createElement("p");
+  const exhausted = failure.attempts >= CONTINUOUS_PAGE_MAX_ATTEMPTS;
+  message.textContent = exhausted
+    ? `第 ${pageNumber} 页加载失败。自动重试已停止。`
+    : `第 ${pageNumber} 页加载失败，稍后自动重试（${failure.attempts}/${CONTINUOUS_PAGE_MAX_ATTEMPTS - 1}）。`;
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.textContent = exhausted ? "重试本页" : "立即重试";
+  const documentToken = documentOpenToken;
+  const token = renderToken;
+  retry.addEventListener("click", () => {
+    if (documentToken !== documentOpenToken || token !== renderToken || !pdfDoc || !isScrollMode()) {
+      return;
+    }
+    clearContinuousPageFailure(pageNumber, shell);
+    scheduleContinuousPageRender(pageNumber, token);
+  });
+  panel.append(message, retry);
+  (shell.querySelector(".page-placeholder") || shell).append(panel);
+}
+
+function recordContinuousPageFailure(pageNumber, shell, error) {
+  const attempts = (continuousPageFailures.get(pageNumber)?.attempts || 0) + 1;
+  const retryAt = attempts < CONTINUOUS_PAGE_MAX_ATTEMPTS
+    ? Date.now() + CONTINUOUS_PAGE_RETRY_DELAY_MS * 2 ** (attempts - 1)
+    : Infinity;
+  continuousPageFailures.set(pageNumber, { attempts, retryAt });
+  pendingContinuousPages.delete(pageNumber);
+  showContinuousPageFailure(pageNumber, shell);
+  recordDiagnosticEvent("pdf-continuous-page-error", {
+    page: pageNumber,
+    attempt: attempts,
+    exhausted: attempts >= CONTINUOUS_PAGE_MAX_ATTEMPTS,
+    error: summarizeError(error),
+  });
+  if (Number.isFinite(retryAt)) {
+    scheduleContinuousHealthCheck(Math.max(1, retryAt - Date.now()));
+  }
 }
 
 function clearContinuousHealthTimer() {
@@ -4572,7 +4836,7 @@ function isContinuousRenderCurrent(pageNumber, shell, token, runId) {
   );
 }
 
-function recoverContinuousPageRender(pageNumber, shell, token) {
+function recoverContinuousPageRender(pageNumber, shell, token, options = {}) {
   if (!pdfDoc || token !== renderToken || !isScrollMode()) {
     return false;
   }
@@ -4590,7 +4854,11 @@ function recoverContinuousPageRender(pageNumber, shell, token) {
   continuousRenderRuns.delete(pageNumber);
   pendingContinuousPages.delete(pageNumber);
   releaseContinuousCanvas(shell);
-  scheduleContinuousPageRender(pageNumber, token);
+  if (options.error) {
+    recordContinuousPageFailure(pageNumber, shell, options.error);
+  } else {
+    scheduleContinuousPageRender(pageNumber, token);
+  }
   return true;
 }
 
@@ -4615,7 +4883,9 @@ function checkVisibleContinuousPages() {
       const startedAt = Number.parseInt(shell.dataset.renderStartedAt || "0", 10);
 
       if (startedAt && now - startedAt > CONTINUOUS_RENDER_TIMEOUT_MS) {
-        recoverContinuousPageRender(pageNumber, shell, token);
+        recoverContinuousPageRender(pageNumber, shell, token, {
+          error: new Error(`PDF page ${pageNumber} render timed out.`),
+        });
       }
 
       continue;
@@ -4641,6 +4911,12 @@ function checkVisibleContinuousPages() {
         hasUnsettledVisiblePage = true;
       }
 
+      continue;
+    }
+
+    if (shell.dataset.renderFailed === "true" && !canRetryContinuousPage(pageNumber, now)) {
+      const failure = continuousPageFailures.get(pageNumber);
+      hasUnsettledVisiblePage ||= Boolean(failure && Number.isFinite(failure.retryAt));
       continue;
     }
 
@@ -4744,6 +5020,7 @@ function getNextQueuedContinuousPage() {
     if (
       token !== renderToken ||
       !shell ||
+      !canRetryContinuousPage(pageNumber) ||
       shell.dataset.rendered === "true" ||
       shell.dataset.rendering === "true" ||
       continuousRenderPromises.has(pageNumber) ||
@@ -4825,7 +5102,9 @@ async function renderContinuousPageWithTimeout(pageNumber, token) {
   const shell = getContinuousShellByPageNumber(pageNumber);
 
   if (shell) {
-    recoverContinuousPageRender(pageNumber, shell, token);
+    recoverContinuousPageRender(pageNumber, shell, token, {
+      error: new Error(`PDF page ${pageNumber} render timed out.`),
+    });
   }
 }
 
@@ -4837,6 +5116,14 @@ function scheduleContinuousPageRender(pageNumber, token = renderToken) {
   const targetPage = Math.round(pageNumber);
 
   if (!Number.isFinite(targetPage) || targetPage < 1 || targetPage > pdfDoc.numPages) {
+    return;
+  }
+
+  if (!canRetryContinuousPage(targetPage)) {
+    const retryAt = continuousPageFailures.get(targetPage)?.retryAt;
+    if (Number.isFinite(retryAt)) {
+      scheduleContinuousHealthCheck(Math.max(1, retryAt - Date.now()));
+    }
     return;
   }
 
@@ -4879,6 +5166,9 @@ async function renderContinuousPage(pageNumber, token = renderToken, options = {
   }
 
   const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
+  if (!canRetryContinuousPage(targetPage)) {
+    return false;
+  }
   let shell = getContinuousShellByPageNumber(targetPage);
 
   if (!shell && options.force) {
@@ -4898,6 +5188,12 @@ async function renderContinuousPage(pageNumber, token = renderToken, options = {
         console.error(error);
       }
     });
+
+    // The awaited render may belong to a previous zoom level or document.
+    // Never replace a newer page's run id with work for the stale shell.
+    if (!pdfDoc || token !== renderToken || getContinuousShellByPageNumber(targetPage) !== shell) {
+      return false;
+    }
 
     if (shell.dataset.rendered === "true" || !options.force) {
       return shell.dataset.rendered === "true";
@@ -4979,6 +5275,9 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, doc
 
   shell.dataset.rendering = "true";
   shell.dataset.renderStartedAt = String(Date.now());
+  if (shell.dataset.renderFailed === "true") {
+    shell.querySelector(".page-render-error")?.remove();
+  }
   let page = null;
   let task = null;
   let renderCanvas = null;
@@ -5041,8 +5340,13 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, doc
       const canvas = ensureContinuousCanvas(shell, viewport);
       commitRenderedCanvas(renderCanvas, canvas);
     }
+    if (shell.dataset.renderFailed === "true") {
+      clearContinuousPageFailure(targetPage, shell);
+    }
     shell.dataset.rendered = "true";
     shell.dataset.renderedAt = String(Date.now());
+    const visibleCanvas = directRender ? renderCanvas : shell.querySelector("canvas");
+    pdfTools?.renderTextLayer({ page, viewport, canvas: visibleCanvas }).catch(() => {});
     scheduleContinuousHealthCheck(260);
     return true;
   } catch (error) {
@@ -5061,6 +5365,9 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, doc
       isContinuousRenderCurrent(targetPage, shell, token, runId)
     ) {
       releaseContinuousCanvas(shell);
+      if (error?.name !== "RenderingCancelledException") {
+        recordContinuousPageFailure(targetPage, shell, error);
+      }
     }
     if (options.throwOnError) {
       throw error;
@@ -6273,6 +6580,9 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
 
   try {
     await cancelCurrentRender();
+    if (token !== renderToken || documentToken !== documentOpenToken || !pdfDoc) {
+      return false;
+    }
     releasePagedCanvasBitmap();
     clearContinuousPages();
 
@@ -6282,8 +6592,10 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
       return false;
     }
 
-    lastLayoutWidth = getAvailableCanvasWidth();
     buildContinuousPlaceholders(estimatedSize, targetPage);
+    // Placeholders restore the vertical scrollbar. Measure the width used by
+    // the actual page render, not the wider empty container during rebuild.
+    lastLayoutWidth = getAvailableCanvasWidth();
     setupContinuousObserver(token);
 
     if (continuousAnchor) {
@@ -6317,6 +6629,15 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
     }
 
     if (token !== renderToken || documentToken !== documentOpenToken) {
+      return false;
+    }
+
+    if (renderedTargetPage !== true) {
+      // The page itself shows the failure and retry control. Remove only the
+      // preparation spinner; do not save progress or report a successful view.
+      queueVisibleContinuousPages(token);
+      pruneContinuousPages();
+      hideStatus();
       return false;
     }
 
@@ -6358,7 +6679,7 @@ async function renderContinuousDocument(pageNumber = state.page, options = {}) {
     });
     return true;
   } catch (error) {
-    if (documentToken !== documentOpenToken) {
+    if (documentToken !== documentOpenToken || token !== renderToken) {
       return false;
     }
 
@@ -8080,6 +8401,7 @@ async function loadPdfFromSource(
     state.scrollPage = clamp(state.scrollPage || state.page, 1, pdfDoc.numPages);
     state.zoom = clamp(state.zoom || 1, 0.6, 2.6);
 
+    pdfTools?.setDocument(pdfDoc, state.documentId);
     updateControls();
     setReaderVisible(true);
     updateViewerMode();
@@ -8559,8 +8881,9 @@ async function handleFileSelection(file) {
     return opened;
   }
 
-  deleteDocumentProgress(record.id);
-  const opened = await openDocumentRecord(record, { resetProgress: true });
+  const opened = await openDocumentRecord(record, {
+    resetProgress: !getProgressMap()[record.id],
+  });
   if (opened) {
     recordDiagnosticEvent("handle-file-selection-success", {
       file: summarizeFile(file),
@@ -8633,6 +8956,10 @@ async function handleEncryptedBackupSelectionV2(file) {
       error: summarizeError(error),
       file: summarizeFile(file),
     });
+    if (error?.userMessage) {
+      showStatus(error.userMessage, true);
+      return;
+    }
     showBackupImportPasswordPrompt(backupRecord);
   }
 }
@@ -8724,6 +9051,45 @@ async function handleUnlockedSession() {
   await maybePromptLibraryEncryption();
 }
 
+function refreshPdfTextLayers() {
+  const doc = pdfDoc;
+  const token = documentOpenToken;
+  const viewToken = renderToken;
+  const mode = state.mode;
+  if (!doc || !pdfTools || !els.lockOverlay.hidden) return;
+  const canvases = isScrollMode()
+    ? Array.from(els.continuousPages.querySelectorAll('[data-rendered="true"] canvas'))
+    : [els.canvas];
+  for (const canvas of canvases) {
+    const pageNumber = Number(canvas.dataset.page) || state.page;
+    doc.getPage(pageNumber).then((page) => {
+      if (doc !== pdfDoc || token !== documentOpenToken || viewToken !== renderToken || mode !== state.mode ||
+          Number(canvas.dataset.page) !== pageNumber || !els.lockOverlay.hidden || !canvas.isConnected) return;
+      return pdfTools.renderTextLayer({ page, viewport: getScaledViewport(page), canvas });
+    }).catch(() => {});
+  }
+}
+
+function closeReaderTools(restoreFocus = true) {
+  if (!els.readerToolsOverlay || els.readerToolsOverlay.hidden) return;
+  els.readerToolsOverlay.hidden = true;
+  els.moreButton.setAttribute("aria-expanded", "false");
+  updatePanelScrollLock();
+  if (restoreFocus) els.moreButton.focus({ preventScroll: true });
+}
+
+function openReaderTools() {
+  if ((!pdfDoc && !epubBook) || !els.lockOverlay.hidden) return;
+  closeLibrary();
+  closeToc();
+  pdfTools?.close();
+  els.readerToolsOverlay.hidden = false;
+  els.moreButton.setAttribute("aria-expanded", "true");
+  updateControls();
+  updatePanelScrollLock();
+  els.readerToolsCloseButton.focus({ preventScroll: true });
+}
+
 function closeLibrary() {
   libraryRenderRequestId += 1;
   els.libraryOverlay.hidden = true;
@@ -8736,6 +9102,8 @@ async function openLibrary() {
   }
 
   closeToc();
+  closeReaderTools(false);
+  pdfTools?.close();
   els.libraryOverlay.hidden = false;
   updatePanelScrollLock();
 
@@ -8762,6 +9130,8 @@ function openToc() {
   }
 
   closeLibrary();
+  closeReaderTools(false);
+  pdfTools?.close();
   els.tocOverlay.hidden = false;
   updatePanelScrollLock();
   renderTocList();
@@ -8769,6 +9139,8 @@ function openToc() {
 
 function updatePanelScrollLock() {
   const panelOpen =
+    !els.readerToolsOverlay.hidden ||
+    pdfTools?.isOpen() ||
     !els.libraryOverlay.hidden ||
     !els.tocOverlay.hidden ||
     !els.encryptionOverlay.hidden ||
@@ -9250,6 +9622,7 @@ function handleTocListClick(event) {
 }
 
 async function deleteDocumentFromLibrary(documentId) {
+  await deleteStoredDocument(documentId);
   const isActiveDocument = documentId === state.documentId;
 
   if (isActiveDocument) {
@@ -9268,7 +9641,6 @@ async function deleteDocumentFromLibrary(documentId) {
     updateControls();
   }
 
-  await deleteStoredDocument(documentId).catch(() => {});
   deleteDocumentProgress(documentId);
   saveReaderState();
   await renderLibraryList();
@@ -9519,7 +9891,43 @@ function preventLockScroll(event) {
   }
 }
 
+function canTurnPdfPageWithSwipe(target) {
+  if (!pdfDoc || isScrollMode() || state.zoom > 1.01 || (window.visualViewport?.scale || 1) > 1.01) {
+    return false;
+  }
+  if (els.canvasWrap.scrollWidth > els.canvasWrap.clientWidth + 2) {
+    return false;
+  }
+  const selection = window.getSelection?.();
+  if (selection && !selection.isCollapsed) {
+    return false;
+  }
+  const element = target?.nodeType === 3 ? target.parentElement : target;
+  return !element?.closest?.("button, input, a, textarea, select, [contenteditable], .textLayer span, .pdf-text-layer span, [data-pdf-text-layer] span");
+}
+
 function wireEvents() {
+  els.moreButton.addEventListener("click", openReaderTools);
+  els.readerToolsCloseButton.addEventListener("click", () => closeReaderTools());
+  els.readerToolsOverlay.addEventListener("click", (event) => {
+    if (event.target === els.readerToolsOverlay) closeReaderTools();
+  });
+  els.readerToolsOverlay.addEventListener("keydown", (event) => {
+    if (event.key !== "Tab") return;
+    const buttons = Array.from(els.readerToolsOverlay.querySelectorAll('button:not([disabled])'));
+    const first = buttons[0];
+    const last = buttons.at(-1);
+    if ((event.shiftKey && document.activeElement === first) || (!event.shiftKey && document.activeElement === last)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first)?.focus();
+    }
+  });
+  for (const [button, kind] of [[els.pdfOutlineButton, "outline"], [els.pdfSearchButton, "search"], [els.pdfBookmarksButton, "bookmarks"]]) {
+    button.addEventListener("click", () => {
+      closeReaderTools();
+      pdfTools?.open(kind);
+    });
+  }
   els.openButton.addEventListener("click", openFilePicker);
   els.emptyOpenButton.addEventListener("click", openFilePicker);
   els.runtimeLogButton?.addEventListener("click", copyRuntimeLogToClipboard);
@@ -9742,11 +10150,13 @@ function wireEvents() {
     window.clearTimeout(resizeTimer);
 
     if (fullscreenTransitionInProgress) {
+      fullscreenLayoutChangePending = true;
       return;
     }
 
     resizeTimer = window.setTimeout(() => {
       if (fullscreenTransitionInProgress) {
+        fullscreenLayoutChangePending = true;
         return;
       }
 
@@ -9764,6 +10174,8 @@ function wireEvents() {
 
         if (lastLayoutWidth && Math.abs(nextLayoutWidth - lastLayoutWidth) < 8) {
           restoreReaderPositionAfterResume();
+          updateCurrentPageFromScroll();
+          scheduleContinuousHealthCheck(0);
           return;
         }
 
@@ -9781,6 +10193,11 @@ function wireEvents() {
   });
 
   window.addEventListener("keydown", (event) => {
+    if (event.defaultPrevented || pdfTools?.isOpen()) return;
+    if (!els.readerToolsOverlay.hidden) {
+      if (event.key === "Escape") closeReaderTools();
+      return;
+    }
     if (!els.imageOverlay.hidden) {
       if (event.key === "Escape") {
         closeImagePreview();
@@ -9813,12 +10230,15 @@ function wireEvents() {
       return;
     }
 
+    if (!els.lockOverlay.hidden || !els.libraryOverlay.hidden || !els.tocOverlay.hidden ||
+        !els.backupOverlay.hidden || !els.encryptionOverlay.hidden || !els.diagnosticsOverlay.hidden) return;
+
     if (event.key === "Escape" && appFullscreen) {
       toggleAppFullscreen();
       return;
     }
 
-    if ((!pdfDoc && !epubBook) || event.target === els.pageInput) {
+    if ((!pdfDoc && !epubBook) || event.target?.closest?.('input, textarea, [contenteditable="true"]')) {
       return;
     }
 
@@ -9842,10 +10262,16 @@ function wireEvents() {
   els.canvasWrap.addEventListener(
     "touchstart",
     (event) => {
-      const touch = event.changedTouches[0];
+      const touch = event.changedTouches?.[0];
+      if (event.touches?.length !== 1 || !touch || !canTurnPdfPageWithSwipe(event.target)) {
+        touchStart = null;
+        return;
+      }
       touchStart = {
         x: touch.clientX,
         y: touch.clientY,
+        scrollLeft: els.canvasWrap.scrollLeft,
+        scrollTop: els.canvasWrap.scrollTop,
       };
     },
     { passive: true },
@@ -9854,12 +10280,17 @@ function wireEvents() {
   els.canvasWrap.addEventListener(
     "touchend",
     (event) => {
-      if (!touchStart || !pdfDoc || isScrollMode()) {
+      if (!touchStart || event.touches?.length || !canTurnPdfPageWithSwipe(event.target)) {
         touchStart = null;
         return;
       }
 
-      const touch = event.changedTouches[0];
+      const touch = event.changedTouches?.[0];
+      if (!touch || Math.abs(els.canvasWrap.scrollLeft - touchStart.scrollLeft) > 2 ||
+          Math.abs(els.canvasWrap.scrollTop - touchStart.scrollTop) > 2) {
+        touchStart = null;
+        return;
+      }
       const dx = touch.clientX - touchStart.x;
       const dy = touch.clientY - touchStart.y;
       touchStart = null;
@@ -9870,6 +10301,10 @@ function wireEvents() {
     },
     { passive: true },
   );
+
+  els.canvasWrap.addEventListener("touchcancel", () => {
+    touchStart = null;
+  }, { passive: true });
 
   els.epubPane.addEventListener(
     "touchstart",
@@ -10413,6 +10848,23 @@ async function runContinuousWindowSelfTest() {
   showStatus("自测通过：长 PDF 仅保留窗口内页面节点。");
 }
 
+function assertSelfTestFullscreenPaint(label) {
+  const viewport = els.canvasWrap.getBoundingClientRect();
+  const visible = getActuallyVisibleContinuousShells();
+  const hasVisibleInk = visible.some((shell) => {
+    const canvas = shell.querySelector("canvas");
+    if (shell.dataset.rendered !== "true" || !canvas || canvas.width < 2 || canvas.height < 2) return false;
+    const rect = canvas.getBoundingClientRect();
+    return rect.bottom > viewport.top && rect.top < viewport.bottom && !isCanvasLikelyBlank(canvas);
+  });
+  if (!hasVisibleInk) {
+    throw new Error(`${label}: no painted PDF content intersects the viewport without scrolling.`);
+  }
+  if (Math.abs(getAvailableCanvasWidth() - lastLayoutWidth) > 1) {
+    throw new Error(`${label}: PDF was rendered for an outdated fullscreen width.`);
+  }
+}
+
 async function runFullscreenProgressSelfTest() {
   const documentId = `${DOCUMENT_ID_PREFIX}selftest-fullscreen-progress`;
   const targetPage = 110;
@@ -10460,6 +10912,7 @@ async function runFullscreenProgressSelfTest() {
 
   try {
     await toggleAppFullscreen();
+    assertSelfTestFullscreenPaint("Enter fullscreen");
     const entered = captureContinuousReadingAnchor();
 
     if (!entered || entered.page !== before.page || state.page !== before.page) {
@@ -10467,6 +10920,7 @@ async function runFullscreenProgressSelfTest() {
     }
 
     await toggleAppFullscreen();
+    assertSelfTestFullscreenPaint("Exit fullscreen");
     const exited = captureContinuousReadingAnchor();
 
     if (!exited || exited.page !== before.page || state.page !== before.page) {
@@ -10478,8 +10932,8 @@ async function runFullscreenProgressSelfTest() {
     }
   }
 
-  updateSelfTestResult("passed", `fullscreen preserved PDF progress at page ${targetPage}`);
-  showStatus(`自测通过：全屏切换保持在第 ${targetPage} 页。`);
+  updateSelfTestResult("passed", `fullscreen painted visible content and preserved PDF progress at page ${targetPage}`);
+  showStatus(`自测通过：全屏进出无需滚动即可显示，保持在第 ${targetPage} 页。`);
 }
 
 async function runLockSecuritySelfTest() {
@@ -10697,6 +11151,20 @@ function initializeVersionBadge() {
   els.appVersion.textContent = APP_VERSION;
 }
 
+pdfTools = createPdfTools({
+  getDocument: () => els.lockOverlay.hidden ? pdfDoc : null,
+  getDocumentId: () => state.documentId,
+  getPage: () => state.page,
+  navigate: (page) => goToPage(page),
+  showStatus,
+  onOpen: () => {
+    closeReaderTools(false);
+    closeLibrary();
+    closeToc();
+    updatePanelScrollLock();
+  },
+  onClose: () => updatePanelScrollLock(),
+});
 initializeVersionBadge();
 installRuntimeLogHooks();
 wireEvents();
