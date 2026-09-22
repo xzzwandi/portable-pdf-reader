@@ -6,6 +6,7 @@ import { createExportBlob, releaseExportBlob, transferExportBlobCleanup, MAX_MEM
 
 const source = fs.readFileSync(new URL("../app.js", import.meta.url), "utf8");
 function load(context, names) {
+  context.pdfTools ??= null;
   for (const name of names) {
     const start = new RegExp(`^(?:async )?function ${name}\\(`, "m").exec(source);
     assert.ok(start, `Missing function ${name}`);

@@ -1,33 +1,35 @@
-const CACHE_NAME = "portable-pdf-reader-v114";
+const CACHE_PREFIX = "portable-pdf-reader-";
+const CACHE_NAME = "portable-pdf-reader-v116";
 const APP_SHELL = [
   "./",
   "./index.html",
-  "./styles.css?v=114",
-  "./app.js?v=114",
-  "./src/constants.js?v=114",
-  "./src/encryption.js?v=114",
-  "./src/encrypted-backups.js?v=114",
-  "./src/pdf-sources.js?v=114",
-  "./src/utils.js?v=114",
-  "./src/export-blobs.js?v=114",
-  "./src/export-worker.js?v=114",
+  "./styles.css?v=116",
+  "./app.js?v=116",
+  "./src/constants.js?v=116",
+  "./src/encryption.js?v=116",
+  "./src/encrypted-backups.js?v=116",
+  "./src/pdf-sources.js?v=116",
+  "./src/pdf-tools.js?v=116",
+  "./src/pdf-tools.css?v=116",
+  "./src/utils.js?v=116",
+  "./src/export-blobs.js?v=116",
+  "./src/export-worker.js?v=116",
   "./manifest.webmanifest",
   "./icons/icon.svg",
-  "./vendor/jszip/jszip.min.js?v=114",
-  "./vendor/epubjs/epub.min.js?v=114",
+  "./vendor/jszip/jszip.min.js?v=116",
+  "./vendor/epubjs/epub.min.js?v=116",
   "./vendor/pdfjs/pdf.min.mjs",
-  "./vendor/pdfjs/pdf.worker.mjs?v=114",
+  "./vendor/pdfjs/pdf.worker.mjs?v=116",
   "./vendor/libsodium/libsodium-wrappers.mjs",
   "./vendor/libsodium/libsodium-sumo.mjs",
 ];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) =>
-      Promise.allSettled(APP_SHELL.map((url) => cache.add(url))),
-    ),
+    caches.open(CACHE_NAME)
+      .then((cache) => cache.addAll(APP_SHELL))
+      .then(() => self.skipWaiting()),
   );
-  self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {
@@ -35,10 +37,12 @@ self.addEventListener("activate", (event) => {
     caches
       .keys()
       .then((keys) =>
-        Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))),
-      ),
+        Promise.all(keys
+          .filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE_NAME)
+          .map((key) => caches.delete(key))),
+      )
+      .then(() => self.clients.claim()),
   );
-  self.clients.claim();
 });
 
 self.addEventListener("fetch", (event) => {

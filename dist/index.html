@@ -8,7 +8,8 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./icons/icon.svg" />
-    <link rel="stylesheet" href="./styles.css?v=114" />
+    <link rel="stylesheet" href="./styles.css?v=116" />
+    <link rel="stylesheet" href="./src/pdf-tools.css?v=116" />
   </head>
   <body>
     <div class="app-shell">
@@ -18,7 +19,7 @@
           <div>
             <div class="brand-title">
               <h1>随身阅读</h1>
-              <span id="appVersion" class="version-badge">v114</span>
+              <span id="appVersion" class="version-badge">v116</span>
             </div>
             <p id="docName">未打开文件</p>
           </div>
@@ -26,7 +27,6 @@
 
         <div class="actions">
           <input id="fileInput" type="file" hidden />
-          <button id="runtimeLogButton" type="button">日志</button>
           <button id="libraryButton" type="button">书架</button>
           <button id="openButton" class="primary" type="button">打开文件</button>
         </div>
@@ -52,30 +52,51 @@
       </main>
 
       <footer id="controls" class="controls" hidden>
-        <button id="prevButton" type="button" aria-label="上一页">上一页</button>
+        <button id="prevButton" type="button" aria-label="上一页">上页</button>
         <label class="page-jump" for="pageInput">
-          <input id="pageInput" type="number" min="1" value="1" inputmode="numeric" />
+          <input id="pageInput" type="number" min="1" value="1" inputmode="numeric" aria-label="跳转到页码" />
           <span id="pageTotal">/ 0</span>
         </label>
-        <button id="nextButton" type="button" aria-label="下一页">下一页</button>
+        <button id="nextButton" type="button" aria-label="下一页">下页</button>
 
         <div class="spacer"></div>
-
-        <div class="mode-switch" role="group" aria-label="阅读模式">
-          <button id="pagedModeButton" type="button" aria-pressed="true">分页</button>
-          <button id="scrollModeButton" type="button" aria-pressed="false">连续</button>
-        </div>
 
         <div id="edgeJumpGroup" class="edge-jumps" role="group" aria-label="连续模式跳转" hidden>
           <button id="jumpTopButton" type="button" aria-label="跳到顶部">↑</button>
           <button id="jumpBottomButton" type="button" aria-label="跳到底部">↓</button>
         </div>
 
-        <button id="zoomOutButton" type="button" aria-label="缩小">-</button>
-        <button id="fitButton" type="button">适宽</button>
         <button id="fullscreenButton" type="button" aria-pressed="false">全屏</button>
-        <button id="zoomInButton" type="button" aria-label="放大">+</button>
+        <button id="moreButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="readerToolsOverlay">更多</button>
       </footer>
+
+      <div id="readerToolsOverlay" class="reader-tools-overlay" hidden>
+        <section class="reader-tools-panel" role="dialog" aria-modal="true" aria-labelledby="readerToolsTitle">
+          <header class="reader-tools-header">
+            <h2 id="readerToolsTitle">阅读工具</h2>
+            <button id="readerToolsCloseButton" type="button" aria-label="关闭阅读工具">关闭</button>
+          </header>
+          <div class="reader-tools-body">
+            <div class="mode-switch" role="group" aria-label="阅读模式">
+              <button id="pagedModeButton" type="button" aria-pressed="true">分页阅读</button>
+              <button id="scrollModeButton" type="button" aria-pressed="false">连续阅读</button>
+            </div>
+            <div class="reader-tools-zoom" role="group" aria-label="页面缩放">
+              <button id="zoomOutButton" type="button" aria-label="缩小">−</button>
+              <button id="fitButton" type="button">适宽</button>
+              <output id="zoomLevel" aria-label="当前缩放">100%</output>
+              <button id="zoomInButton" type="button" aria-label="放大">+</button>
+            </div>
+            <div class="reader-tools-grid">
+              <button id="pdfOutlineButton" type="button">PDF 目录</button>
+              <button id="pdfSearchButton" type="button">搜索文字</button>
+              <button id="pdfBookmarksButton" type="button">书签</button>
+              <button id="runtimeLogButton" type="button">复制诊断日志</button>
+            </div>
+            <p class="reader-tools-hint">PDF 文字可长按选择并复制；扫描图片需要先识别文字。</p>
+          </div>
+        </section>
+      </div>
 
       <button id="floatingLockButton" class="floating-lock" type="button" aria-label="锁定阅读器">
         锁
@@ -243,8 +264,8 @@
       </div>
     </div>
 
-    <script src="./vendor/jszip/jszip.min.js?v=114"></script>
-    <script src="./vendor/epubjs/epub.min.js?v=114"></script>
-    <script type="module" src="./app.js?v=114"></script>
+    <script src="./vendor/jszip/jszip.min.js?v=116"></script>
+    <script src="./vendor/epubjs/epub.min.js?v=116"></script>
+    <script type="module" src="./app.js?v=116"></script>
   </body>
 </html>
