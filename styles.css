@@ -402,23 +402,6 @@ canvas {
   text-overflow: ellipsis;
 }
 
-.floating-pdf-preview {
-  position: fixed;
-  z-index: 12;
-  left: 50%;
-  bottom: max(12px, env(safe-area-inset-bottom));
-  transform: translateX(-50%);
-  min-height: 44px;
-  max-width: calc(100vw - 120px);
-  color: var(--accent);
-  background: var(--surface);
-  box-shadow: var(--shadow);
-  font-variant-numeric: tabular-nums;
-}
-
-body.is-panel-open .floating-pdf-preview,
-body.is-reader-locked .floating-pdf-preview { visibility: hidden; }
-
 .reader-tools-overlay {
   position: fixed;
   inset: 0;

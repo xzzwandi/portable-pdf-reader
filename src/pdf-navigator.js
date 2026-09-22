@@ -1,4 +1,4 @@
-import { createPdfThumbnailCache } from "./pdf-thumbnails.js?v=119";
+import { createPdfThumbnailCache } from "./pdf-thumbnails.js?v=120";
 
 const THUMBNAIL_DELAY_MS = 100;
 const NEARBY_RADIUS = 50;

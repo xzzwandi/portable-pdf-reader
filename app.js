@@ -1,6 +1,6 @@
 import sodium from "./vendor/libsodium/libsodium-wrappers.mjs";
-import { createPdfTools } from "./src/pdf-tools.js?v=119";
-import { createPdfNavigator } from "./src/pdf-navigator.js?v=119";
+import { createPdfTools } from "./src/pdf-tools.js?v=120";
+import { createPdfNavigator } from "./src/pdf-navigator.js?v=120";
 import {
   AES_GCM_ENCRYPTION_VERSION,
   AES_GCM_IV_BYTES,
@@ -53,7 +53,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=119";
+} from "./src/constants.js?v=120";
 import {
   bytesToHex,
   createChunkAad,
@@ -83,28 +83,28 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=119";
+} from "./src/encryption.js?v=120";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=119";
+} from "./src/utils.js?v=120";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=119";
+} from "./src/encrypted-backups.js?v=120";
 import {
   createExportBlob,
   releaseExportBlob,
   transferExportBlobCleanup,
-} from "./src/export-blobs.js?v=119";
+} from "./src/export-blobs.js?v=120";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=119";
+} from "./src/pdf-sources.js?v=120";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -153,7 +153,6 @@ const els = {
   fitButton: document.querySelector("#fitButton"),
   floatingFullscreenButton: document.querySelector("#floatingFullscreenButton"),
   floatingLockButton: document.querySelector("#floatingLockButton"),
-  floatingPdfPreviewButton: document.querySelector("#floatingPdfPreviewButton"),
   fullscreenButton: document.querySelector("#fullscreenButton"),
   imageCloseButton: document.querySelector("#imageCloseButton"),
   imageOverlay: document.querySelector("#imageOverlay"),
@@ -3452,8 +3451,6 @@ function updateFullscreenButtons() {
   els.floatingFullscreenButton.textContent = appFullscreen ? "退" : "全";
   els.floatingFullscreenButton.setAttribute("aria-label", fullscreenLabel);
   els.floatingFullscreenButton.setAttribute("aria-pressed", String(appFullscreen));
-  els.floatingPdfPreviewButton.hidden = !appFullscreen || !pdfDoc || !els.lockOverlay.hidden;
-  els.floatingPdfPreviewButton.textContent = `${state.page} / ${pdfDoc?.numPages || 0} · 预览`;
 }
 
 async function syncFullscreenLayoutAfterFrame(continuousAnchor = null, pagedAnchor = null, openToken = documentOpenToken) {
@@ -10280,9 +10277,7 @@ function wireEvents() {
   for (const type of ["pointerdown", "touchstart", "wheel", "keydown"]) {
     document.querySelector(".app-shell").addEventListener(type, () => cancelPdfNavigationForInput(), { capture: true, passive: true });
   }
-  for (const button of [els.pdfPreviewButton, els.floatingPdfPreviewButton]) {
-    button.addEventListener("click", () => pdfNavigator?.open());
-  }
+  els.pdfPreviewButton.addEventListener("click", () => pdfNavigator?.open());
   for (const type of ["touchstart", "wheel", "pointerdown"]) {
     els.canvasWrap.addEventListener(type, handleContinuousScrollInput, { passive: true });
   }
@@ -11727,12 +11722,10 @@ pdfNavigator = createPdfNavigator({
     clearContinuousScrollUpdate();
     updatePanelScrollLock();
     els.pdfPreviewButton.setAttribute("aria-expanded", "true");
-    els.floatingPdfPreviewButton.setAttribute("aria-expanded", "true");
   },
   onClose: () => {
     updatePanelScrollLock();
     els.pdfPreviewButton.setAttribute("aria-expanded", "false");
-    els.floatingPdfPreviewButton.setAttribute("aria-expanded", "false");
   },
 });
 initializeVersionBadge();
