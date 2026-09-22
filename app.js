@@ -1,5 +1,5 @@
 import sodium from "./vendor/libsodium/libsodium-wrappers.mjs";
-import { createPdfTools } from "./src/pdf-tools.js?v=116";
+import { createPdfTools } from "./src/pdf-tools.js?v=117";
 import {
   AES_GCM_ENCRYPTION_VERSION,
   AES_GCM_IV_BYTES,
@@ -52,7 +52,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=116";
+} from "./src/constants.js?v=117";
 import {
   bytesToHex,
   createChunkAad,
@@ -82,28 +82,28 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=116";
+} from "./src/encryption.js?v=117";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=116";
+} from "./src/utils.js?v=117";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=116";
+} from "./src/encrypted-backups.js?v=117";
 import {
   createExportBlob,
   releaseExportBlob,
   transferExportBlobCleanup,
-} from "./src/export-blobs.js?v=116";
+} from "./src/export-blobs.js?v=117";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=116";
+} from "./src/pdf-sources.js?v=117";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -273,13 +273,15 @@ const libraryRecordCache = new Map();
 const recordDisplayNameCache = new Map();
 let libraryListDirty = true;
 let libraryRenderRequestId = 0;
-let continuousQueueRunning = false;
+let continuousQueueOwner = null;
 let continuousRenderRunId = 0;
 let continuousHealthTimer = null;
 let continuousCleanupTimer = null;
 let continuousScrollFrame = 0;
 let continuousProgrammaticScrollTarget = 0;
 let continuousProgrammaticScrollUntil = 0;
+let continuousScrollIntent = 0;
+let continuousScrollCorrectionFrame = 0;
 const CONTINUOUS_PAGE_GAP_PX = 14;
 const CONTINUOUS_DOM_WINDOW_PAGES = 36;
 const CONTINUOUS_CONSTRAINED_DOM_WINDOW_PAGES = 22;
@@ -288,6 +290,8 @@ let continuousEstimatedPageWidth = 0;
 let continuousEstimatedShellHeight = 0;
 let continuousPageHeightTree = null;
 const continuousPageHeightOverrides = new Map();
+const continuousPageAspectRatios = new Map();
+let continuousBasePageAspectRatio = 0;
 let continuousDomWindowStart = 0;
 let continuousDomWindowEnd = 0;
 let continuousWindowUpdating = false;
@@ -3581,6 +3585,27 @@ async function exitNativeFullscreen() {
   }
 }
 
+function pauseContinuousScrollForFullscreen() {
+  if (!pdfDoc || !isScrollMode()) return () => {};
+  cancelContinuousScrollCorrection();
+  window.clearTimeout(scrollStateTimer);
+  const wrap = els.canvasWrap;
+  const top = wrap.scrollTop;
+  const previousOverflow = wrap.style.overflowY;
+  wrap.style.overflowY = "hidden";
+  // Stop the iOS momentum scroller before changing its height and contents.
+  // Keeping its overflow disabled through reflow prevents a late fling from
+  // replacing the restored reading point with an old pixel offset.
+  void wrap.offsetHeight;
+  applyContinuousScrollTopInstant(top);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    wrap.style.overflowY = previousOverflow;
+  };
+}
+
 async function toggleAppFullscreen() {
   if (fullscreenTransitionInProgress) {
     return;
@@ -3590,6 +3615,7 @@ async function toggleAppFullscreen() {
   const continuousAnchor = pdfDoc && isScrollMode() ? captureContinuousReadingAnchor() : null;
   const pagedAnchor = pdfDoc && !isScrollMode() ? capturePagedReadingAnchor() : null;
   const openToken = documentOpenToken;
+  const resumeScroll = pauseContinuousScrollForFullscreen();
   window.clearTimeout(resizeTimer);
   fullscreenLayoutChangePending = false;
   fullscreenTransitionInProgress = true;
@@ -3610,8 +3636,10 @@ async function toggleAppFullscreen() {
     if (documentOpenToken !== openToken) return;
     await syncFullscreenLayoutAfterFrame(continuousAnchor, pagedAnchor, openToken);
     await wait(220);
+    resumeScroll();
     await reconcileFullscreenViewport(continuousAnchor, pagedAnchor, openToken);
   } finally {
+    resumeScroll();
     scrollTrackingSuppressionDepth = Math.max(0, scrollTrackingSuppressionDepth - 1);
     fullscreenTransitionInProgress = false;
     if (documentOpenToken === openToken && pdfDoc && isScrollMode()) {
@@ -3629,6 +3657,7 @@ async function handleNativeFullscreenExit() {
   const continuousAnchor = pdfDoc && isScrollMode() ? captureContinuousReadingAnchor() : null;
   const pagedAnchor = pdfDoc && !isScrollMode() ? capturePagedReadingAnchor() : null;
   const openToken = documentOpenToken;
+  const resumeScroll = pauseContinuousScrollForFullscreen();
   window.clearTimeout(resizeTimer);
   fullscreenLayoutChangePending = false;
   fullscreenTransitionInProgress = true;
@@ -3642,8 +3671,10 @@ async function handleNativeFullscreenExit() {
   try {
     await syncFullscreenLayoutAfterFrame(continuousAnchor, pagedAnchor, openToken);
     await wait(220);
+    resumeScroll();
     await reconcileFullscreenViewport(continuousAnchor, pagedAnchor, openToken);
   } finally {
+    resumeScroll();
     scrollTrackingSuppressionDepth = Math.max(0, scrollTrackingSuppressionDepth - 1);
     fullscreenTransitionInProgress = false;
     if (documentOpenToken === openToken && pdfDoc && isScrollMode()) {
@@ -3715,6 +3746,9 @@ function updateControls() {
 function cancelCurrentRender() {
   clearContinuousHealthTimer();
   clearContinuousCleanupTimer();
+  // A queue may still await getPage(), before PDF.js exposes a cancellable
+  // RenderTask. Retire its ownership so the next layout can paint immediately.
+  continuousQueueOwner = null;
 
   if (renderTask) {
     try {
@@ -3746,6 +3780,7 @@ function clearContinuousPages() {
   clearContinuousHealthTimer();
   clearContinuousCleanupTimer();
   clearContinuousScrollUpdate();
+  continuousQueueOwner = null;
 
   if (pageObserver) {
     pageObserver.disconnect();
@@ -3753,7 +3788,11 @@ function clearContinuousPages() {
   }
 
   for (const task of pageRenderTasks.values()) {
-    task.cancel();
+    try {
+      task.cancel();
+    } catch {
+      // Release every old bitmap even when a task was already cancelled.
+    }
   }
   pageRenderTasks.clear();
   continuousRenderPromises.clear();
@@ -3763,6 +3802,12 @@ function clearContinuousPages() {
   continuousBlankRetries.clear();
   continuousPageFailures.clear();
   pdfTools?.clearTextLayers();
+  // Fullscreen rebuilds can detach several large canvases at once. Release
+  // their backing stores now instead of relying on delayed mobile GC.
+  for (const canvas of els.continuousPages.querySelectorAll("canvas")) {
+    canvas.width = 0;
+    canvas.height = 0;
+  }
   els.continuousPages.replaceChildren();
   continuousEstimatedPageWidth = 0;
   continuousEstimatedShellHeight = 0;
@@ -3793,6 +3838,8 @@ async function closeCurrentDocument() {
 
   await cancelCurrentRender();
   clearContinuousPages();
+  continuousPageAspectRatios.clear();
+  continuousBasePageAspectRatio = 0;
 
   els.canvas.removeAttribute("width");
   els.canvas.removeAttribute("height");
@@ -4207,7 +4254,7 @@ async function estimateContinuousPageSize() {
     });
     const viewport = getScaledViewport(page);
     return {
-      height: Math.max(420, Math.floor(viewport.height)),
+      height: Math.max(1, Math.floor(viewport.height)),
       width: Math.max(240, Math.floor(viewport.width)),
     };
   } catch {
@@ -4233,9 +4280,19 @@ function getContinuousDomWindowPageCount() {
 function resetContinuousPageMetrics(estimatedSize = {}) {
   const pageCount = Math.max(0, pdfDoc?.numPages || 0);
   continuousEstimatedPageWidth = Math.max(240, Math.floor(estimatedSize.width || getAvailableCanvasWidth()));
-  continuousEstimatedShellHeight = Math.max(320, Math.floor(estimatedSize.height || 420)) + 28;
+  continuousBasePageAspectRatio ||= (estimatedSize.height || 420) / continuousEstimatedPageWidth;
+  continuousEstimatedShellHeight = Math.max(320, Math.floor(continuousEstimatedPageWidth * continuousBasePageAspectRatio)) + 28;
   continuousPageHeightTree = new Float64Array(pageCount + 1);
   continuousPageHeightOverrides.clear();
+  // Keep measured page shapes across fullscreen/zoom. Replacing them with one
+  // guessed height moves the reading point as earlier pages finish rendering.
+  for (const [page, aspectRatio] of continuousPageAspectRatios) {
+    const height = Math.max(320, Math.floor(continuousEstimatedPageWidth * aspectRatio)) + 28;
+    if (page <= pageCount && height !== continuousEstimatedShellHeight) {
+      continuousPageHeightOverrides.set(page, height);
+      addContinuousPageHeightDelta(page, height - continuousEstimatedShellHeight);
+    }
+  }
   continuousDomWindowStart = 0;
   continuousDomWindowEnd = 0;
 }
@@ -4374,6 +4431,18 @@ function updateContinuousPageHeight(pageNumber, height) {
     return;
   }
 
+  const scrollTop = els.canvasWrap.scrollTop;
+  const pageTop = getContinuousPageTopOffset(targetPage);
+  const marker = scrollTop + els.canvasWrap.clientHeight * CONTINUOUS_READING_MARKER_RATIO;
+  const anchorPage = getContinuousPageNumberAtOffset(marker);
+  // Preserve the reading point even when the top of the viewport still shows
+  // the preceding page. Browser anchoring is disabled so this runs only once.
+  const correction = continuousWindowUpdating ? 0 : targetPage < anchorPage
+    ? nextHeight - previousHeight
+    : targetPage === anchorPage
+      ? clamp((marker - pageTop) / previousHeight, 0, 1) * (nextHeight - previousHeight)
+      : 0;
+
   if (nextHeight === continuousEstimatedShellHeight) {
     continuousPageHeightOverrides.delete(targetPage);
   } else {
@@ -4382,6 +4451,10 @@ function updateContinuousPageHeight(pageNumber, height) {
 
   addContinuousPageHeightDelta(targetPage, nextHeight - previousHeight);
   updateContinuousSpacerSizes();
+  if (correction) {
+    cancelContinuousScrollCorrection();
+    applyContinuousScrollTopInstant(scrollTop + correction);
+  }
 }
 
 function createContinuousShell(pageNumber) {
@@ -4492,9 +4565,10 @@ function renderContinuousDomWindow(centerPage, options = {}) {
           ? anchorPage
           : targetPage;
       const preservedRatio = preservedPage === anchorPage ? anchorRatio : 0;
-      els.canvasWrap.scrollTop =
+      applyContinuousScrollTopInstant(
         getContinuousPageTopOffset(preservedPage) +
-        preservedRatio * getContinuousPageHeight(preservedPage);
+        preservedRatio * getContinuousPageHeight(preservedPage),
+      );
     }
   } finally {
     continuousWindowUpdating = false;
@@ -4600,6 +4674,7 @@ function ensureContinuousPlaceholder(shell) {
 }
 
 function ensureContinuousCanvas(shell, viewport) {
+  continuousPageAspectRatios.set(getContinuousShellPageNumber(shell), viewport.height / viewport.width);
   setContinuousShellSize(shell, viewport.width, viewport.height);
   shell.querySelector(".page-placeholder")?.remove();
 
@@ -4711,6 +4786,7 @@ function clearContinuousCleanupTimer() {
 }
 
 function clearContinuousScrollUpdate() {
+  cancelContinuousScrollCorrection();
   if (!continuousScrollFrame) {
     return;
   }
@@ -4953,12 +5029,20 @@ function pruneContinuousPages() {
     return;
   }
 
+  // The height model can temporarily lag a mixed-size page or fullscreen
+  // layout. A page that is actually on screen must never be reclaimed merely
+  // because the estimate says otherwise, including its in-flight render.
+  const visibleShells = new Set(getActuallyVisibleContinuousShells());
+  const isProtected = (shell) => shell && (
+    visibleShells.has(shell) || isPinnedContinuousPage(getContinuousShellPageNumber(shell))
+  );
+
   for (const [pageNumber, task] of pageRenderTasks) {
     const shell = getContinuousShellByPageNumber(pageNumber);
 
     if (
       !shell ||
-      (!isPinnedContinuousPage(pageNumber) &&
+      (!isProtected(shell) &&
         !isContinuousShellNearViewport(shell, getContinuousRenderViewports()))
     ) {
       task.cancel();
@@ -4973,7 +5057,7 @@ function pruneContinuousPages() {
 
   for (const shell of renderedShells) {
     if (
-      isPinnedContinuousPage(getContinuousShellPageNumber(shell)) ||
+      isProtected(shell) ||
       isContinuousShellNearViewport(shell)
     ) {
       keptShells.push(shell);
@@ -4985,20 +5069,13 @@ function pruneContinuousPages() {
   const maxRenderedPages = getContinuousMaxRenderedPages();
 
   if (keptShells.length > maxRenderedPages) {
-    keptShells
-      .sort((a, b) => {
-        const aPage = getContinuousShellPageNumber(a);
-        const bPage = getContinuousShellPageNumber(b);
-        const aPinned = isPinnedContinuousPage(aPage) ? 0 : 1;
-        const bPinned = isPinnedContinuousPage(bPage) ? 0 : 1;
-
-        if (aPinned !== bPinned) {
-          return aPinned - bPinned;
-        }
-
-        return getContinuousShellDistance(a) - getContinuousShellDistance(b);
-      })
-      .slice(maxRenderedPages)
+    const evictable = keptShells.filter((shell) => !isProtected(shell));
+    const protectedCount = keptShells.length - evictable.length;
+    // The limit budgets prefetched pages; it cannot evict a visible or pinned
+    // page when a tall viewport contains more sheets than the mobile budget.
+    evictable
+      .sort((a, b) => getContinuousShellDistance(a) - getContinuousShellDistance(b))
+      .slice(Math.max(0, maxRenderedPages - protectedCount))
       .forEach((shell) => releaseContinuousCanvas(shell));
   }
 
@@ -5056,14 +5133,20 @@ function getNextQueuedContinuousPage() {
 }
 
 async function runContinuousRenderQueue() {
-  if (continuousQueueRunning) {
+  if (continuousQueueOwner) {
     return;
   }
 
-  continuousQueueRunning = true;
+  const owner = { token: renderToken, documentToken: documentOpenToken };
+  continuousQueueOwner = owner;
 
   try {
-    while (pendingContinuousPages.size && pdfDoc && isScrollMode()) {
+    while (
+      continuousQueueOwner === owner &&
+      owner.token === renderToken &&
+      owner.documentToken === documentOpenToken &&
+      pendingContinuousPages.size && pdfDoc && isScrollMode()
+    ) {
       const next = getNextQueuedContinuousPage();
 
       if (!next) {
@@ -5073,10 +5156,13 @@ async function runContinuousRenderQueue() {
       await renderContinuousPageWithTimeout(next.pageNumber, next.token);
     }
   } finally {
-    continuousQueueRunning = false;
-
-    if (pendingContinuousPages.size && pdfDoc && isScrollMode()) {
-      window.setTimeout(runContinuousRenderQueue, 0);
+    // A retired queue can finish after the new one has started. It must not
+    // unlock that queue or consume its pending pages.
+    if (continuousQueueOwner === owner) {
+      continuousQueueOwner = null;
+      if (pendingContinuousPages.size && pdfDoc && isScrollMode()) {
+        window.setTimeout(runContinuousRenderQueue, 0);
+      }
     }
   }
 }
@@ -5220,6 +5306,8 @@ async function renderContinuousPage(pageNumber, token = renderToken, options = {
     }
 
     if (
+      token === renderToken &&
+      documentToken === documentOpenToken &&
       pdfDoc &&
       isScrollMode() &&
       pageRenderTasks.size === 0 &&
@@ -5397,7 +5485,9 @@ async function renderContinuousPageInternal(targetPage, shell, token, runId, doc
       delete shell.dataset.renderRunId;
     }
 
-    pruneContinuousPages();
+    if (token === renderToken && documentToken === documentOpenToken) {
+      pruneContinuousPages();
+    }
   }
 }
 
@@ -6029,6 +6119,18 @@ async function setEpubScrollEdge(edge) {
   return false;
 }
 
+function cancelContinuousScrollCorrection() {
+  continuousScrollIntent += 1;
+  if (continuousScrollCorrectionFrame) window.cancelAnimationFrame(continuousScrollCorrectionFrame);
+  continuousScrollCorrectionFrame = 0;
+}
+
+function handleContinuousScrollInput() {
+  cancelContinuousScrollCorrection();
+  continuousProgrammaticScrollTarget = 0;
+  continuousProgrammaticScrollUntil = 0;
+}
+
 function applyContinuousScrollTopInstant(top) {
   const previousScrollBehavior = els.canvasWrap.style.scrollBehavior;
   els.canvasWrap.style.scrollBehavior = "auto";
@@ -6045,6 +6147,10 @@ function applyContinuousScrollTopInstant(top) {
 }
 
 function setContinuousScrollTop(top, edge = "") {
+  cancelContinuousScrollCorrection();
+  const intent = continuousScrollIntent;
+  const openToken = documentOpenToken;
+  const token = renderToken;
   const maxScrollTop = getContinuousMaxScrollTop();
   const targetTop = edge === "bottom" ? maxScrollTop : clamp(Math.round(top), 0, maxScrollTop);
   applyContinuousScrollTopInstant(targetTop);
@@ -6056,7 +6162,9 @@ function setContinuousScrollTop(top, edge = "") {
     });
   }
 
-  window.requestAnimationFrame(() => {
+  continuousScrollCorrectionFrame = window.requestAnimationFrame(() => {
+    continuousScrollCorrectionFrame = 0;
+    if (intent !== continuousScrollIntent || openToken !== documentOpenToken || token !== renderToken || !isScrollMode()) return;
     if (Math.abs(els.canvasWrap.scrollTop - targetTop) > 4) {
       applyContinuousScrollTopInstant(targetTop);
     }
@@ -6078,9 +6186,16 @@ function captureContinuousScrollPosition() {
 
   const scrollTop = Math.max(0, els.canvasWrap.scrollTop);
   const marker = scrollTop + 8;
-  const nextPage = getContinuousPageNumberAtOffset(marker) || state.scrollPage;
-  const top = getContinuousPageTopOffset(nextPage);
-  const height = Math.max(getContinuousPageHeight(nextPage), 1);
+  const viewport = els.canvasWrap.getBoundingClientRect();
+  const visible = getActuallyVisibleContinuousShells();
+  const shell = visible.find((candidate) => {
+    const rect = candidate.getBoundingClientRect();
+    return rect.top <= viewport.top + 8 && rect.bottom > viewport.top + 8;
+  }) || visible[0];
+  const nextPage = shell ? getContinuousShellPageNumber(shell) : getContinuousPageNumberAtOffset(marker) || state.scrollPage;
+  const rect = shell?.getBoundingClientRect();
+  const top = rect ? scrollTop + rect.top - viewport.top : getContinuousPageTopOffset(nextPage);
+  const height = Math.max(rect?.height || getContinuousPageHeight(nextPage), 1);
   const offset = clamp(scrollTop - top, 0, height);
   const nextOffsetRatio = clamp(offset / height, 0, 0.98);
 
@@ -6102,6 +6217,22 @@ function captureContinuousReadingAnchor() {
   }
 
   const viewportRatio = CONTINUOUS_READING_MARKER_RATIO;
+  const viewport = els.canvasWrap.getBoundingClientRect();
+  const markerY = viewport.top + els.canvasWrap.clientHeight * viewportRatio;
+  const visible = getActuallyVisibleContinuousShells();
+  const shell = visible.sort((a, b) => {
+    const ar = a.getBoundingClientRect();
+    const br = b.getBoundingClientRect();
+    return Math.max(ar.top - markerY, markerY - ar.bottom, 0) - Math.max(br.top - markerY, markerY - br.bottom, 0);
+  })[0];
+  if (shell) {
+    const rect = shell.getBoundingClientRect();
+    return {
+      page: getContinuousShellPageNumber(shell),
+      offsetRatio: clamp((markerY - rect.top) / Math.max(rect.height, 1), 0, 0.98),
+      viewportRatio,
+    };
+  }
   const marker = Math.max(0, els.canvasWrap.scrollTop) + els.canvasWrap.clientHeight * viewportRatio;
   const page = getContinuousPageNumberAtOffset(marker) || state.page;
   const pageTop = getContinuousPageTopOffset(page);
@@ -6130,10 +6261,12 @@ function restoreContinuousReadingAnchor(anchor) {
     return false;
   }
 
-  const pageHeight = Math.max(getContinuousPageHeight(targetPage), 1);
+  const rect = shell.getBoundingClientRect();
+  const viewport = els.canvasWrap.getBoundingClientRect();
+  const pageHeight = Math.max(rect.height, 1);
   const pageOffset = clamp(anchor.offsetRatio || 0, 0, 0.98) * pageHeight;
   const viewportOffset = clamp(anchor.viewportRatio || 0, 0, 1) * els.canvasWrap.clientHeight;
-  const targetTop = getContinuousPageTopOffset(targetPage) + pageOffset - viewportOffset;
+  const targetTop = els.canvasWrap.scrollTop + rect.top - viewport.top + pageOffset - viewportOffset;
   setContinuousScrollTop(targetTop);
   scheduleContinuousPageRender(targetPage, renderToken);
   return true;
@@ -6182,6 +6315,10 @@ function isLikelyTransientTopJump() {
 }
 
 async function scrollToContinuousPage(pageNumber, options = {}) {
+  cancelContinuousScrollCorrection();
+  const intent = continuousScrollIntent;
+  const token = renderToken;
+  const openToken = documentOpenToken;
   const targetPage = clamp(Math.round(pageNumber), 1, pdfDoc.numPages);
   continuousProgrammaticScrollTarget = targetPage;
   continuousProgrammaticScrollUntil = Date.now() + 1_200;
@@ -6202,11 +6339,8 @@ async function scrollToContinuousPage(pageNumber, options = {}) {
     const targetTop = getContinuousPageTop(shell);
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      els.canvasWrap.scrollTop = targetTop;
-      els.canvasWrap.scrollTo({
-        top: targetTop,
-        behavior: attempt === 0 ? options.behavior || "smooth" : "auto",
-      });
+      if (intent !== continuousScrollIntent || token !== renderToken || openToken !== documentOpenToken) return;
+      applyContinuousScrollTopInstant(targetTop);
       await waitForNextFrame();
 
       if (Math.abs(els.canvasWrap.scrollTop - targetTop) <= 4) {
@@ -6214,10 +6348,14 @@ async function scrollToContinuousPage(pageNumber, options = {}) {
       }
     }
 
+    if (token !== renderToken || openToken !== documentOpenToken) return;
     queueVisibleContinuousPages(renderToken);
     pruneContinuousPages();
   } finally {
     scrollTrackingSuppressionDepth = Math.max(0, scrollTrackingSuppressionDepth - 1);
+    if (token === renderToken && openToken === documentOpenToken && intent !== continuousScrollIntent) {
+      scheduleContinuousScrollUpdate();
+    }
   }
 }
 
@@ -6838,7 +6976,7 @@ function updateCurrentPageFromScroll() {
 
   const marker =
     els.canvasWrap.scrollTop + els.canvasWrap.clientHeight * CONTINUOUS_READING_MARKER_RATIO;
-  const currentPage = getContinuousPageNumberAtOffset(marker) || state.page;
+  const currentPage = captureContinuousReadingAnchor()?.page || getContinuousPageNumberAtOffset(marker) || state.page;
   ensureContinuousDomWindow(currentPage);
   const positionChanged = captureContinuousScrollPosition();
 
@@ -9843,8 +9981,12 @@ function restoreReaderPositionAfterResume() {
     return;
   }
 
+  const openToken = documentOpenToken;
+  const token = renderToken;
+  const intent = continuousScrollIntent;
   const restoreIfNeeded = () => {
-    if (!pdfDoc || !isScrollMode() || !els.continuousPages.childElementCount) {
+    if (openToken !== documentOpenToken || token !== renderToken || intent !== continuousScrollIntent ||
+        isScrollTrackingSuppressed() || !pdfDoc || !isScrollMode() || !els.continuousPages.childElementCount) {
       return;
     }
 
@@ -9907,6 +10049,9 @@ function canTurnPdfPageWithSwipe(target) {
 }
 
 function wireEvents() {
+  for (const type of ["touchstart", "wheel", "pointerdown"]) {
+    els.canvasWrap.addEventListener(type, handleContinuousScrollInput, { passive: true });
+  }
   els.moreButton.addEventListener("click", openReaderTools);
   els.readerToolsCloseButton.addEventListener("click", () => closeReaderTools());
   els.readerToolsOverlay.addEventListener("click", (event) => {
@@ -10380,7 +10525,7 @@ setPdfSourceDiagnosticHandler((type, detail = {}) => {
   recordDiagnosticEvent(`pdf-source:${type}`, detail);
 });
 
-function createSelfTestPdfBytes(label, pageCount = 3, fillerBytes = 0, blankPages = []) {
+function createSelfTestPdfBytes(label, pageCount = 3, fillerBytes = 0, blankPages = [], pageSizes = []) {
   const encoder = new TextEncoder();
   const safeLabel = String(label).replace(/[()\\]/g, "\\$&");
   const objects = [];
@@ -10393,12 +10538,15 @@ function createSelfTestPdfBytes(label, pageCount = 3, fillerBytes = 0, blankPage
   for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
     const pageObjectId = 4 + pageIndex * 2;
     const contentObjectId = pageObjectId + 1;
-    const content = blankPages.includes(pageIndex + 1) ? "" :
-      `0 0 0 rg 36 82 220 12 re f BT /F1 22 Tf 36 120 Td (${safeLabel} page ${pageIndex + 1}) Tj ET`;
+    const height = pageSizes[pageIndex % pageSizes.length] || 180;
+    const content = blankPages.includes(pageIndex + 1) ? "" : pageSizes.length
+      ? Array.from({ length: Math.max(1, Math.floor(height / 90)) }, (_, line) =>
+          `0 0 0 rg 24 ${height - 70 - line * 90} 250 7 re f BT /F1 16 Tf 24 ${height - 45 - line * 90} Td (${safeLabel} page ${pageIndex + 1} line ${line + 1}) Tj ET`).join("\n")
+      : `0 0 0 rg 36 82 220 12 re f BT /F1 22 Tf 36 120 Td (${safeLabel} page ${pageIndex + 1}) Tj ET`;
 
     pageObjectIds.push(pageObjectId);
     objects[pageObjectId] =
-      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 180] ` +
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 ${height}] ` +
       `/Resources << /Font << /F1 ${fontObjectId} 0 R >> >> /Contents ${contentObjectId} 0 R >>`;
     objects[contentObjectId] = `<< /Length ${encoder.encode(content).length} >>\nstream\n${content}\nendstream`;
   }
@@ -10429,8 +10577,8 @@ function createSelfTestPdfBytes(label, pageCount = 3, fillerBytes = 0, blankPage
   return encoder.encode(pdf);
 }
 
-function createSelfTestPdfRecord(id, name, pageCount = 3, fillerBytes = 0, blankPages = []) {
-  const bytes = createSelfTestPdfBytes(name, pageCount, fillerBytes, blankPages);
+function createSelfTestPdfRecord(id, name, pageCount = 3, fillerBytes = 0, blankPages = [], pageSizes = []) {
+  const bytes = createSelfTestPdfBytes(name, pageCount, fillerBytes, blankPages, pageSizes);
   const blob = new Blob([bytes], { type: "application/pdf" });
   const now = Date.now();
 
@@ -10936,6 +11084,57 @@ async function runFullscreenProgressSelfTest() {
   showStatus(`自测通过：全屏进出无需滚动即可显示，保持在第 ${targetPage} 页。`);
 }
 
+async function runFullscreenScrollSelfTest() {
+  const record = createSelfTestPdfRecord(`${DOCUMENT_ID_PREFIX}selftest-fullscreen-scroll`, "mixed pages", 120, 0, [], [240, 1080, 540, 1600, 720]);
+  await putStoredDocument(record);
+  state.mode = READ_MODES.SCROLL;
+  await openSelfTestRecord(record, { resetProgress: true }, "mixed-size PDF");
+  const doc = pdfDoc;
+  const originalGetPage = doc.getPage.bind(doc);
+  doc.getPage = async (number) => {
+    await wait((number % 3) * 45);
+    return originalGetPage(number);
+  };
+  const assertPosition = (label, before) => {
+    assertSelfTestFullscreenPaint(label);
+    const after = captureContinuousReadingAnchor();
+    if (before.page !== after?.page || Math.abs(before.offsetRatio - after.offsetRatio) > 0.025 || state.page !== after.page) {
+      throw new Error(`${label}: reading position changed from ${before.page}/${before.offsetRatio.toFixed(3)} to ${after?.page}/${after?.offsetRatio.toFixed(3)} (displayed ${state.page}).`);
+    }
+  };
+  try {
+    for (let iteration = 0; iteration < 10; iteration += 1) {
+      const page = [8, 23, 47, 64, 89, 103, 76, 51, 28, 9][iteration];
+      await goToPage(page);
+      await renderContinuousPage(page, renderToken, { force: true, throwOnError: true });
+      continuousProgrammaticScrollTarget = 0;
+      continuousProgrammaticScrollUntil = 0;
+      for (const delta of [95, -40, 130]) {
+        cancelContinuousScrollCorrection();
+        applyContinuousScrollTopInstant(els.canvasWrap.scrollTop + delta);
+        scheduleContinuousScrollUpdate();
+        await waitForNextFrame();
+      }
+      const before = captureContinuousReadingAnchor();
+      updateSelfTestResult("running", `scroll/fullscreen cycle ${iteration + 1}/10`);
+      showStatus(`自测：滚动后切换全屏 ${iteration + 1}/10…`, true);
+      await toggleAppFullscreen();
+      assertPosition(`Enter cycle ${iteration + 1}`, before);
+      await wait(400);
+      assertPosition(`Late enter cycle ${iteration + 1}`, before);
+      await toggleAppFullscreen();
+      assertPosition(`Exit cycle ${iteration + 1}`, before);
+      await wait(400);
+      assertPosition(`Late exit cycle ${iteration + 1}`, before);
+    }
+    updateSelfTestResult("passed", "20 fullscreen transitions after scrolling mixed-size pages kept visible content and reading position");
+    showStatus("自测通过：滚动后全屏进出 20 次，画面和阅读位置保持正常。", true);
+  } finally {
+    doc.getPage = originalGetPage;
+    if (appFullscreen) await toggleAppFullscreen();
+  }
+}
+
 async function runLockSecuritySelfTest() {
   const password = "portable-reader-lock-selftest";
   const originalConfig = window.localStorage.getItem(LOCK_KEY);
@@ -11086,6 +11285,7 @@ async function runSelfTest(mode) {
       "diagnostics",
       "encrypted-switch",
       "fullscreen-progress",
+      "fullscreen-scroll",
       "lock-security",
       "rapid-switch",
       "reader-regressions",
@@ -11104,6 +11304,8 @@ async function runSelfTest(mode) {
       await runContinuousWindowSelfTest();
     } else if (mode === "fullscreen-progress") {
       await runFullscreenProgressSelfTest();
+    } else if (mode === "fullscreen-scroll") {
+      await runFullscreenScrollSelfTest();
     } else if (mode === "lock-security") {
       await runLockSecuritySelfTest();
     } else if (mode === "rapid-switch") {
@@ -11172,7 +11374,7 @@ setReaderVisible(false);
 updateViewerMode();
 updateControls();
 const selfTestMode = getSelfTestMode();
-registerServiceWorker();
+if (!selfTestMode) registerServiceWorker();
 if (selfTestMode) {
   runSelfTest(selfTestMode).catch((error) => {
     console.error(error);

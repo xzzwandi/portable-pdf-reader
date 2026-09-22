@@ -31,7 +31,12 @@ function setup(shells = [makeShell(8)]) {
   const healthChecks = [];
   const layouts = [];
   const anchors = [];
-  const wrap = { scrollTop: 1000, clientHeight: 600, getBoundingClientRect: () => ({ top: 0, bottom: 600 }) };
+  const wrap = {
+    scrollTop: 1000, clientHeight: 600, offsetHeight: 600,
+    style: { overflowY: "auto", scrollBehavior: "auto" },
+    scrollTo({ top }) { this.scrollTop = top; },
+    getBoundingClientRect: () => ({ top: 0, bottom: 600 }),
+  };
   let width = 1000;
   let context;
   context = vm.createContext({
@@ -39,10 +44,11 @@ function setup(shells = [makeShell(8)]) {
     state: { page: 3, mode: "scroll" }, renderToken: 1, documentOpenToken: 1,
     appFullscreen: true, fullscreenTransitionInProgress: false, fullscreenLayoutChangePending: false,
     scrollTrackingSuppressionDepth: 0, continuousScrollFrame: 0,
+    continuousScrollIntent: 0, continuousScrollCorrectionFrame: 0, scrollStateTimer: null,
     resizeTimer: null, lastLayoutWidth: 1000, lastViewportChangeAt: 0,
     CONTINUOUS_READING_MARKER_RATIO: 0.35, continuousPinnedPages: new Set(),
     els: { canvasWrap: wrap, continuousPages: { querySelectorAll: () => shells } },
-    window: { clearTimeout: noop, requestAnimationFrame: (fn) => { fn(); return 0; } },
+    window: { clearTimeout: noop, cancelAnimationFrame: noop, requestAnimationFrame: (fn) => { fn(); return 0; } },
     waitForNextFrame: async () => {}, wait: async () => {},
     isScrollMode: () => context.state.mode === "scroll",
     isScrollTrackingSuppressed: () => context.scrollTrackingSuppressionDepth > 0,
@@ -70,7 +76,7 @@ function setup(shells = [makeShell(8)]) {
     },
     scheduleContinuousHealthCheck: (delay) => healthChecks.push(delay),
   });
-  load(context, ["getActuallyVisibleContinuousShells", "reconcileFullscreenViewport", "scheduleContinuousScrollUpdate", "toggleAppFullscreen", "handleNativeFullscreenExit"]);
+  load(context, ["getActuallyVisibleContinuousShells", "reconcileFullscreenViewport", "scheduleContinuousScrollUpdate", "cancelContinuousScrollCorrection", "applyContinuousScrollTopInstant", "pauseContinuousScrollForFullscreen", "toggleAppFullscreen", "handleNativeFullscreenExit"]);
   return { context, wrap, shells, rendered, queued, healthChecks, layouts, anchors, setWidth: (value) => { width = value; } };
 }
 
@@ -83,6 +89,7 @@ for (const [label, handler, startFullscreen] of [
     const { context, wrap, rendered, queued, healthChecks } = setup();
     context.appFullscreen = startFullscreen;
     context.wait = async () => {
+      assert.equal(wrap.style.overflowY, "hidden", "momentum remains paused throughout the fullscreen reflow");
       wrap.scrollTop = 1900;
       context.scheduleContinuousScrollUpdate();
       assert.equal(queued.length, 0, "the transition's scroll event is deliberately suppressed");
@@ -93,6 +100,7 @@ for (const [label, handler, startFullscreen] of [
     assert.ok(healthChecks.includes(0));
     assert.equal(context.fullscreenTransitionInProgress, false);
     assert.equal(context.scrollTrackingSuppressionDepth, 0);
+    assert.equal(wrap.style.overflowY, "auto", "normal scrolling is restored after the transition");
   });
 }
 
