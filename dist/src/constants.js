@@ -8,7 +8,7 @@ export const LAST_DOCUMENT_ID = "last-document";
 export const LOCK_KEY = "portable-pdf-reader-lock";
 export const PROGRESS_KEY = "portable-pdf-reader-document-progress";
 export const STATE_KEY = "portable-pdf-reader-state";
-export const APP_VERSION = "v120";
+export const APP_VERSION = "v121";
 
 export const ENCRYPTED_BACKUP_EXTENSION = ".pprenc";
 export const ENCRYPTED_BACKUP_MAGIC = "PPRENC1\n";
@@ -47,8 +47,8 @@ export const MAX_PAGED_CANVAS_PIXELS = 18_000_000;
 export const MAX_CONTINUOUS_CANVAS_PIXELS = 6_500_000;
 export const MAX_CANVAS_DIMENSION = 8192;
 
-export const FULLSCREEN_EPUB_SWIPE_DISTANCE = 72;
-export const FULLSCREEN_EPUB_SWIPE_MAX_DRIFT = 52;
+export const EPUB_SWIPE_DISTANCE = 72;
+export const EPUB_SWIPE_MAX_DRIFT = 52;
 
 export const TOC_RENDER_BATCH_SIZE = 72;
 export const TOC_RENDER_SCROLL_THRESHOLD = 320;

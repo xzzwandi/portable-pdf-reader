@@ -19,6 +19,47 @@ function load(context, names) {
 const noop = () => {};
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
+test("EPUB pagination is saved per book and older progress still opens in scroll mode", () => {
+  const values = new Map([["progress", JSON.stringify({ old: { format: "epub", mode: "paged", epubCfi: "old-position" } })]]);
+  const context = vm.createContext({
+    state: { format: "epub", documentId: "new", epubMode: "paged", epubCfi: "page-position", mode: "scroll" },
+    PROGRESS_KEY: "progress", READ_MODES: { PAGED: "paged", SCROLL: "scroll" }, DOCUMENT_FORMATS: { EPUB: "epub" }, clamp,
+    window: { localStorage: { getItem: (key) => values.get(key), setItem: (key, value) => values.set(key, value) } },
+  });
+  load(context, ["getProgressMap", "readDocumentProgress", "saveDocumentProgress", "applyDocumentProgress"]);
+  context.saveDocumentProgress();
+  context.applyDocumentProgress("old");
+  assert.equal(context.state.epubMode, "scroll");
+  assert.equal(context.state.epubCfi, "old-position");
+  context.applyDocumentProgress("new");
+  assert.equal(context.state.epubMode, "paged");
+  assert.equal(context.state.epubCfi, "page-position");
+  assert.equal(context.state.mode, "scroll");
+});
+
+test("a split paragraph anchors in the visible EPUB column when its reported CFI is on the preceding page", () => {
+  const caret = { offsetNode: {}, offset: 43 };
+  const range = { setStart(node, offset) { assert.equal(node, caret.offsetNode); assert.equal(offset, 43); }, collapse: noop };
+  let reportedLeft = 32;
+  const view = {
+    iframe: { getBoundingClientRect: () => ({ left: -700, top: 40 }) },
+    contents: {
+      locationOf: () => ({ left: reportedLeft, top: 20 }),
+      document: { caretPositionFromPoint(x, y) { assert.ok(x >= 720 && x < 1080 && y > 0); return caret; }, createRange: () => range },
+      cfiFromRange: (r) => { assert.equal(r, range); return "visible-cfi"; },
+    },
+  };
+  const context = vm.createContext({
+    getEpubSectionAt: () => ({}), getEpubViewForSection: () => view,
+    els: { epubViewer: { getBoundingClientRect: () => ({ left: 20, top: 40, width: 360, height: 600 }) } },
+  });
+  load(context, ["getEpubReadingAnchor"]);
+  const location = { start: { index: 1, cfi: "reported-cfi" } };
+  assert.equal(context.getEpubReadingAnchor(location), "visible-cfi");
+  reportedLeft = 760;
+  assert.equal(context.getEpubReadingAnchor(location), "reported-cfi");
+});
+
 test("a blank first page completes before the open operation returns", async () => {
   let committed = 0;
   let released = 0;
@@ -91,6 +132,7 @@ function temporaryContext(format) {
     pdfDoc: { numPages: 100 }, epubBook: null, activePdfLoadingTask: null, activePdfRangeFailurePromise: null,
     pdfNavigationTransaction: null,
     DOCUMENT_FORMATS: { PDF: "pdf", EPUB: "epub" }, STATE_KEY: "state", PROGRESS_KEY: "progress", PDF_LOAD_TIMEOUT_MS: 1000,
+    READ_MODES: { PAGED: "paged", SCROLL: "scroll" },
     EncryptedDocumentSource: class {}, BlobDocumentSource: class { constructor(blob) { this.blob = blob; this.length = blob.size; } },
     beginDocumentOpen: () => 1, isDocumentOpenCurrent: () => true,
     isScrollMode: () => false, isDeferredPdfProgressSaveGuardActive: () => false,
