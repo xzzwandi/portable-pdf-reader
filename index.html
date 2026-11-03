@@ -8,9 +8,9 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./icons/icon.svg" />
-    <link rel="stylesheet" href="./styles.css?v=120" />
-    <link rel="stylesheet" href="./src/pdf-tools.css?v=120" />
-    <link rel="stylesheet" href="./src/pdf-navigator.css?v=120" />
+    <link rel="stylesheet" href="./styles.css?v=121" />
+    <link rel="stylesheet" href="./src/pdf-tools.css?v=121" />
+    <link rel="stylesheet" href="./src/pdf-navigator.css?v=121" />
   </head>
   <body>
     <div class="app-shell">
@@ -20,7 +20,7 @@
           <div>
             <div class="brand-title">
               <h1>随身阅读</h1>
-              <span id="appVersion" class="version-badge">v120</span>
+              <span id="appVersion" class="version-badge">v121</span>
             </div>
             <p id="docName">未打开文件</p>
           </div>
@@ -59,6 +59,7 @@
           <input id="pageInput" type="number" min="1" value="1" inputmode="numeric" aria-label="跳转到页码" />
           <span id="pageTotal">/ 0</span>
         </label>
+        <output id="epubPageStatus" class="epub-page-status" aria-label="EPUB 阅读位置" hidden></output>
         <button id="nextButton" type="button" aria-label="下一页">下页</button>
 
         <div class="spacer"></div>
@@ -95,7 +96,7 @@
               <button id="pdfBookmarksButton" type="button">书签</button>
               <button id="runtimeLogButton" type="button">复制诊断日志</button>
             </div>
-            <p class="reader-tools-hint">PDF 文字可长按选择并复制；扫描图片需要先识别文字。</p>
+            <p id="readerToolsHint" class="reader-tools-hint"></p>
           </div>
         </section>
       </div>
@@ -266,8 +267,8 @@
       </div>
     </div>
 
-    <script src="./vendor/jszip/jszip.min.js?v=120"></script>
-    <script src="./vendor/epubjs/epub.min.js?v=120"></script>
-    <script type="module" src="./app.js?v=120"></script>
+    <script src="./vendor/jszip/jszip.min.js?v=121"></script>
+    <script src="./vendor/epubjs/epub.min.js?v=121"></script>
+    <script type="module" src="./app.js?v=121"></script>
   </body>
 </html>

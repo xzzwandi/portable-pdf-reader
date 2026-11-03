@@ -303,6 +303,11 @@ h1 {
   touch-action: none;
 }
 
+.epub-pane.is-paged .epub-viewer {
+  touch-action: pan-y pinch-zoom;
+  overscroll-behavior-x: contain;
+}
+
 .epub-viewer {
   width: min(860px, 100%);
   height: 100%;
@@ -483,6 +488,21 @@ button:focus-visible, input:focus-visible {
 
 .page-jump span {
   white-space: nowrap;
+}
+
+.epub-page-status {
+  text-align: center;
+  white-space: pre;
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.epub-page-status::first-line {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 650;
 }
 
 .page-jump input::-webkit-outer-spin-button,

@@ -1,6 +1,6 @@
 import sodium from "./vendor/libsodium/libsodium-wrappers.mjs";
-import { createPdfTools } from "./src/pdf-tools.js?v=120";
-import { createPdfNavigator } from "./src/pdf-navigator.js?v=120";
+import { createPdfTools } from "./src/pdf-tools.js?v=121";
+import { createPdfNavigator } from "./src/pdf-navigator.js?v=121";
 import {
   AES_GCM_ENCRYPTION_VERSION,
   AES_GCM_IV_BYTES,
@@ -29,8 +29,8 @@ import {
   ENCRYPTION_KDF_ITERATIONS,
   ENCRYPTION_KEY_ALGORITHM,
   ENCRYPTION_VERSION,
-  FULLSCREEN_EPUB_SWIPE_DISTANCE,
-  FULLSCREEN_EPUB_SWIPE_MAX_DRIFT,
+  EPUB_SWIPE_DISTANCE,
+  EPUB_SWIPE_MAX_DRIFT,
   LAST_DOCUMENT_ID,
   LOCK_KEY,
   MAX_CANVAS_DIMENSION,
@@ -53,7 +53,7 @@ import {
   XCHACHA_NONCE_BYTES,
   XCHACHA_NONCE_PREFIX_BYTES,
   XCHACHA_TAG_BYTES,
-} from "./src/constants.js?v=120";
+} from "./src/constants.js?v=121";
 import {
   bytesToHex,
   createChunkAad,
@@ -83,28 +83,28 @@ import {
   withPayloadOnlyEncryptedBlob,
   withoutEncryptedPayloadLocation,
   withoutPlainRecordName,
-} from "./src/encryption.js?v=120";
+} from "./src/encryption.js?v=121";
 import {
   clamp,
   wait,
   waitForNextFrame,
-} from "./src/utils.js?v=120";
+} from "./src/utils.js?v=121";
 import {
   createEncryptedBackupBlob,
   parseEncryptedBackupFile,
-} from "./src/encrypted-backups.js?v=120";
+} from "./src/encrypted-backups.js?v=121";
 import {
   createExportBlob,
   releaseExportBlob,
   transferExportBlobCleanup,
-} from "./src/export-blobs.js?v=120";
+} from "./src/export-blobs.js?v=121";
 import {
   BlobDocumentSource,
   EncryptedDocumentSource,
   createPdfLoadingTaskFromSource,
   setPdfSourceDiagnosticHandler,
   setPdfSourceMetricHandler,
-} from "./src/pdf-sources.js?v=120";
+} from "./src/pdf-sources.js?v=121";
 
 const els = {
   canvas: document.querySelector("#pdfCanvas"),
@@ -113,6 +113,7 @@ const els = {
   controls: document.querySelector("#controls"),
   moreButton: document.querySelector("#moreButton"),
   readerToolsOverlay: document.querySelector("#readerToolsOverlay"),
+  readerToolsHint: document.querySelector("#readerToolsHint"),
   readerToolsCloseButton: document.querySelector("#readerToolsCloseButton"),
   zoomLevel: document.querySelector("#zoomLevel"),
   pdfOutlineButton: document.querySelector("#pdfOutlineButton"),
@@ -148,6 +149,7 @@ const els = {
   encryptionProgressText: document.querySelector("#encryptionProgressText"),
   encryptionStartButton: document.querySelector("#encryptionStartButton"),
   epubPane: document.querySelector("#epubPane"),
+  epubPageStatus: document.querySelector("#epubPageStatus"),
   epubViewer: document.querySelector("#epubViewer"),
   fileInput: document.querySelector("#fileInput"),
   fitButton: document.querySelector("#fitButton"),
@@ -252,7 +254,6 @@ let deferredPdfProgressSaveGuard = null;
 let resizeTimer = null;
 let scrollStateTimer = null;
 let touchStart = null;
-let epubPaneTouchStart = null;
 let overlayTouchY = 0;
 let appFullscreen = false;
 let syncingNativeFullscreen = false;
@@ -309,6 +310,7 @@ const state = {
   format: DOCUMENT_FORMATS.PDF,
   fileName: "",
   epubCfi: "",
+  epubMode: READ_MODES.SCROLL,
   epubProgress: 0,
   page: 1,
   scrollOffsetRatio: 0,
@@ -328,6 +330,10 @@ function isPdfDocument() {
 
 function isEpubDocument() {
   return state.format === DOCUMENT_FORMATS.EPUB;
+}
+
+function isEpubPaged() {
+  return isEpubDocument() && state.epubMode === READ_MODES.PAGED;
 }
 
 function isDocumentOpenCurrent(openToken) {
@@ -1666,6 +1672,7 @@ function readSavedState() {
       saved.format === DOCUMENT_FORMATS.EPUB ? DOCUMENT_FORMATS.EPUB : DOCUMENT_FORMATS.PDF;
     state.fileName = typeof saved.fileName === "string" ? saved.fileName : "";
     state.epubCfi = typeof saved.epubCfi === "string" ? saved.epubCfi : "";
+    state.epubMode = saved.epubMode === READ_MODES.PAGED ? READ_MODES.PAGED : READ_MODES.SCROLL;
     state.epubProgress = Number.isFinite(saved.epubProgress) ? saved.epubProgress : 0;
     state.page = Number.isFinite(saved.page) ? saved.page : 1;
     state.scrollPage = Number.isFinite(saved.scrollPage) ? saved.scrollPage : state.page;
@@ -1680,6 +1687,7 @@ function readSavedState() {
     state.format = DOCUMENT_FORMATS.PDF;
     state.fileName = "";
     state.epubCfi = "";
+    state.epubMode = READ_MODES.SCROLL;
     state.epubProgress = 0;
     state.page = 1;
     state.scrollPage = 1;
@@ -1714,6 +1722,7 @@ function saveReaderState(options = {}) {
       JSON.stringify({
         documentId: state.documentId,
         epubCfi: state.epubCfi,
+        epubMode: state.epubMode,
         epubProgress: state.epubProgress,
         format: state.format,
         mode: state.mode,
@@ -2476,6 +2485,7 @@ function saveDocumentProgress() {
     const progressMap = getProgressMap();
     progressMap[state.documentId] = {
       epubCfi: state.epubCfi,
+      epubMode: state.epubMode,
       epubProgress: state.epubProgress,
       format: state.format,
       mode: state.mode,
@@ -2508,6 +2518,7 @@ function applyDocumentProgress(documentId, fallbackPage = 1) {
   state.format =
     progress?.format === DOCUMENT_FORMATS.EPUB ? DOCUMENT_FORMATS.EPUB : state.format;
   state.epubCfi = typeof progress?.epubCfi === "string" ? progress.epubCfi : "";
+  state.epubMode = progress?.epubMode === READ_MODES.PAGED ? READ_MODES.PAGED : READ_MODES.SCROLL;
   state.epubProgress = Number.isFinite(progress?.epubProgress) ? progress.epubProgress : 0;
   state.page = clamp(progress?.page || fallbackPage, 1, Number.MAX_SAFE_INTEGER);
   state.scrollPage = clamp(progress?.scrollPage || state.page, 1, Number.MAX_SAFE_INTEGER);
@@ -3458,7 +3469,7 @@ async function syncFullscreenLayoutAfterFrame(continuousAnchor = null, pagedAnch
   if (documentOpenToken !== openToken) return;
   lastViewportChangeAt = Date.now();
 
-  if (epubRendition) {
+  if (epubRendition?.manager?.isRendered()) {
     epubRendition.resize("100%", "100%", state.epubCfi || undefined);
     return;
   }
@@ -3708,22 +3719,30 @@ function updateControls() {
   const total = pdfDoc?.numPages || 0;
   const epubTotal = getEpubChapterTotal();
   const epubPercent = getEpubProgressPercent();
-  const pagedMode = !epubMode && state.mode === READ_MODES.PAGED;
-  const scrollMode = !epubMode && state.mode !== READ_MODES.PAGED;
-  const showEdgeJumps = hasDocument && (epubMode || scrollMode);
+  const pagedMode = (epubMode ? state.epubMode : state.mode) === READ_MODES.PAGED;
+  const epubPaged = epubMode && pagedMode;
+  const epubScroll = epubMode && !pagedMode;
+  const displayed = epubPaged ? epubRendition?.location?.start?.displayed : null;
   const fullscreenEpubMode = epubMode && appFullscreen;
+  const showEdgeJumps = hasDocument && (!pagedMode || fullscreenEpubMode);
+  const prevLabel = epubScroll ? "上一章" : "上一页";
+  const nextLabel = epubScroll ? "下一章" : "下一页";
 
   els.docName.textContent = state.fileName || "未打开文件";
-  els.prevButton.textContent = epubMode ? "上章" : "上页";
-  els.nextButton.textContent = epubMode ? "下章" : "下页";
-  els.prevButton.setAttribute("aria-label", epubMode ? "上一章" : "上一页");
-  els.nextButton.setAttribute("aria-label", epubMode ? "下一章" : "下一页");
-  els.pageInput.value = epubMode
-    ? String(clamp(state.page || 1, 1, epubTotal))
-    : String(hasDocument ? state.page : 1);
+  els.epubPane.classList.toggle("is-paged", epubPaged);
+  els.prevButton.textContent = epubScroll ? "上章" : "上页";
+  els.nextButton.textContent = epubScroll ? "下章" : "下页";
+  els.prevButton.setAttribute("aria-label", prevLabel);
+  els.nextButton.setAttribute("aria-label", nextLabel);
+  els.pageInput.value = String(hasDocument ? state.page : 1);
   els.pageInput.max = String(epubMode ? epubTotal : Math.max(total, 1));
+  els.pageInput.setAttribute("aria-label", epubMode ? "当前章节" : "跳转到页码");
   els.pageTotal.textContent = epubMode ? `章 / ${epubTotal} · ${epubPercent}%` : `/ ${total}`;
-  els.pageJump.hidden = !epubMode;
+  els.pageJump.hidden = !epubScroll;
+  els.epubPageStatus.hidden = !epubPaged;
+  if (epubPaged) {
+    els.epubPageStatus.textContent = `${displayed?.page || 1} / ${displayed?.total || "…"} 页\n第${state.page}章 · ${epubPercent}%`;
+  }
   els.pdfPreviewButton.hidden = epubMode;
   els.pdfPreviewButton.disabled = !pdfDoc || !els.lockOverlay.hidden;
   els.pdfPreviewButton.textContent = `${hasDocument ? state.page : 1} / ${total} ▴`;
@@ -3750,21 +3769,29 @@ function updateControls() {
   els.edgeJumpGroup.hidden = !showEdgeJumps;
   els.edgeJumpGroup.setAttribute(
     "aria-label",
-    fullscreenEpubMode ? "章节切换" : "连续模式跳转",
+    fullscreenEpubMode ? (epubPaged ? "翻页" : "章节切换") : "连续模式跳转",
   );
-  els.jumpTopButton.setAttribute("aria-label", fullscreenEpubMode ? "上一章" : "跳到顶部");
-  els.jumpBottomButton.setAttribute("aria-label", fullscreenEpubMode ? "下一章" : "跳到底部");
+  const rightToLeft = epubBook?.package?.metadata?.direction === "rtl";
+  els.jumpTopButton.textContent = epubPaged ? (rightToLeft ? "→" : "←") : "↑";
+  els.jumpBottomButton.textContent = epubPaged ? (rightToLeft ? "←" : "→") : "↓";
+  els.jumpTopButton.setAttribute("aria-label", fullscreenEpubMode ? prevLabel : "跳到顶部");
+  els.jumpBottomButton.setAttribute("aria-label", fullscreenEpubMode ? nextLabel : "跳到底部");
   els.jumpTopButton.disabled =
     !showEdgeJumps || (epubMode && (epubNavigationInProgress || (fullscreenEpubMode && epubAtStart)));
   els.jumpBottomButton.disabled =
     !showEdgeJumps || (epubMode && (epubNavigationInProgress || (fullscreenEpubMode && epubAtEnd)));
-  els.pagedModeButton.disabled = epubMode;
-  els.scrollModeButton.disabled = epubMode;
+  els.pagedModeButton.textContent = epubMode ? "左右翻页" : "分页阅读";
+  els.scrollModeButton.textContent = epubMode ? "上下滚动" : "连续阅读";
+  els.readerToolsHint.textContent = epubMode
+    ? "左右翻页时，滑动正文或轻点两侧可翻一页。上下滚动时，点「上章」或「下章」换章。"
+    : "PDF 文字可长按选择并复制。扫描图片需要先识别文字。";
+  els.pagedModeButton.disabled = epubMode && epubNavigationInProgress;
+  els.scrollModeButton.disabled = epubMode && epubNavigationInProgress;
 
   els.pagedModeButton.classList.toggle("active", pagedMode);
-  els.scrollModeButton.classList.toggle("active", scrollMode || epubMode);
+  els.scrollModeButton.classList.toggle("active", !pagedMode);
   els.pagedModeButton.setAttribute("aria-pressed", String(pagedMode));
-  els.scrollModeButton.setAttribute("aria-pressed", String(scrollMode || epubMode));
+  els.scrollModeButton.setAttribute("aria-pressed", String(!pagedMode));
 }
 
 function cancelCurrentRender() {
@@ -3873,6 +3900,8 @@ async function closeCurrentDocument() {
   delete els.canvas.dataset.page;
   els.epubViewer.replaceChildren();
   resetEpubTocCache();
+  clearPendingEpubTarget();
+  epubRecentTargetIndex = null;
   epubAtEnd = false;
   epubAtStart = false;
   epubLastKnownIndex = 0;
@@ -5830,7 +5859,7 @@ async function displayEpubSection(section) {
   await waitForEpubImageRepairs();
   await repairVisibleEpubImages(section, { attempts: 2 });
 
-  if (scrollToEpubSection(section, "top")) {
+  if (!isEpubPaged() && scrollToEpubSection(section, "top")) {
     await waitForNextFrame();
     await repairVisibleEpubImages(section, { attempts: 1 });
   }
@@ -7115,12 +7144,12 @@ async function goToPage(pageNumber) {
 }
 
 async function setReadMode(mode) {
-  if (isEpubDocument()) {
+  if (mode !== READ_MODES.PAGED && mode !== READ_MODES.SCROLL) {
     return;
   }
 
-  if (mode !== READ_MODES.PAGED && mode !== READ_MODES.SCROLL) {
-    return;
+  if (isEpubDocument()) {
+    return setEpubReadMode(mode);
   }
 
   if (state.mode === mode) {
@@ -7221,14 +7250,16 @@ function updateCurrentPageFromScroll() {
 function estimateEpubProgress(location) {
   const percentage = location?.start?.percentage;
 
-  if (Number.isFinite(percentage)) {
+  if (Number.isFinite(percentage) && location.start.location !== -1) {
     return clamp(percentage, 0, 1);
   }
 
   const index = Number.isFinite(location?.start?.index) ? location.start.index : state.page - 1;
   const total = Math.max(epubBook?.spine?.length || 1, 1);
 
-  return clamp(index / total, 0, 1);
+  const displayed = location?.start?.displayed;
+  const withinChapter = displayed?.total > 0 ? (displayed.page - 1) / displayed.total : 0;
+  return clamp((index + withinChapter) / total, 0, 1);
 }
 
 function isReplaceableEpubResource(value) {
@@ -8147,6 +8178,13 @@ async function fixEpubImages(section, view) {
   }
 
   await Promise.allSettled(tasks);
+  if (!documentElement.body?.classList.contains("portable-reader-scrolled")) {
+    // Paginated images use the column and viewport limits supplied by epub.js.
+    for (const image of documentElement.querySelectorAll("img, image")) {
+      bindEpubImagePreview(image, getEpubImageSource(image), getEpubImageAlt(image));
+    }
+    return false;
+  }
   ensureEpubImageStyles(documentElement);
   bindEpubDocumentPreviewHandler(documentElement);
   installEpubImageObserver(documentElement);
@@ -8205,9 +8243,9 @@ async function waitForEpubImageRepairs(timeout = 1400) {
   }
 }
 
-function isFullscreenEpubGestureEnabled() {
+function isEpubGestureEnabled() {
   return (
-    appFullscreen &&
+    (isEpubPaged() || appFullscreen) &&
     isEpubDocument() &&
     Boolean(epubBook) &&
     Boolean(epubRendition) &&
@@ -8216,7 +8254,10 @@ function isFullscreenEpubGestureEnabled() {
     els.libraryOverlay.hidden &&
     els.tocOverlay.hidden &&
     els.encryptionOverlay.hidden &&
-    els.imageOverlay.hidden
+    els.imageOverlay.hidden &&
+    els.readerToolsOverlay.hidden &&
+    els.backupOverlay.hidden &&
+    els.diagnosticsOverlay.hidden
   );
 }
 
@@ -8241,45 +8282,41 @@ function isInteractiveEpubGestureTarget(target) {
   );
 }
 
-function handleFullscreenEpubSwipe(start, end) {
-  if (!isFullscreenEpubGestureEnabled()) {
-    return false;
-  }
-
-  const dx = end.x - start.x;
-  const dy = end.y - start.y;
-
-  if (
-    Math.abs(dx) < FULLSCREEN_EPUB_SWIPE_DISTANCE ||
-    Math.abs(dy) > FULLSCREEN_EPUB_SWIPE_MAX_DRIFT
-  ) {
-    return false;
-  }
-
-  navigateEpub(dx < 0 ? "next" : "prev").catch((error) => {
-    console.error(error);
-    showStatus("章节切换失败，请再滑一次。", true);
-  });
-  return true;
+function navigateEpubHorizontally(towardRight) {
+  const rtl = isEpubPaged() && epubBook?.package?.metadata?.direction === "rtl";
+  return navigateEpub(towardRight !== rtl ? "next" : "prev");
 }
 
-function installEpubGestureNavigation(documentElement) {
-  const body = documentElement?.body;
-
-  if (!documentElement || !body || body.dataset.portableReaderGestureNavigation === "true") {
+function installEpubGestureNavigation(surface) {
+  const host = surface.body || surface;
+  if (host.dataset.portableReaderGestureNavigation === "true") {
     return;
   }
 
-  body.dataset.portableReaderGestureNavigation = "true";
+  host.dataset.portableReaderGestureNavigation = "true";
+  const doc = host.ownerDocument;
+  const canNavigate = () => isEpubGestureEnabled() && !doc.getSelection()?.toString() &&
+    (window.visualViewport?.scale || 1) <= 1.01;
   let start = null;
+  let suppressClickUntil = 0;
+  const turnAtEdge = (clientX) => {
+    const bounds = els.epubViewer.getBoundingClientRect();
+    // The chapter iframe spans every column. Hit-test in the reader viewport.
+    const frameLeft = surface === doc ? doc.defaultView.frameElement.getBoundingClientRect().left : 0;
+    const fraction = (frameLeft + clientX - bounds.left) / bounds.width;
+    if (fraction >= 0.3 && fraction <= 0.7) return false;
+    navigateEpubHorizontally(fraction > 0.7);
+    return true;
+  };
 
-  documentElement.addEventListener(
+  surface.addEventListener(
     "touchstart",
     (event) => {
       if (
         event.touches?.length !== 1 ||
-        !isFullscreenEpubGestureEnabled() ||
-        isInteractiveEpubGestureTarget(event.target)
+        !canNavigate() ||
+        (isInteractiveEpubGestureTarget(event.target) &&
+          !(isEpubPaged() && event.target.closest?.("img, svg, [data-portable-reader-image]")))
       ) {
         start = null;
         return;
@@ -8294,42 +8331,60 @@ function installEpubGestureNavigation(documentElement) {
       start = {
         x: touch.clientX,
         y: touch.clientY,
+        at: performance.now(),
       };
     },
     { passive: true },
   );
 
-  documentElement.addEventListener(
+  surface.addEventListener(
     "touchend",
     (event) => {
-      if (!start) {
-        return;
-      }
-
-      const touch = event.changedTouches?.[0];
-      if (!touch) {
-        start = null;
-        return;
-      }
-
-      const currentStart = start;
+      const origin = start;
       start = null;
+      const touch = event.changedTouches?.[0];
+      if (!origin || !touch || event.touches.length || !canNavigate()) {
+        return;
+      }
 
-      handleFullscreenEpubSwipe(currentStart, {
-        x: touch.clientX,
-        y: touch.clientY,
-      });
+      const dx = touch.clientX - origin.x;
+      const dy = touch.clientY - origin.y;
+      if (Math.abs(dx) >= EPUB_SWIPE_DISTANCE && Math.abs(dy) <= EPUB_SWIPE_MAX_DRIFT) {
+        navigateEpubHorizontally(dx < 0);
+      } else {
+        const tap = Math.hypot(dx, dy) <= 8 && performance.now() - origin.at <= 450;
+        if (!tap || !isEpubPaged() || isInteractiveEpubGestureTarget(event.target)) return;
+        if (!turnAtEdge(touch.clientX)) return;
+      }
+      if (event.cancelable) event.preventDefault();
+      suppressClickUntil = performance.now() + 450;
     },
-    { passive: true },
+    { passive: false },
   );
 
-  documentElement.addEventListener(
+  surface.addEventListener(
     "touchcancel",
     () => {
       start = null;
     },
     { passive: true },
   );
+
+  surface.addEventListener("click", (event) => {
+    if (!isEpubPaged() || !canNavigate() || event.defaultPrevented || isInteractiveEpubGestureTarget(event.target)) return;
+    if (performance.now() < suppressClickUntil && event.sourceCapabilities?.firesTouchEvents !== false) return;
+    turnAtEdge(event.clientX);
+  });
+
+  if (surface === doc) {
+    surface.addEventListener("keydown", (event) => {
+      if (!isEpubPaged() || !canNavigate() || event.defaultPrevented || isInteractiveEpubGestureTarget(event.target)) return;
+      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        navigateEpubHorizontally(event.key === "ArrowRight");
+      }
+    });
+  }
 }
 
 function installEpubContentImageHook() {
@@ -8340,11 +8395,16 @@ function installEpubContentImageHook() {
       return;
     }
 
-    ensureEpubImageStyles(documentElement);
     bindEpubDocumentPreviewHandler(documentElement);
-    installEpubImageObserver(documentElement);
     installEpubGestureNavigation(documentElement);
-    markEpubImagesForExpansion(documentElement);
+    if (isEpubPaged()) {
+      documentElement.documentElement.style.touchAction = "pan-y pinch-zoom";
+    } else {
+      documentElement.body.classList.add("portable-reader-scrolled");
+      ensureEpubImageStyles(documentElement);
+      installEpubImageObserver(documentElement);
+      markEpubImagesForExpansion(documentElement);
+    }
   });
 }
 
@@ -8384,6 +8444,33 @@ async function repairVisibleEpubImages(section = null, options = {}) {
   return changed;
 }
 
+function getEpubReadingAnchor(location) {
+  const cfi = location?.start?.cfi;
+  if (!cfi) return cfi;
+  const view = getEpubViewForSection(getEpubSectionAt(location.start.index));
+  if (!view?.contents || !view.iframe) return cfi;
+
+  const frame = view.iframe.getBoundingClientRect();
+  const bounds = els.epubViewer.getBoundingClientRect();
+  const left = bounds.left - frame.left;
+  const top = bounds.top - frame.top;
+  const position = view.contents.locationOf(cfi);
+  if (position.left >= left && position.left < left + bounds.width &&
+      position.top >= top && position.top < top + bounds.height) return cfi;
+
+  // A long paragraph without spaces can span several screens. epub.js may
+  // report its beginning even when the reader is several pages further along.
+  const doc = view.contents.document;
+  const x = left + bounds.width / 2;
+  const y = top + Math.min(48, bounds.height / 4);
+  const caret = doc.caretPositionFromPoint?.(x, y);
+  const range = caret ? doc.createRange() : doc.caretRangeFromPoint?.(x, y);
+  if (!range) return cfi;
+  if (caret) range.setStart(caret.offsetNode, caret.offset);
+  range.collapse(true);
+  return view.contents.cfiFromRange(range);
+}
+
 function updateEpubLocation(location) {
   if (!location?.start) {
     return;
@@ -8409,7 +8496,7 @@ function updateEpubLocation(location) {
 
   epubAtStart = Boolean(location.atStart);
   epubAtEnd = Boolean(location.atEnd);
-  state.epubCfi = location.start.cfi || state.epubCfi;
+  state.epubCfi = getEpubReadingAnchor(location) || state.epubCfi;
   state.epubProgress = epubAtEnd ? 1 : estimateEpubProgress(location);
   state.page = Number.isFinite(locationIndex)
     ? clamp(locationIndex + 1, 1, total)
@@ -8422,10 +8509,14 @@ function updateEpubLocation(location) {
   scrollStateTimer = window.setTimeout(saveReaderState, 300);
 }
 
+function getEpubFlow(mode) {
+  return mode === READ_MODES.PAGED ? "paginated" : "scrolled-doc";
+}
+
 function createEpubRendition() {
   epubRendition = epubBook.renderTo(els.epubViewer, {
     allowScriptedContent: false,
-    flow: "scrolled-doc",
+    flow: getEpubFlow(state.epubMode),
     height: "100%",
     spread: "none",
     width: "100%",
@@ -8436,12 +8527,14 @@ function createEpubRendition() {
       "font-family":
         'ui-serif, "Iowan Old Style", "Songti SC", "Noto Serif CJK SC", serif',
       "line-height": "1.72",
+    },
+    "body.portable-reader-scrolled": {
       "padding": "0 4%",
     },
     p: {
       "line-height": "1.72",
     },
-    img: {
+    "body.portable-reader-scrolled img": {
       "display": "block",
       "height": "auto",
       "margin": "1.15rem auto 1.55rem",
@@ -8451,7 +8544,7 @@ function createEpubRendition() {
       "object-fit": "contain",
       "width": "min(calc(100vw - 24px), 760px)",
     },
-    svg: {
+    "body.portable-reader-scrolled svg": {
       "display": "block",
       "height": "auto",
       "margin": "1.15rem auto 1.55rem",
@@ -8462,12 +8555,48 @@ function createEpubRendition() {
   });
 
   installEpubContentImageHook();
-  epubRendition.on("relocated", updateEpubLocation);
+  const rendition = epubRendition;
+  const openToken = documentOpenToken;
+  epubRendition.on("relocated", (location) => {
+    if (rendition === epubRendition && isDocumentOpenCurrent(openToken)) updateEpubLocation(location);
+  });
   epubRendition.on("rendered", (section, view) => {
     trackEpubImageRepair(fixEpubImages(section, view));
   });
 
   return epubRendition;
+}
+
+async function setEpubReadMode(mode) {
+  const rendition = epubRendition;
+  if (!rendition || epubNavigationInProgress || mode === state.epubMode) return;
+
+  const openToken = documentOpenToken;
+  const isCurrent = () => rendition === epubRendition && isDocumentOpenCurrent(openToken);
+  const previousMode = state.epubMode;
+  const anchor = getEpubReadingAnchor(rendition.currentLocation()) || state.epubCfi || getCurrentEpubIndex();
+  const displayMode = async (nextMode) => {
+    state.epubMode = nextMode;
+    rendition.flow(getEpubFlow(nextMode));
+    await rendition.display(anchor);
+    if (!isCurrent()) return;
+    updateEpubLocationFromRendition();
+    saveReaderState();
+  };
+
+  closeReaderTools();
+  setEpubLoading(true);
+  try {
+    await displayMode(mode);
+  } catch (error) {
+    if (isCurrent()) {
+      console.warn(error);
+      await displayMode(previousMode).catch(console.warn);
+      if (isCurrent()) showStatus("阅读模式切换失败，请再试一次。", true);
+    }
+  } finally {
+    if (isCurrent()) setEpubLoading(false);
+  }
 }
 
 async function recreateEpubRenditionAt(section) {
@@ -8557,6 +8686,7 @@ async function loadEpubFromSource(source, meta = {}, openToken = beginDocumentOp
     await waitForNextFrame();
     await waitForEpubImageRepairs();
     await repairVisibleEpubImages(null, { attempts: 3 });
+    if (!isDocumentOpenCurrent(openToken)) return false;
     const location = epubRendition.currentLocation?.();
 
     if (location) {
@@ -8599,6 +8729,32 @@ async function loadEpubFromRecord(record, meta = {}, openToken = beginDocumentOp
 
 async function navigateEpub(direction) {
   if (!epubRendition || epubNavigationInProgress) {
+    return;
+  }
+
+  if (isEpubPaged()) {
+    const rendition = epubRendition;
+    const openToken = documentOpenToken;
+    const isCurrent = () => rendition === epubRendition && isDocumentOpenCurrent(openToken);
+    clearPendingEpubTarget();
+    epubRecentTargetIndex = null;
+    epubNavigationInProgress = true;
+    try {
+      if (direction === "prev") await rendition.prev();
+      else await rendition.next();
+      if (isCurrent()) {
+        updateEpubLocationFromRendition();
+        saveReaderState();
+      }
+    } catch (error) {
+      if (isCurrent()) showStatus("翻页失败，请再试一次。", true);
+      console.warn(error);
+    } finally {
+      if (isCurrent()) {
+        epubNavigationInProgress = false;
+        updateControls();
+      }
+    }
     return;
   }
 
@@ -8888,6 +9044,7 @@ async function openDocumentRecord(record, options = {}) {
       state.scrollOffsetRatio = 0;
       state.scrollTop = 0;
       state.epubCfi = "";
+      state.epubMode = READ_MODES.SCROLL;
       state.epubProgress = 0;
       state.zoom = 1;
     } else {
@@ -9193,6 +9350,7 @@ async function openTemporaryDocument(file) {
     scrollOffsetRatio: 0,
     scrollTop: 0,
     epubCfi: "",
+    epubMode: READ_MODES.SCROLL,
     epubProgress: 0,
     zoom: 1,
   });
@@ -9742,7 +9900,13 @@ async function jumpToEpubTocEntry(entry) {
     let displayed = false;
     targetSection = section;
 
-    if (section) {
+    if (isEpubPaged() && section) {
+      const fragmentIndex = entry.href?.indexOf("#") ?? -1;
+      const target = fragmentIndex >= 0 ? section.href + entry.href.slice(fragmentIndex) : getEpubDisplayTarget(section);
+      setPendingEpubTarget(section);
+      await epubRendition.display(target);
+      displayed = true;
+    } else if (section) {
       setPendingEpubTarget(section);
       displayed = await displayEpubSection(section);
 
@@ -10534,7 +10698,7 @@ function wireEvents() {
         return;
       }
 
-      if (epubRendition) {
+      if (epubRendition?.manager?.isRendered()) {
         epubRendition.resize("100%", "100%", state.epubCfi || undefined);
         return;
       }
@@ -10618,7 +10782,8 @@ function wireEvents() {
 
     if (event.key === "ArrowLeft") {
       if (isEpubDocument()) {
-        navigateEpub("prev");
+        event.preventDefault();
+        navigateEpubHorizontally(false);
       } else {
         goToPage(state.page - 1);
       }
@@ -10626,7 +10791,8 @@ function wireEvents() {
 
     if (event.key === "ArrowRight") {
       if (isEpubDocument()) {
-        navigateEpub("next");
+        event.preventDefault();
+        navigateEpubHorizontally(true);
       } else {
         goToPage(state.page + 1);
       }
@@ -10680,63 +10846,7 @@ function wireEvents() {
     touchStart = null;
   }, { passive: true });
 
-  els.epubPane.addEventListener(
-    "touchstart",
-    (event) => {
-      if (
-        event.touches?.length !== 1 ||
-        !isFullscreenEpubGestureEnabled() ||
-        isInteractiveEpubGestureTarget(event.target)
-      ) {
-        epubPaneTouchStart = null;
-        return;
-      }
-
-      const touch = event.changedTouches?.[0];
-      if (!touch) {
-        epubPaneTouchStart = null;
-        return;
-      }
-
-      epubPaneTouchStart = {
-        x: touch.clientX,
-        y: touch.clientY,
-      };
-    },
-    { passive: true },
-  );
-
-  els.epubPane.addEventListener(
-    "touchend",
-    (event) => {
-      if (!epubPaneTouchStart) {
-        return;
-      }
-
-      const touch = event.changedTouches?.[0];
-      if (!touch) {
-        epubPaneTouchStart = null;
-        return;
-      }
-
-      const currentStart = epubPaneTouchStart;
-      epubPaneTouchStart = null;
-
-      handleFullscreenEpubSwipe(currentStart, {
-        x: touch.clientX,
-        y: touch.clientY,
-      });
-    },
-    { passive: true },
-  );
-
-  els.epubPane.addEventListener(
-    "touchcancel",
-    () => {
-      epubPaneTouchStart = null;
-    },
-    { passive: true },
-  );
+  installEpubGestureNavigation(els.epubPane);
 }
 
 function noteSelfTestMetric(name) {
